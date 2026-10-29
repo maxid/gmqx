@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Transport migration: TCP/TLS/WebSocket/WSS listeners now come from the gnety
+  transport framework (RawHandler); MQTT codec and broker state machine stay in gmqx.
+
+
 ## [0.5.0] - 2026-10-29
 
 - MQTT 5 CONNACK capability properties (retain/wildcard/subscription-id/shared/max-qos/max-packet/topic-alias).

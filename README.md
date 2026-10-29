@@ -70,10 +70,10 @@ Full MQTT 5 properties/semantics, full QoS 2, clustering and the client library 
 
 ## Transport layering
 
-The broker currently owns its TCP/TLS/WebSocket transport. The target
-architecture is to move transport/session plumbing to the `gnety` transport
-library and keep only MQTT codec/state machine in gmqx (roadmap, no breaking
-change yet).
+TCP/TLS/WebSocket/WSS listeners are provided by the
+[`gnety`](https://github.com/maxid/gnety) transport framework (`RawHandler`
+mode). gmqx owns the MQTT packet codec and broker state machine; the wire codec
+may move to `gnety/codec/mqtt` later.
 
 ## Versioning
 

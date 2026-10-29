@@ -1,2 +1,4 @@
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
+github.com/maxid/gnety v0.2.3-0.20261029104124-cde52566571b h1:O5KVRJOeGICmcfNh/sRDz5qbu1hKZSd8PlbC79YnDlY=
+github.com/maxid/gnety v0.2.3-0.20261029104124-cde52566571b/go.mod h1:ekaTAE4d+539+nmrpSLVUOTQw68YR9qNo+q0POD/jbY=
