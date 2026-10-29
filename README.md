@@ -94,6 +94,9 @@ Every node dials peers whose address sorts after its own, so listing all peers i
 `Seeds` on every node yields one connection per pair. `Addr` must be explicit
 (no `:0`). Failed peers are dropped and retried.
 
+With `ConnectModeKick`, each successful connect broadcasts a kick, so client-id
+takeover drops the old session even when it lives on another node.
+
 ## Versioning
 
 See [VERSIONING.md](VERSIONING.md).

@@ -346,7 +346,6 @@ func (b *Broker) register(c *client) error {
 		delete(b.clients, c.id)
 		b.mu.Unlock()
 		old.close(false)
-		b.spreadKick(old.id)
 		b.mu.Lock()
 	}
 	if b.cfg.MaxConnections > 0 && len(b.clients) >= b.cfg.MaxConnections {
@@ -357,6 +356,12 @@ func (b *Broker) register(c *client) error {
 	c.registered = true
 	n := len(b.clients)
 	b.mu.Unlock()
+
+	// KICK mode: tell peer nodes to drop any session with the same client id.
+	// This makes client-id takeover work across nodes, not just locally.
+	if b.cfg.ConnectMode == ConnectModeKick {
+		b.spreadKick(c.id)
+	}
 
 	b.metrics.IncrementConnections()
 	b.metrics.RecordConnections(n)

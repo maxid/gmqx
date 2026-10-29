@@ -162,6 +162,60 @@ func TestTCPClusterBrokerCrossNodePublish(t *testing.T) {
 	}
 }
 
+func TestTCPClusterReconnect(t *testing.T) {
+	aAddr, bAddr := freeAddr(t), freeAddr(t)
+	ca := NewTCPCluster(TCPClusterConfig{Addr: aAddr, Seeds: []string{bAddr}, ReconnectInterval: 20 * time.Millisecond})
+	cb := NewTCPCluster(TCPClusterConfig{Addr: bAddr, Seeds: []string{aAddr}, ReconnectInterval: 20 * time.Millisecond})
+	if err := ca.Start(context.Background(), "a", &recClusterHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Start(context.Background(), "b", &recClusterHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	waitPeers(t, ca, 1)
+	if err := cb.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ca.Stop(context.Background()) })
+
+	// Wait for the dead peer to be noticed before restarting b.
+	caTCP := ca.(*tcpCluster)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && caTCP.peerCount() != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if caTCP.peerCount() != 0 {
+		t.Fatal("dead peer was not removed")
+	}
+
+	// Restart b on the same address; a's dial loop must reconnect.
+	hb := &recClusterHandler{}
+	cb2 := NewTCPCluster(TCPClusterConfig{Addr: bAddr, Seeds: []string{aAddr}, ReconnectInterval: 20 * time.Millisecond})
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		if err := cb2.Start(context.Background(), "b", hb); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Cleanup(func() { _ = cb2.Stop(context.Background()) })
+	waitPeers(t, ca, 1)
+
+	if err := ca.Spread(context.Background(), ClusterMessage{
+		Type: ClusterPublish, NodeID: "a", Topic: "reconnect", Payload: []byte("ok"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wait := time.Now().Add(3 * time.Second)
+	for time.Now().Before(wait) {
+		if n, _ := hb.counts(); n == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("publish not delivered after reconnect (waited %v)", time.Since(start))
+}
+
 func TestTCPClusterBrokerCrossNodeKick(t *testing.T) {
 	aAddr, bAddr := freeAddr(t), freeAddr(t)
 	ca := NewTCPCluster(TCPClusterConfig{Addr: aAddr, Seeds: []string{bAddr}, ReconnectInterval: 20 * time.Millisecond})
@@ -172,8 +226,7 @@ func TestTCPClusterBrokerCrossNodeKick(t *testing.T) {
 	waitPeers(t, cb, 1)
 
 	remote := dialTestClient(t, b.Addr(), "dup")
-	_ = dialTestClient(t, a.Addr(), "dup")
-	_ = dialTestClient(t, a.Addr(), "dup") // kicks the first local session and broadcasts
+	_ = dialTestClient(t, a.Addr(), "dup") // same client id on another node must take over
 
 	_ = remote.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := remote.r.ReadByte(); err == nil {
