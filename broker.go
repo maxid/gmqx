@@ -1,8 +1,7 @@
-// Package gmqx implements a small MQTT 3.1.1 broker used by XDMP.
+// Package gmqx implements a small, embeddable MQTT 3.1.1 broker.
 //
-// The broker is a general-purpose library: it has no knowledge of XDMP
-// business concepts. Device authentication/ACL/telemetry semantics belong to
-// the calling application.
+// The broker is protocol-focused: authentication, ACL, message handling and
+// metrics are pluggable.
 package gmqx
 
 import (
@@ -214,7 +213,7 @@ func (b *Broker) serve(conn net.Conn) {
 }
 
 // register enforces connect mode and connection limits, then records the
-// session and calls the dispatcher. It mirrors jmqx's SessionRegistry.
+// session and calls the dispatcher.
 func (b *Broker) register(c *client) error {
 	b.mu.Lock()
 	if old, ok := b.clients[c.id]; ok && old != c {

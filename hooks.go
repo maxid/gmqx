@@ -14,15 +14,15 @@ type ConnectInfo struct {
 	RemoteAddr   string
 }
 
-// AuthManager validates a connecting client (jmqx AuthManager SPI).
+// AuthManager validates a connecting client.
 type AuthManager interface {
 	Authenticate(ctx context.Context, info ConnectInfo) error
-	// RequiresOffload mirrors jmqx; Go runs each connection in its own
-	// goroutine, so callers may ignore it.
+	// RequiresOffload is kept for SPI compatibility; Go runs each connection in
+	// its own goroutine, so callers may ignore it.
 	RequiresOffload() bool
 }
 
-// AclAction is a topic permission action (jmqx AclAction).
+// AclAction is a topic permission action.
 type AclAction int
 
 const (
@@ -36,13 +36,13 @@ type SessionInfo struct {
 	Username string
 }
 
-// AclManager authorizes subscribe/publish (jmqx AclManager SPI).
+// AclManager authorizes subscribe/publish.
 type AclManager interface {
 	Check(ctx context.Context, session SessionInfo, topic string, action AclAction) bool
 	RequiresOffload() bool
 }
 
-// EventSink receives broker lifecycle and message events (jmqx PlatformDispatcher).
+// EventSink receives broker lifecycle and message events.
 type EventSink interface {
 	OnConnect(ctx context.Context, info ConnectInfo)
 	OnDisconnect(ctx context.Context, clientID string, err error)
@@ -51,7 +51,7 @@ type EventSink interface {
 	OnPing(ctx context.Context, clientID string)
 }
 
-// MetricsManager is the metrics SPI (jmqx MetricsManager).
+// MetricsManager is the metrics SPI.
 type MetricsManager interface {
 	IncrementConnections()
 	DecrementConnections()

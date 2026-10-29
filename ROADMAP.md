@@ -1,11 +1,14 @@
 # Roadmap
 
-- [x] MQTT 3.1.1 packet codec (TCP)
-- [x] Session/subscription/wildcards/QoS 0–2 basic/retained/will/keepalive
+- [x] MQTT 3.1.1 TCP packet codec
+- [x] Session/subscriptions/wildcards/QoS 0–2 basic/retained/will/keepalive
 - [x] Auth & ACL hook interfaces
-- [ ] TLS / WS / WSS listeners (v0.3)
-- [ ] Cluster membership + routing tables + kick broadcast (v0.5)
-- [ ] Conformance tests (mosquitto/paho clients)
+- [x] Connect modes (UNIQUE/KICK), limits, connection rate limiting, metrics hooks
+- [ ] TLS / WebSocket / WSS listeners
+- [ ] MQTT 5 handshake and reason codes
+- [ ] Full QoS 2 state machine and inflight limits
+- [ ] Cluster membership + session/topic routing + kick broadcast
+- [ ] Client library
+- [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests
-- [x] jmqx-aligned config/SPI (v0.2.0)
 - [ ] v1.0 API stabilization

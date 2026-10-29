@@ -6,17 +6,17 @@ import (
 )
 
 // ConnectMode controls what happens when a client connects with an existing
-// clientId. It mirrors jmqx's ConnectMode.
+// clientId. It controls session takeover behavior.
 type ConnectMode string
 
 const (
-	// ConnectModeUnique rejects the new connection (jmqx default).
+	// ConnectModeUnique rejects the new connection (default).
 	ConnectModeUnique ConnectMode = "UNIQUE"
 	// ConnectModeKick closes the old connection and accepts the new one.
 	ConnectModeKick ConnectMode = "KICK"
 )
 
-// TLSConfig mirrors jmqx ssl* configuration. TLS is not implemented yet (roadmap).
+// TLSConfig holds TLS listener settings. TLS is not implemented yet (roadmap).
 type TLSConfig struct {
 	Enabled bool
 	CA      string
@@ -24,9 +24,9 @@ type TLSConfig struct {
 	Key     string
 }
 
-// ClusterConfig mirrors jmqx ClusterConfig. Clustering is not implemented yet
-// (roadmap); the interface is provided so a ScaleCube-equivalent backend can be
-// plugged in without changing the broker API.
+// ClusterConfig holds cluster settings. Clustering is not implemented yet
+// (roadmap); the interface is provided so a backend can be plugged in without
+// changing the broker API.
 type ClusterConfig struct {
 	Enabled                  bool
 	URL                      string
@@ -38,8 +38,8 @@ type ClusterConfig struct {
 	ClusterMessageBufferSize int
 }
 
-// Config is the broker configuration. It follows jmqx MqttConfiguration naming
-// where practical; Go does not expose Netty thread/watermark knobs.
+// Config is the broker configuration. Transport-specific tuning knobs are
+// intentionally small and portable.
 type Config struct {
 	// Network
 	Addr                string // TCP listen address, default :1883
@@ -56,7 +56,7 @@ type Config struct {
 	NotKickSeconds int
 	Namespace      string
 
-	// Limits (0 = unlimited, matching jmqx defaults)
+	// Limits (0 = unlimited)
 	MaxConnections        int
 	MaxTopicSubscriptions int
 	MaxRetainMessages     int64
