@@ -6,7 +6,8 @@
 - [x] Connect modes (UNIQUE/KICK), limits, connection rate limiting, metrics hooks
 - [x] TLS / WebSocket / WSS listeners
 - [x] MQTT 5 handshake, property skipping and basic reason codes
-- [ ] Full MQTT 5 properties/semantics
+- [x] MQTT 5: CONNACK capabilities, Topic Alias, User Property forwarding, subscription options
+- [ ] Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)
 - [ ] Full QoS 2 state machine and inflight limits
 - [ ] Cluster membership + session/topic routing + kick broadcast
 - [ ] Client library

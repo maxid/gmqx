@@ -2,7 +2,7 @@
 
 A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
-> Status: **v0.4.0** — MQTT 3.1.1/5 broker with TCP/TLS/WebSocket/WSS listeners,
+> Status: **v0.5.0** — MQTT 3.1.1/5 broker with TCP/TLS/WebSocket/WSS listeners,
 > pluggable authentication/ACL/event/metrics hooks, connect modes and limits.
 > API may change before v1.0.
 
@@ -10,7 +10,8 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
 - MQTT 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
-- MQTT 5 property blocks skipped, v5 CONNACK/SUBACK/UNSUBACK and reason codes
+- MQTT 5: CONNACK capability properties, Topic Alias, User Property forwarding,
+  subscription options (no-local / retain-as-published / retain-handling), reason codes
 - QoS 0/1 basic flows and QoS 2 handshake
 - Retained messages, wildcard subscriptions (`+`/`#`), will messages, keepalive
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),

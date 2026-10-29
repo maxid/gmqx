@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
+- MQTT 5 CONNACK capability properties (retain/wildcard/subscription-id/shared/max-qos/max-packet/topic-alias).
+- Topic Alias handling (inbound and per-session resolution).
+- Publish property forwarding (User Property, content type, response topic, correlation data).
+- Subscription options: no-local, retain-as-published, retain-handling.
+- Tests for v5 CONNACK properties, topic alias and user property forwarding.
+
+
 ## [0.4.0] - 2026-10-29
 
 - Basic MQTT 5 support: CONNECT with properties (skipped), v5 CONNACK/SUBACK/UNSUBACK formats,

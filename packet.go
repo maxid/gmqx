@@ -90,52 +90,57 @@ func appendString(dst []byte, s string) []byte {
 	return append(dst, s...)
 }
 
-func parseConnect(payload []byte) (ConnectInfo, byte, error) {
+func parseConnect(payload []byte) (ConnectInfo, byte, connectProperties, error) {
 	var info ConnectInfo
+	var props connectProperties
 	name, rest, err := readString(payload)
 	if err != nil {
-		return info, 0, err
+		return info, 0, props, err
 	}
 	if name != "MQTT" || len(rest) < 4 {
-		return info, 0, ErrUnsupportedProtocol
+		return info, 0, props, ErrUnsupportedProtocol
 	}
 	level := rest[0]
 	if level != 4 && level != 5 {
-		return info, 0, ErrUnsupportedProtocol
+		return info, 0, props, ErrUnsupportedProtocol
 	}
 	flags := rest[1]
 	keepAlive := binary.BigEndian.Uint16(rest[2:4])
 	rest = rest[4:]
 	if flags&0x01 != 0 {
-		return info, 0, fmt.Errorf("%w: reserved connect flag", ErrMalformedPacket)
+		return info, 0, props, fmt.Errorf("%w: reserved connect flag", ErrMalformedPacket)
 	}
 	info.KeepAlive = keepAlive
 	info.CleanSession = flags&0x02 != 0
 	if level == 5 {
-		// Skip CONNECT properties.
-		if rest, err = skipProperties(rest); err != nil {
-			return info, 0, err
+		block, next, err := readPropertyBlock(rest)
+		if err != nil {
+			return info, 0, props, err
 		}
+		if props, err = parseConnectProperties(block); err != nil {
+			return info, 0, props, err
+		}
+		rest = next
 	}
 	clientID, rest, err := readString(rest)
 	if err != nil {
-		return info, 0, err
+		return info, 0, props, err
 	}
 	info.ClientID = clientID
 	willFlag := flags&0x04 != 0
 	if willFlag {
 		willTopic, next, err := readString(rest)
 		if err != nil {
-			return info, 0, err
+			return info, 0, props, err
 		}
 		if level == 5 {
 			if next, err = skipProperties(next); err != nil {
-				return info, 0, err
+				return info, 0, props, err
 			}
 		}
 		willPayload, next2, err := readBytes(next)
 		if err != nil {
-			return info, 0, err
+			return info, 0, props, err
 		}
 		info.WillTopic = willTopic
 		info.WillPayload = willPayload
@@ -144,7 +149,7 @@ func parseConnect(payload []byte) (ConnectInfo, byte, error) {
 	if flags&0x80 != 0 {
 		username, next, err := readString(rest)
 		if err != nil {
-			return info, 0, err
+			return info, 0, props, err
 		}
 		info.Username = username
 		rest = next
@@ -152,12 +157,12 @@ func parseConnect(payload []byte) (ConnectInfo, byte, error) {
 	if flags&0x40 != 0 {
 		password, next, err := readBytes(rest)
 		if err != nil {
-			return info, 0, err
+			return info, 0, props, err
 		}
 		info.Password = password
 		rest = next
 	}
-	return info, level, nil
+	return info, level, props, nil
 }
 
 // skipProperties reads an MQTT 5 property length and skips the properties.

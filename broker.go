@@ -46,6 +46,7 @@ type retainedMessage struct {
 	topic   string
 	payload []byte
 	qos     byte
+	props   []byte
 }
 
 // New creates a Broker. Start must be called to listen.
@@ -455,23 +456,22 @@ func (b *Broker) unregister(c *client) {
 	}
 }
 
-func (b *Broker) subscribe(c *client, filter string, qos byte) byte {
+func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bool) {
 	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
 		b.metrics.RecordDroppedMessage("acl_subscribe")
-		return 0x80
+		return 0x80, false
 	}
 	c.mu.Lock()
-	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions {
-		if _, exists := c.subs[filter]; !exists {
-			c.mu.Unlock()
-			b.metrics.RecordDroppedMessage("max_subscriptions")
-			return 0x80
-		}
+	_, exists := c.subs[filter]
+	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions && !exists {
+		c.mu.Unlock()
+		b.metrics.RecordDroppedMessage("max_subscriptions")
+		return 0x80, exists
 	}
-	c.subs[filter] = qos
+	c.subs[filter] = sub
 	c.mu.Unlock()
 	b.metrics.IncrementSubscribeEvents()
-	return qos
+	return sub.qos, exists
 }
 
 func (b *Broker) unsubscribe(c *client, filter string) {
@@ -484,7 +484,7 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 	}
 }
 
-func (b *Broker) sendRetained(c *client, filter string, qos byte) {
+func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool) {
 	b.mu.RLock()
 	var msgs []retainedMessage
 	for topic, m := range b.retained {
@@ -494,11 +494,11 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte) {
 	}
 	b.mu.RUnlock()
 	for _, m := range msgs {
-		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true)
+		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true, m.props)
 	}
 }
 
-func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, retain bool) bool {
+func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, retain bool, props []byte) bool {
 	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, topic, AclPublish) {
 		b.metrics.RecordDroppedMessage("acl_publish")
 		return false
@@ -516,7 +516,7 @@ func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, r
 		} else {
 			_, exists := b.retained[topic]
 			if b.cfg.MaxRetainMessages <= 0 || exists || int64(len(b.retained)) < b.cfg.MaxRetainMessages {
-				b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos}
+				b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: append([]byte(nil), props...)}
 			} else {
 				b.metrics.RecordDroppedMessage("max_retain")
 			}
@@ -529,27 +529,40 @@ func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, r
 	b.metrics.IncrementPublishedMessages()
 
 	b.mu.RLock()
-	targets := make([]*client, 0)
+	type target struct {
+		client *client
+		rap    bool
+	}
+	targets := make([]target, 0)
 	for _, c := range b.clients {
-		if c == from {
-			continue
-		}
 		c.mu.Lock()
 		found := false
-		for filter := range c.subs {
-			if matchTopic(filter, topic) {
-				found = true
-				break
+		rap := false
+		for filter, sub := range c.subs {
+			if !matchTopic(filter, topic) {
+				continue
+			}
+			if sub.noLocal && c == from {
+				continue
+			}
+			found = true
+			if sub.retainAsPublished {
+				rap = true
 			}
 		}
 		c.mu.Unlock()
 		if found {
-			targets = append(targets, c)
+			targets = append(targets, target{client: c, rap: rap})
 		}
 	}
 	b.mu.RUnlock()
-	for _, c := range targets {
-		_ = c.sendPublish(topic, payload, qos, false)
+	for _, t := range targets {
+		ret := false
+		outProps := props
+		if t.rap && retain {
+			ret = true
+		}
+		_ = t.client.sendPublish(topic, payload, qos, ret, outProps)
 	}
 	return true
 }

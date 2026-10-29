@@ -135,3 +135,151 @@ func TestMQTT5AuthDenied(t *testing.T) {
 		t.Fatalf("expected 0x87 Not authorized, got %d", reason)
 	}
 }
+
+func publishV5(conn net.Conn, topic string, props, payload []byte) {
+	body := appendString(nil, topic)
+	body = append(body, prefixPropertyLength(props)...)
+	body = append(body, payload...)
+	frame := appendRemainingLength([]byte{0x30}, len(body))
+	frame = append(frame, body...)
+	_, _ = conn.Write(frame)
+}
+
+func readV5Publish(t *testing.T, r *bufio.Reader) (topic string, props, payload []byte) {
+	t.Helper()
+	header, err := r.ReadByte()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header>>4 != 3 {
+		t.Fatalf("expected PUBLISH, got %d", header>>4)
+	}
+	n, err := readRemainingLength(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatal(err)
+	}
+	topic, rest, err := readString(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	props, rest, err = readPropertyBlock(rest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return topic, props, rest
+}
+
+func TestMQTT5TopicAliasAndUserProperty(t *testing.T) {
+	b := startBroker(t, Config{})
+	subConn, subReader, reason := dialV5(t, b.Addr(), "v5-sub2", nil)
+	defer subConn.Close()
+	if reason != 0 {
+		t.Fatalf("connack reason=%d", reason)
+	}
+	body := []byte{0, 1, 0}
+	body = appendString(body, "alias/topic")
+	body = append(body, 0)
+	frame := appendRemainingLength([]byte{0x82}, len(body))
+	frame = append(frame, body...)
+	_, _ = subConn.Write(frame)
+	if h, _, err := readPacketFrom(subReader); err != nil || h>>4 != 9 {
+		t.Fatalf("suback: h=%x err=%v", h, err)
+	}
+
+	pubConn, _, _ := dialV5(t, b.Addr(), "v5-pub2", nil)
+	defer pubConn.Close()
+	userProp := []byte{0x26, 0, 3, 'k', 'e', 'y', 0, 1, 'v'}
+	props := append([]byte{0x23, 0, 1}, userProp...) // topic alias 1 + user property
+	publishV5(pubConn, "alias/topic", props, []byte("one"))
+
+	topic, gotProps, payload := readV5Publish(t, subReader)
+	if topic != "alias/topic" || string(payload) != "one" {
+		t.Fatalf("unexpected first publish: topic=%q payload=%q", topic, payload)
+	}
+	if !containsProperty(gotProps, 0x26) {
+		t.Fatalf("user property not forwarded: %x", gotProps)
+	}
+	if containsProperty(gotProps, 0x23) {
+		t.Fatalf("topic alias should not be forwarded: %x", gotProps)
+	}
+
+	// Empty topic + alias resolution.
+	aliasOnly := []byte{0x23, 0, 1}
+	publishV5(pubConn, "", aliasOnly, []byte("two"))
+	topic, _, payload = readV5Publish(t, subReader)
+	if topic != "alias/topic" || string(payload) != "two" {
+		t.Fatalf("alias resolve failed: topic=%q payload=%q", topic, payload)
+	}
+}
+
+func containsProperty(props []byte, want byte) bool {
+	for len(props) > 0 {
+		id := props[0]
+		props = props[1:]
+		n, err := lengthOfProperty(id, props)
+		if err != nil {
+			return false
+		}
+		if id == want {
+			return true
+		}
+		props = props[n:]
+	}
+	return false
+}
+
+func readPacketFrom(r *bufio.Reader) (byte, []byte, error) {
+	header, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	n, err := readRemainingLength(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return 0, nil, err
+	}
+	return header, body, nil
+}
+
+func TestMQTT5ConnackProperties(t *testing.T) {
+	b := startBroker(t, Config{})
+	conn, err := net.Dial("tcp", b.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	body := connectV5Payload("v5-props", nil)
+	frame := appendRemainingLength([]byte{0x10}, len(body))
+	frame = append(frame, body...)
+	_, _ = conn.Write(frame)
+	r := bufio.NewReader(conn)
+	header, err := r.ReadByte()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := readRemainingLength(r)
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		t.Fatal(err)
+	}
+	if header>>4 != 2 || len(payload) < 3 || payload[1] != 0 {
+		t.Fatalf("unexpected connack: %x %v", header, payload)
+	}
+	props, _, err := readPropertyBlock(payload[2:])
+	if err != nil {
+		t.Fatalf("read connack properties: %v", err)
+	}
+	for _, id := range []byte{0x25, 0x28, 0x24, 0x27, 0x22, 0x29, 0x2A} {
+		if !containsProperty(props, id) {
+			t.Fatalf("connack properties missing 0x%02x: %x", id, props)
+		}
+	}
+}
