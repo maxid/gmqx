@@ -68,6 +68,17 @@ broker, _ := gmqx.New(gmqx.Config{
 
 Full MQTT 5 properties/semantics, full QoS 2, clustering and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
+## Transport layering
+
+The broker currently owns its TCP/TLS/WebSocket transport. The target
+architecture is to move transport/session plumbing to the `gnety` transport
+library and keep only MQTT codec/state machine in gmqx (roadmap, no breaking
+change yet).
+
+## Versioning
+
+See [VERSIONING.md](VERSIONING.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
