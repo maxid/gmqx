@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-29
+
+- Multi-listener support: TCP, TLS (server cert/optional client cert), WebSocket and WSS.
+- WebSocket subprotocol validation and path configuration.
+- TLS/WS integration tests; listener address accessors.
+
+
 ## [0.2.3] - 2026-10-29
 
 - Documentation cleanup: the library README/docs are product-neutral and self-contained.

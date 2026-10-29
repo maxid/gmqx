@@ -2,13 +2,14 @@
 
 A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
-> Status: **v0.2.3** — single-node MQTT 3.1.1 TCP broker with pluggable
-> authentication/ACL/event/metrics hooks, connect modes, limits and rate
-> limiting. API may change before v1.0.
+> Status: **v0.3.0** — MQTT 3.1.1 broker with TCP/TLS/WebSocket/WSS listeners,
+> pluggable authentication/ACL/event/metrics hooks, connect modes and limits.
+> API may change before v1.0.
 
 ## Features
 
-- MQTT 3.1.1 over TCP: CONNECT, SUBSCRIBE, PUBLISH, PING, DISCONNECT
+- MQTT 3.1.1 over TCP, TLS, WebSocket and WSS
+- CONNECT, SUBSCRIBE, PUBLISH, PING, DISCONNECT
 - QoS 0/1 basic flows and QoS 2 handshake
 - Retained messages, wildcard subscriptions (`+`/`#`), will messages, keepalive
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
@@ -50,6 +51,11 @@ broker, _ := gmqx.New(gmqx.Config{
 | Field | Default | Description |
 |---|---|---|
 | `Addr` / `Port` | `:1883` / `1883` | TCP listen address |
+| `SecureAddr` / `SecurePort` | — / 8883 | TLS listener (requires `TLS`) |
+| `WebsocketAddr` / `WebsocketPort` | — / 1884 | WebSocket listener |
+| `WebsocketSecureAddr` / `WebsocketSecurePort` | — / 8884 | WSS listener |
+| `WebsocketPath` | `/mqtt` | WebSocket path |
+| `TLS` | disabled | `Enabled`, `Cert`, `Key`, `CA`, `RequireClientCert` |
 | `MaxPacketSize` | 4 MiB | inbound packet limit |
 | `ConnectMode` | `UNIQUE` | reject or kick an existing client id |
 | `MaxConnections` | 0 (unlimited) | concurrent connection limit |
@@ -58,7 +64,7 @@ broker, _ := gmqx.New(gmqx.Config{
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
 
-TLS, WebSocket and clustering are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+MQTT 5, full QoS 2, clustering and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
 ## License
 

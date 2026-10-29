@@ -18,10 +18,11 @@ const (
 
 // TLSConfig holds TLS listener settings. TLS is not implemented yet (roadmap).
 type TLSConfig struct {
-	Enabled bool
-	CA      string
-	Cert    string
-	Key     string
+	Enabled           bool
+	CA                string
+	Cert              string
+	Key               string
+	RequireClientCert bool
 }
 
 // ClusterConfig holds cluster settings. Clustering is not implemented yet
@@ -44,10 +45,13 @@ type Config struct {
 	// Network
 	Addr                string // TCP listen address, default :1883
 	Port                int    // used when Addr is empty
-	SecurePort          int    // reserved (TLS, not implemented)
-	WebsocketPort       int    // reserved (WS, not implemented)
-	WebsocketSecurePort int    // reserved (WSS, not implemented)
-	WebsocketPath       string // reserved, default /mqtt
+	SecureAddr          string // TLS listen address (optional override)
+	SecurePort          int    // TLS port when SecureAddr is empty
+	WebsocketAddr       string // WebSocket listen address (optional override)
+	WebsocketPort       int    // WebSocket port when WebsocketAddr is empty
+	WebsocketSecureAddr string // WSS listen address (optional override)
+	WebsocketSecurePort int    // WSS port when WebsocketSecureAddr is empty
+	WebsocketPath       string // WebSocket path, default /mqtt
 	TLS                 TLSConfig
 	MaxPacketSize       int
 

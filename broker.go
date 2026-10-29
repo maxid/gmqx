@@ -7,13 +7,20 @@ package gmqx
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // Broker is a single-node MQTT 3.1.1 broker.
@@ -23,13 +30,16 @@ type Broker struct {
 	metrics MetricsManager
 	limiter *rateLimiter
 
-	mu       sync.RWMutex
-	clients  map[string]*client
-	retained map[string]retainedMessage
-	ln       net.Listener
-	done     chan struct{}
-	wg       sync.WaitGroup
-	started  bool
+	mu          sync.RWMutex
+	clients     map[string]*client
+	retained    map[string]retainedMessage
+	listeners   []net.Listener
+	httpServers []*http.Server
+	addrs       map[string]string
+	done        chan struct{}
+	wg          sync.WaitGroup
+	started     bool
+	closed      bool
 }
 
 type retainedMessage struct {
@@ -78,36 +88,79 @@ func New(cfg Config) (*Broker, error) {
 		metrics:  cfg.Metrics,
 		clients:  make(map[string]*client),
 		retained: make(map[string]retainedMessage),
+		addrs:    make(map[string]string),
 		done:     make(chan struct{}),
 	}
 	if cfg.ConnectionRateLimit > 0 {
 		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
 	}
-	if cfg.TLS.Enabled || cfg.SecurePort > 0 || cfg.WebsocketPort > 0 || cfg.WebsocketSecurePort > 0 {
-		logger.Warn("gmqx: TLS/WS listeners are configured but not implemented yet", "secure_port", cfg.SecurePort, "ws_port", cfg.WebsocketPort)
-	}
 	return b, nil
 }
 
-// Start begins listening. It returns once the listener is ready.
+// Start begins all configured listeners. It returns once they are ready.
 func (b *Broker) Start(ctx context.Context) error {
 	b.mu.Lock()
 	if b.started {
 		b.mu.Unlock()
 		return errors.New("gmqx: broker already started")
 	}
-	ln, err := net.Listen("tcp", b.cfg.Addr)
-	if err != nil {
+	if b.closed {
 		b.mu.Unlock()
-		return fmt.Errorf("gmqx: listen %s: %w", b.cfg.Addr, err)
+		return errors.New("gmqx: broker is closed")
 	}
-	b.ln = ln
 	b.started = true
 	b.mu.Unlock()
 
-	b.log.Info("gmqx broker listening", "addr", ln.Addr().String())
-	b.wg.Add(1)
-	go b.acceptLoop()
+	var errs []error
+	started := 0
+
+	if addr := b.cfg.Addr; addr != "" {
+		if err := b.startListener("tcp", addr, nil); err != nil {
+			errs = append(errs, err)
+		} else {
+			started++
+		}
+	}
+	if b.cfg.TLS.Enabled {
+		addr := addrOrPort(b.cfg.SecureAddr, b.cfg.SecurePort)
+		if addr == "" {
+			addr = ":8883"
+		}
+		tlsCfg, err := b.tlsConfig()
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := b.startListener("tls", addr, tlsCfg); err != nil {
+			errs = append(errs, err)
+		} else {
+			started++
+		}
+	}
+	if addr := addrOrPort(b.cfg.WebsocketAddr, b.cfg.WebsocketPort); addr != "" {
+		if err := b.startWS("ws", addr, nil); err != nil {
+			errs = append(errs, err)
+		} else {
+			started++
+		}
+	}
+	if addr := addrOrPort(b.cfg.WebsocketSecureAddr, b.cfg.WebsocketSecurePort); addr != "" {
+		if !b.cfg.TLS.Enabled {
+			errs = append(errs, errors.New("gmqx: WSS requires TLS.Enabled and certificate"))
+		} else if tlsCfg, err := b.tlsConfig(); err != nil {
+			errs = append(errs, err)
+		} else if err := b.startWS("wss", addr, tlsCfg); err != nil {
+			errs = append(errs, err)
+		} else {
+			started++
+		}
+	}
+	if len(errs) > 0 {
+		_ = b.Stop(context.Background())
+		return errors.Join(errs...)
+	}
+	if started == 0 {
+		_ = b.Stop(context.Background())
+		return errors.New("gmqx: no listeners configured")
+	}
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -118,33 +171,166 @@ func (b *Broker) Start(ctx context.Context) error {
 	return nil
 }
 
-// Addr returns the actual listen address (useful when Addr uses port 0).
-func (b *Broker) Addr() string {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.ln == nil {
-		return ""
+func addrOrPort(addr string, port int) string {
+	if addr != "" {
+		return addr
 	}
-	return b.ln.Addr().String()
+	if port > 0 {
+		return fmt.Sprintf(":%d", port)
+	}
+	return ""
 }
 
-// Stop closes the listener and all client connections.
+func (b *Broker) startListener(name, addr string, tlsCfg *tls.Config) error {
+	var (
+		ln  net.Listener
+		err error
+	)
+	if tlsCfg != nil {
+		ln, err = tls.Listen("tcp", addr, tlsCfg)
+	} else {
+		ln, err = net.Listen("tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("gmqx: %s listen %s: %w", name, addr, err)
+	}
+	b.mu.Lock()
+	b.listeners = append(b.listeners, ln)
+	b.addrs[name] = ln.Addr().String()
+	b.mu.Unlock()
+	b.log.Info("gmqx listener started", "transport", name, "addr", ln.Addr().String())
+	b.wg.Add(1)
+	go b.acceptLoop(ln)
+	return nil
+}
+
+func (b *Broker) startWS(name, addr string, tlsCfg *tls.Config) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("gmqx: %s listen %s: %w", name, addr, err)
+	}
+	if tlsCfg != nil {
+		ln = tls.NewListener(ln, tlsCfg)
+	}
+	srv := &http.Server{Handler: b.wsHandler(), ReadHeaderTimeout: 10 * time.Second}
+	b.mu.Lock()
+	b.listeners = append(b.listeners, ln)
+	b.httpServers = append(b.httpServers, srv)
+	b.addrs[name] = ln.Addr().String()
+	b.mu.Unlock()
+	b.log.Info("gmqx listener started", "transport", name, "addr", ln.Addr().String(), "path", b.cfg.WebsocketPath)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		_ = srv.Serve(ln)
+	}()
+	return nil
+}
+
+func (b *Broker) wsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if b.cfg.WebsocketPath != "" && r.URL.Path != b.cfg.WebsocketPath {
+			http.NotFound(w, r)
+			return
+		}
+		if !strings.Contains(strings.ToLower(r.Header.Get("Sec-WebSocket-Protocol")), "mqtt") {
+			http.Error(w, "missing mqtt WebSocket subprotocol", http.StatusBadRequest)
+			return
+		}
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:       []string{"mqtt"},
+			InsecureSkipVerify: true, // broker accepts clients from arbitrary origins
+		})
+		if err != nil {
+			return
+		}
+		c.SetReadLimit(int64(b.cfg.MaxPacketSize))
+		conn := websocket.NetConn(context.Background(), c, websocket.MessageBinary)
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.serve(conn)
+		}()
+	})
+}
+
+func (b *Broker) tlsConfig() (*tls.Config, error) {
+	if b.cfg.TLS.Cert == "" || b.cfg.TLS.Key == "" {
+		return nil, errors.New("gmqx: TLS requires both Cert and Key")
+	}
+	cert, err := tls.LoadX509KeyPair(b.cfg.TLS.Cert, b.cfg.TLS.Key)
+	if err != nil {
+		return nil, fmt.Errorf("gmqx: load TLS key pair: %w", err)
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if b.cfg.TLS.CA != "" {
+		pem, err := os.ReadFile(b.cfg.TLS.CA)
+		if err != nil {
+			return nil, fmt.Errorf("gmqx: read TLS CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("gmqx: invalid TLS CA PEM")
+		}
+		cfg.ClientCAs = pool
+		if b.cfg.TLS.RequireClientCert {
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+	}
+	return cfg, nil
+}
+
+// Addr returns the TCP listen address.
+func (b *Broker) Addr() string { return b.addr("tcp") }
+
+// SecureAddr returns the TLS listen address.
+func (b *Broker) SecureAddr() string { return b.addr("tls") }
+
+// WebsocketAddr returns the WebSocket listen address.
+func (b *Broker) WebsocketAddr() string { return b.addr("ws") }
+
+// WebsocketSecureAddr returns the WSS listen address.
+func (b *Broker) WebsocketSecureAddr() string { return b.addr("wss") }
+
+// Addrs returns a copy of all listening addresses by transport.
+func (b *Broker) Addrs() map[string]string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make(map[string]string, len(b.addrs))
+	for k, v := range b.addrs {
+		out[k] = v
+	}
+	return out
+}
+
+func (b *Broker) addr(name string) string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.addrs[name]
+}
+
+// Stop closes all listeners and client connections.
 func (b *Broker) Stop(ctx context.Context) error {
 	b.mu.Lock()
-	if !b.started {
+	if !b.started || b.closed {
 		b.mu.Unlock()
 		return nil
 	}
 	b.started = false
+	b.closed = true
 	close(b.done)
-	ln := b.ln
+	listeners := append([]net.Listener(nil), b.listeners...)
+	servers := append([]*http.Server(nil), b.httpServers...)
 	clients := make([]*client, 0, len(b.clients))
 	for _, c := range b.clients {
 		clients = append(clients, c)
 	}
 	b.mu.Unlock()
 
-	if ln != nil {
+	for _, srv := range servers {
+		_ = srv.Close()
+	}
+	for _, ln := range listeners {
 		_ = ln.Close()
 	}
 	for _, c := range clients {
@@ -161,10 +347,10 @@ func (b *Broker) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (b *Broker) acceptLoop() {
+func (b *Broker) acceptLoop(ln net.Listener) {
 	defer b.wg.Done()
 	for {
-		conn, err := b.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-b.done:
@@ -193,12 +379,14 @@ func (b *Broker) acceptLoop() {
 			}
 		}
 		b.wg.Add(1)
-		go b.serve(conn)
+		go func() {
+			defer b.wg.Done()
+			b.serve(conn)
+		}()
 	}
 }
 
 func (b *Broker) serve(conn net.Conn) {
-	defer b.wg.Done()
 	c := newClient(b, conn)
 	if err := c.handshake(); err != nil {
 		if c.registered {
