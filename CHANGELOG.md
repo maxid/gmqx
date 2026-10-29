@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+- Cluster interface (`Cluster`/`ClusterMessage`) and broker hooks for cross-node
+  publish and kick; in-memory two-node test.
+
+
 ## [0.6.0-dev.1] - 2026-10-29
 
 - Transport migrated to gnety (`RawHandler`) for TCP/TLS/WS/WSS; MQTT codec and

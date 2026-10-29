@@ -10,7 +10,8 @@
 - [x] MQTT 5: CONNACK capabilities, Topic Alias, User Property forwarding, subscription options
 - [ ] Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)
 - [ ] Full QoS 2 state machine and inflight limits
-- [ ] Cluster membership + session/topic routing + kick broadcast
+- [x] Cluster interface + cross-node publish/kick hooks (in-memory)
+- [ ] Redis/gossip backend, subscription-aware routing
 - [ ] Client library
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests

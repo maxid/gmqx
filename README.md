@@ -20,6 +20,7 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - Limits: max connections, max subscriptions, max retained messages,
   connection rate limiting
 - Graceful shutdown and client-id session takeover
+- Pluggable `Cluster` interface (cross-node publish/kick; in-memory tested)
 
 ## Install
 

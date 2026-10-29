@@ -74,5 +74,9 @@ type Config struct {
 	Metrics      MetricsManager
 	Interceptors []Interceptor
 	Cluster      ClusterConfig
-	Logger       *slog.Logger
+	// ClusterBackend enables cross-node routing (optional).
+	ClusterBackend Cluster
+	// NodeID identifies this broker in the cluster (default random).
+	NodeID string
+	Logger *slog.Logger
 }

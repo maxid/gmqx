@@ -24,6 +24,7 @@ type Broker struct {
 	log     *slog.Logger
 	metrics MetricsManager
 	limiter *rateLimiter
+	nodeID  string
 
 	mu       sync.RWMutex
 	clients  map[string]*client
@@ -72,6 +73,9 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.WebsocketPath == "" {
 		cfg.WebsocketPath = "/mqtt"
 	}
+	if cfg.NodeID == "" {
+		cfg.NodeID = randomID()
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -84,6 +88,7 @@ func New(cfg Config) (*Broker, error) {
 		retained: make(map[string]retainedMessage),
 		addrs:    make(map[string]string),
 		done:     make(chan struct{}),
+		nodeID:   cfg.NodeID,
 	}
 	if cfg.ConnectionRateLimit > 0 {
 		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
@@ -142,6 +147,12 @@ func (b *Broker) Start(ctx context.Context) error {
 	if len(started) == 0 {
 		_ = b.Stop(context.Background())
 		return errors.New("gmqx: no listeners configured")
+	}
+	if b.cfg.ClusterBackend != nil {
+		if err := b.cfg.ClusterBackend.Start(ctx, b.nodeID, b); err != nil {
+			_ = b.Stop(context.Background())
+			return fmt.Errorf("gmqx: cluster start: %w", err)
+		}
 	}
 	go func() {
 		select {
@@ -293,6 +304,11 @@ func (b *Broker) Stop(ctx context.Context) error {
 	b.mu.Unlock()
 
 	var errs []error
+	if b.cfg.ClusterBackend != nil {
+		if err := b.cfg.ClusterBackend.Stop(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, srv := range servers {
 		if err := srv.Stop(ctx); err != nil {
 			errs = append(errs, err)
@@ -445,6 +461,12 @@ func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, r
 	}
 	b.metrics.IncrementPublishedMessages()
 
+	b.deliverLocal(topic, payload, qos, from, props, retain)
+	b.spreadPublish(topic, payload, qos, retain, props)
+	return true
+}
+
+func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *client, props []byte, retain bool) int {
 	b.mu.RLock()
 	type target struct {
 		client *client
@@ -481,7 +503,36 @@ func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, r
 		}
 		_ = t.client.sendPublish(topic, payload, qos, ret, outProps)
 	}
-	return true
+	return len(targets)
+}
+
+func (b *Broker) spreadPublish(topic string, payload []byte, qos byte, retain bool, props []byte) {
+	if b.cfg.ClusterBackend == nil {
+		return
+	}
+	msg := ClusterMessage{
+		Type: ClusterPublish, NodeID: b.nodeID, Topic: topic,
+		Payload: append([]byte(nil), payload...), QoS: qos, Retain: retain,
+		Props: append([]byte(nil), props...),
+	}
+	if err := b.cfg.ClusterBackend.Spread(context.Background(), msg); err != nil {
+		b.log.Warn("gmqx cluster spread failed", "err", err)
+	}
+}
+
+// OnRemotePublish implements ClusterHandler.
+func (b *Broker) OnRemotePublish(msg ClusterMessage) {
+	b.deliverLocal(msg.Topic, msg.Payload, msg.QoS, nil, msg.Props, msg.Retain)
+}
+
+// OnRemoteKick implements ClusterHandler.
+func (b *Broker) OnRemoteKick(msg ClusterMessage) {
+	b.mu.RLock()
+	c := b.clients[msg.ClientID]
+	b.mu.RUnlock()
+	if c != nil {
+		c.close(false)
+	}
 }
 
 func minQoS(a, b byte) byte {
