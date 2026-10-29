@@ -163,3 +163,55 @@ func TestAuthDenied(t *testing.T) {
 		t.Fatalf("unexpected payload: %v", payload)
 	}
 }
+
+func dialRawConnack(t *testing.T, addr, clientID string) byte {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	body := connectPayload(clientID)
+	buf := appendRemainingLength([]byte{0x10}, len(body))
+	buf = append(buf, body...)
+	if _, err := conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(conn)
+	if _, err := r.ReadByte(); err != nil {
+		t.Fatal(err)
+	}
+	n, err := readRemainingLength(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, n)
+	if _, err := r.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) < 2 {
+		t.Fatalf("short connack: %v", payload)
+	}
+	return payload[1]
+}
+
+func TestConnectModeUniqueRejectsSecondClient(t *testing.T) {
+	b := startBroker(t, Config{ConnectMode: ConnectModeUnique})
+	_ = dialTestClient(t, b.Addr(), "dup")
+	if code := dialRawConnack(t, b.Addr(), "dup"); code != 2 {
+		t.Fatalf("expected CONNACK 2 for duplicate client id, got %d", code)
+	}
+}
+
+func TestConnectModeKickAcceptsSecondClient(t *testing.T) {
+	b := startBroker(t, Config{ConnectMode: ConnectModeKick})
+	old := dialTestClient(t, b.Addr(), "dup")
+	if code := dialRawConnack(t, b.Addr(), "dup"); code != 0 {
+		t.Fatalf("expected CONNACK 0 in KICK mode, got %d", code)
+	}
+	_ = old.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := old.r.ReadByte(); err == nil {
+		t.Fatal("expected old connection to be closed in KICK mode")
+	}
+}
