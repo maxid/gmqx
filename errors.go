@@ -1,12 +1,17 @@
 package gmqx
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/maxid/gnety/codec/mqtt"
+)
 
 var (
 	// ErrUnauthorized is returned when authentication fails.
 	ErrUnauthorized = errors.New("gmqx: unauthorized")
 	// ErrMalformedPacket indicates an invalid MQTT packet.
-	ErrMalformedPacket = errors.New("gmqx: malformed packet")
+	// It aliases the wire codec error so callers can match either sentinel.
+	ErrMalformedPacket = mqtt.ErrMalformedPacket
 	// ErrUnsupportedProtocol indicates a non-MQTT-3.1.1 CONNECT.
 	ErrUnsupportedProtocol = errors.New("gmqx: unsupported protocol level")
 	// ErrClientIDInUse is returned in ConnectModeUnique when the clientId exists.

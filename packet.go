@@ -3,93 +3,35 @@ package gmqx
 import (
 	"bufio"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
+
+	"github.com/maxid/gnety/codec/mqtt"
 )
 
+// MQTT wire format lives in gnety/codec/mqtt (Netty-style codec layer). The
+// shims below keep the broker code and tests stable during G1; call sites move
+// to the codec package directly in G1b.
+
 func (c *client) readPacket() (byte, []byte, error) {
-	header, err := c.r.ReadByte()
-	if err != nil {
-		return 0, nil, err
-	}
-	remaining, err := readRemainingLength(c.r)
-	if err != nil {
-		return 0, nil, err
-	}
-	if remaining > c.broker.cfg.MaxPacketSize {
-		return 0, nil, fmt.Errorf("%w: packet too large", ErrMalformedPacket)
-	}
-	payload := make([]byte, remaining)
-	if _, err := io.ReadFull(c.r, payload); err != nil {
-		return 0, nil, err
-	}
-	return header, payload, nil
+	return mqtt.ReadPacket(c.r, c.broker.cfg.MaxPacketSize)
 }
 
 func writePacket(w io.Writer, header byte, body []byte) error {
-	buf := make([]byte, 0, 1+4+len(body))
-	buf = append(buf, header)
-	buf = appendRemainingLength(buf, len(body))
-	buf = append(buf, body...)
-	_, err := w.Write(buf)
-	return err
+	return mqtt.WritePacket(w, header, body)
 }
 
-func readRemainingLength(r *bufio.Reader) (int, error) {
-	multiplier := 1
-	value := 0
-	for i := 0; i < 4; i++ {
-		b, err := r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		value += int(b&127) * multiplier
-		if b&128 == 0 {
-			return value, nil
-		}
-		multiplier *= 128
-	}
-	return 0, fmt.Errorf("%w: malformed remaining length", ErrMalformedPacket)
-}
+func readRemainingLength(r *bufio.Reader) (int, error)  { return mqtt.ReadRemainingLength(r) }
+func appendRemainingLength(dst []byte, n int) []byte    { return mqtt.AppendRemainingLength(dst, n) }
+func readUint16(b []byte) (uint16, []byte, error)       { return mqtt.ReadUint16(b) }
+func readString(b []byte) (string, []byte, error)       { return mqtt.ReadString(b) }
+func appendString(dst []byte, s string) []byte          { return mqtt.AppendString(dst, s) }
+func readBytes(b []byte) ([]byte, []byte, error)        { return mqtt.ReadBytes(b) }
+func skipProperties(b []byte) ([]byte, error)           { return mqtt.SkipProperties(b) }
+func readVariableByteInt(b []byte) (int, []byte, error) { return mqtt.ReadVariableByteInt(b) }
 
-func appendRemainingLength(dst []byte, n int) []byte {
-	for {
-		encoded := byte(n % 128)
-		n /= 128
-		if n > 0 {
-			encoded |= 128
-		}
-		dst = append(dst, encoded)
-		if n == 0 {
-			return dst
-		}
-	}
-}
-
-func readUint16(b []byte) (uint16, []byte, error) {
-	if len(b) < 2 {
-		return 0, nil, ErrMalformedPacket
-	}
-	return binary.BigEndian.Uint16(b[:2]), b[2:], nil
-}
-
-func readString(b []byte) (string, []byte, error) {
-	if len(b) < 2 {
-		return "", nil, ErrMalformedPacket
-	}
-	n := int(binary.BigEndian.Uint16(b[:2]))
-	if len(b) < 2+n {
-		return "", nil, ErrMalformedPacket
-	}
-	return string(b[2 : 2+n]), b[2+n:], nil
-}
-
-func appendString(dst []byte, s string) []byte {
-	dst = append(dst, byte(len(s)>>8), byte(len(s)))
-	return append(dst, s...)
-}
-
+// parseConnect decodes a CONNECT payload into protocol-level fields. This is
+// the MQTT state-machine boundary: wire parsing stays in gnety/codec/mqtt.
 func parseConnect(payload []byte) (ConnectInfo, byte, connectProperties, error) {
 	var info ConnectInfo
 	var props connectProperties
@@ -164,46 +106,3 @@ func parseConnect(payload []byte) (ConnectInfo, byte, connectProperties, error) 
 	}
 	return info, level, props, nil
 }
-
-// skipProperties reads an MQTT 5 property length and skips the properties.
-func skipProperties(b []byte) ([]byte, error) {
-	n, rest, err := readVariableByteInt(b)
-	if err != nil {
-		return nil, err
-	}
-	if len(rest) < n {
-		return nil, ErrMalformedPacket
-	}
-	return rest[n:], nil
-}
-
-func readVariableByteInt(b []byte) (int, []byte, error) {
-	multiplier := 1
-	value := 0
-	for i := 0; i < 4; i++ {
-		if len(b) < 1 {
-			return 0, nil, ErrMalformedPacket
-		}
-		encoded := b[0]
-		b = b[1:]
-		value += int(encoded&127) * multiplier
-		if encoded&128 == 0 {
-			return value, b, nil
-		}
-		multiplier *= 128
-	}
-	return 0, nil, fmt.Errorf("%w: malformed variable byte integer", ErrMalformedPacket)
-}
-
-func readBytes(b []byte) ([]byte, []byte, error) {
-	if len(b) < 2 {
-		return nil, nil, ErrMalformedPacket
-	}
-	n := int(binary.BigEndian.Uint16(b[:2]))
-	if len(b) < 2+n {
-		return nil, nil, ErrMalformedPacket
-	}
-	return b[2 : 2+n], b[2+n:], nil
-}
-
-var errNotImplemented = errors.New("not implemented")
