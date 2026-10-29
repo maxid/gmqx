@@ -20,7 +20,8 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - Limits: max connections, max subscriptions, max retained messages,
   connection rate limiting
 - Graceful shutdown and client-id session takeover
-- Pluggable `Cluster` interface (cross-node publish/kick; in-memory tested)
+- Pluggable `Cluster` interface with a built-in TCP backend (static seeds,
+  cross-node publish/kick, reconnect)
 
 ## Install
 
@@ -67,14 +68,31 @@ broker, _ := gmqx.New(gmqx.Config{
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
 
-Full MQTT 5 properties/semantics, full QoS 2, clustering and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+Full MQTT 5 properties/semantics, full QoS 2 and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
 ## Transport layering
 
 TCP/TLS/WebSocket/WSS listeners are provided by the
 [`gnety`](https://github.com/maxid/gnety) transport framework (`RawHandler`
-mode). gmqx owns the MQTT packet codec and broker state machine; the wire codec
-may move to `gnety/codec/mqtt` later.
+mode). The MQTT wire format lives in `gnety/codec/mqtt`; gmqx owns the broker
+state machine.
+
+## Cluster backend
+
+`gmqx.NewTCPCluster` broadcasts publish/kick frames between nodes over gnety TCP
+(JSON payloads with length-prefixed framing):
+
+```go
+cluster := gmqx.NewTCPCluster(gmqx.TCPClusterConfig{
+    Addr:  "10.0.0.1:7946",
+    Seeds: []string{"10.0.0.2:7946", "10.0.0.3:7946"},
+})
+broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: cluster})
+```
+
+Every node dials peers whose address sorts after its own, so listing all peers in
+`Seeds` on every node yields one connection per pair. `Addr` must be explicit
+(no `:0`). Failed peers are dropped and retried.
 
 ## Versioning
 

@@ -346,6 +346,7 @@ func (b *Broker) register(c *client) error {
 		delete(b.clients, c.id)
 		b.mu.Unlock()
 		old.close(false)
+		b.spreadKick(old.id)
 		b.mu.Lock()
 	}
 	if b.cfg.MaxConnections > 0 && len(b.clients) >= b.cfg.MaxConnections {
@@ -517,6 +518,17 @@ func (b *Broker) spreadPublish(topic string, payload []byte, qos byte, retain bo
 	}
 	if err := b.cfg.ClusterBackend.Spread(context.Background(), msg); err != nil {
 		b.log.Warn("gmqx cluster spread failed", "err", err)
+	}
+}
+
+// spreadKick tells peer nodes to drop a client that was kicked locally.
+func (b *Broker) spreadKick(clientID string) {
+	if b.cfg.ClusterBackend == nil || clientID == "" {
+		return
+	}
+	msg := ClusterMessage{Type: ClusterKick, NodeID: b.nodeID, ClientID: clientID}
+	if err := b.cfg.ClusterBackend.Spread(context.Background(), msg); err != nil {
+		b.log.Warn("gmqx cluster kick spread failed", "err", err)
 	}
 }
 

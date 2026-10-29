@@ -11,7 +11,8 @@
 - [ ] Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)
 - [ ] Full QoS 2 state machine and inflight limits
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)
-- [ ] Redis/gossip backend, subscription-aware routing
+- [x] Built-in TCP cluster backend (static seeds, cross-node publish/kick, reconnect)
+- [ ] Cluster presence routing (clientId/topicFilter → node) and Redis backend
 - [ ] Client library
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests
