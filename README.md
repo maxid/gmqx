@@ -2,15 +2,15 @@
 
 Go implementation of [jmqx](https://github.com/maxid/jmqx) (MQTT broker/client/cluster) with feature parity, written in Go.
 
-> Status: **experimental scaffold** (v0.0.0-dev). API is not stable.
+> Status: **v0.1.0** — single-node MQTT 3.1.1 TCP broker with hooks. API may change before v1.0.
 
-## Planned features
+## Features (v0.1.0)
 
-- MQTT 3.1.1 / 5.0 broker and client
-- TCP / TLS / WebSocket / WSS listeners
-- Authentication and ACL hooks (same semantics as jmqx)
-- Cluster routing: `clientId → node`, `topicFilter → node`, cross-node publish forwarding, kick broadcast
-- Metrics, health and configuration
+- MQTT 3.1.1 over TCP (CONNECT/SUBSCRIBE/PUBLISH/PING/DISCONNECT, QoS 0/1 basic, QoS 2 handshake)
+- Retained messages, wildcard subscriptions (`+`/`#`), will messages, keepalive timeout
+- Authentication / ACL / event hooks (`Authenticator`, `ACL`, `EventSink`)
+- Client-id session takeover and graceful shutdown
+- No XDMP business semantics: device auth/TSL/telemetry belong to the caller (xdmp-hub adapter)
 
 ## Install
 

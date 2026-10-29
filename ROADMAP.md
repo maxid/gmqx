@@ -1,9 +1,9 @@
 # Roadmap
 
-- [ ] MQTT packet codec (3.1.1 / 5.0)
-- [ ] Session / subscription tree / QoS / retained / will
-- [ ] Auth & ACL hook interfaces
-- [ ] TCP / TLS / WS / WSS listeners
+- [x] MQTT 3.1.1 packet codec (TCP)
+- [x] Session/subscription/wildcards/QoS 0–2 basic/retained/will/keepalive
+- [x] Auth & ACL hook interfaces
+- [ ] TLS / WS / WSS listeners
 - [ ] Cluster membership + routing tables + kick broadcast
 - [ ] Conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests
