@@ -90,41 +90,52 @@ func appendString(dst []byte, s string) []byte {
 	return append(dst, s...)
 }
 
-func parseConnect(payload []byte) (ConnectInfo, error) {
+func parseConnect(payload []byte) (ConnectInfo, byte, error) {
 	var info ConnectInfo
 	name, rest, err := readString(payload)
 	if err != nil {
-		return info, err
+		return info, 0, err
 	}
 	if name != "MQTT" || len(rest) < 4 {
-		return info, ErrUnsupportedProtocol
+		return info, 0, ErrUnsupportedProtocol
 	}
 	level := rest[0]
-	if level != 4 {
-		return info, ErrUnsupportedProtocol
+	if level != 4 && level != 5 {
+		return info, 0, ErrUnsupportedProtocol
 	}
 	flags := rest[1]
 	keepAlive := binary.BigEndian.Uint16(rest[2:4])
 	rest = rest[4:]
 	if flags&0x01 != 0 {
-		return info, fmt.Errorf("%w: reserved connect flag", ErrMalformedPacket)
+		return info, 0, fmt.Errorf("%w: reserved connect flag", ErrMalformedPacket)
 	}
 	info.KeepAlive = keepAlive
 	info.CleanSession = flags&0x02 != 0
+	if level == 5 {
+		// Skip CONNECT properties.
+		if rest, err = skipProperties(rest); err != nil {
+			return info, 0, err
+		}
+	}
 	clientID, rest, err := readString(rest)
 	if err != nil {
-		return info, err
+		return info, 0, err
 	}
 	info.ClientID = clientID
 	willFlag := flags&0x04 != 0
 	if willFlag {
 		willTopic, next, err := readString(rest)
 		if err != nil {
-			return info, err
+			return info, 0, err
+		}
+		if level == 5 {
+			if next, err = skipProperties(next); err != nil {
+				return info, 0, err
+			}
 		}
 		willPayload, next2, err := readBytes(next)
 		if err != nil {
-			return info, err
+			return info, 0, err
 		}
 		info.WillTopic = willTopic
 		info.WillPayload = willPayload
@@ -133,7 +144,7 @@ func parseConnect(payload []byte) (ConnectInfo, error) {
 	if flags&0x80 != 0 {
 		username, next, err := readString(rest)
 		if err != nil {
-			return info, err
+			return info, 0, err
 		}
 		info.Username = username
 		rest = next
@@ -141,12 +152,42 @@ func parseConnect(payload []byte) (ConnectInfo, error) {
 	if flags&0x40 != 0 {
 		password, next, err := readBytes(rest)
 		if err != nil {
-			return info, err
+			return info, 0, err
 		}
 		info.Password = password
 		rest = next
 	}
-	return info, nil
+	return info, level, nil
+}
+
+// skipProperties reads an MQTT 5 property length and skips the properties.
+func skipProperties(b []byte) ([]byte, error) {
+	n, rest, err := readVariableByteInt(b)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) < n {
+		return nil, ErrMalformedPacket
+	}
+	return rest[n:], nil
+}
+
+func readVariableByteInt(b []byte) (int, []byte, error) {
+	multiplier := 1
+	value := 0
+	for i := 0; i < 4; i++ {
+		if len(b) < 1 {
+			return 0, nil, ErrMalformedPacket
+		}
+		encoded := b[0]
+		b = b[1:]
+		value += int(encoded&127) * multiplier
+		if encoded&128 == 0 {
+			return value, b, nil
+		}
+		multiplier *= 128
+	}
+	return 0, nil, fmt.Errorf("%w: malformed variable byte integer", ErrMalformedPacket)
 }
 
 func readBytes(b []byte) ([]byte, []byte, error) {

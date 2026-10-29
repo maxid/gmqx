@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-29
+
+- Basic MQTT 5 support: CONNECT with properties (skipped), v5 CONNACK/SUBACK/UNSUBACK formats,
+  v5 PUBLISH property block, v5 negative ACK reason codes (Not authorized, Quota exceeded,
+  Client Identifier not valid), tests for v5 connect/pub-sub/auth.
+
+
 ## [0.3.0] - 2026-10-29
 
 - Multi-listener support: TCP, TLS (server cert/optional client cert), WebSocket and WSS.

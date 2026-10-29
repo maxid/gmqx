@@ -28,6 +28,7 @@ type client struct {
 	username   string
 	registered bool
 	lost       bool
+	version    byte
 }
 
 func newClient(b *Broker, conn net.Conn) *client {
@@ -47,18 +48,19 @@ func (c *client) handshake() error {
 	if header>>4 != 1 {
 		return fmt.Errorf("%w: first packet is not CONNECT", ErrMalformedPacket)
 	}
-	info, err := parseConnect(payload)
+	info, version, err := parseConnect(payload)
 	if err != nil {
 		return err
 	}
+	c.version = version
 	info.RemoteAddr = c.conn.RemoteAddr().String()
 	if err := c.broker.cfg.Auth.Authenticate(context.Background(), info); err != nil {
-		_ = c.writeConnack(5)
+		_ = c.writeConnack(version, connackNotAuthorized(version))
 		return fmt.Errorf("%w: %v", ErrUnauthorized, err)
 	}
 	if info.ClientID == "" {
 		if !info.CleanSession {
-			_ = c.writeConnack(2)
+			_ = c.writeConnack(version, connackClientIDInvalid(version))
 			return fmt.Errorf("%w: empty client id requires clean session", ErrMalformedPacket)
 		}
 		info.ClientID = randomID()
@@ -74,13 +76,16 @@ func (c *client) handshake() error {
 	c.mu.Unlock()
 	if err := c.broker.register(c); err != nil {
 		code := byte(5)
-		if errors.Is(err, ErrClientIDInUse) {
-			code = 2
+		switch {
+		case errors.Is(err, ErrClientIDInUse):
+			code = connackClientIDInvalid(version)
+		case errors.Is(err, ErrMaxConnections):
+			code = connackQuotaExceeded(version)
 		}
-		_ = c.writeConnack(code)
+		_ = c.writeConnack(version, code)
 		return err
 	}
-	if err := c.writeConnack(0); err != nil {
+	if err := c.writeConnack(version, 0); err != nil {
 		return err
 	}
 	return nil
@@ -149,22 +154,40 @@ func (c *client) handlePublish(header byte, payload []byte) {
 			return
 		}
 	}
+	if c.version == 5 {
+		if rest, err = skipProperties(rest); err != nil {
+			return
+		}
+	}
 	if !validTopic(topic) {
 		return
 	}
+	allowed := c.broker.publish(c, topic, rest, qos, retain)
 	switch qos {
 	case 1:
-		_ = c.writeAck(0x40, pid)
+		if c.version == 5 && !allowed {
+			_ = c.writeAckReason(0x40, pid, 0x87)
+		} else {
+			_ = c.writeAck(0x40, pid)
+		}
 	case 2:
-		_ = c.writeAck(0x50, pid)
+		if c.version == 5 && !allowed {
+			_ = c.writeAckReason(0x50, pid, 0x87)
+		} else {
+			_ = c.writeAck(0x50, pid)
+		}
 	}
-	c.broker.publish(c, topic, rest, qos, retain)
 }
 
 func (c *client) handleSubscribe(payload []byte) {
 	pid, rest, err := readUint16(payload)
 	if err != nil {
 		return
+	}
+	if c.version == 5 {
+		if rest, err = skipProperties(rest); err != nil {
+			return
+		}
 	}
 	type req struct {
 		filter string
@@ -182,9 +205,18 @@ func (c *client) handleSubscribe(payload []byte) {
 	}
 	codes := make([]byte, 0, len(reqs))
 	for _, r := range reqs {
-		codes = append(codes, c.broker.subscribe(c, r.filter, r.qos))
+		code := c.broker.subscribe(c, r.filter, r.qos)
+		if c.version == 5 && code == 0x80 {
+			code = 0x87 // Not authorized
+		}
+		codes = append(codes, code)
 	}
-	_ = c.writePacket(0x90, append([]byte{byte(pid >> 8), byte(pid)}, codes...))
+	suback := []byte{byte(pid >> 8), byte(pid)}
+	if c.version == 5 {
+		suback = append(suback, 0) // property length 0
+	}
+	suback = append(suback, codes...)
+	_ = c.writePacket(0x90, suback)
 	for i, r := range reqs {
 		if codes[i] != 0x80 {
 			c.broker.sendRetained(c, r.filter, r.qos)
@@ -197,6 +229,11 @@ func (c *client) handleUnsubscribe(payload []byte) {
 	if err != nil {
 		return
 	}
+	if c.version == 5 {
+		if rest, err = skipProperties(rest); err != nil {
+			return
+		}
+	}
 	for len(rest) > 0 {
 		filter, next, err := readString(rest)
 		if err != nil {
@@ -205,7 +242,11 @@ func (c *client) handleUnsubscribe(payload []byte) {
 		c.broker.unsubscribe(c, filter)
 		rest = next
 	}
-	_ = c.writeAck(0xB0, pid)
+	if c.version == 5 {
+		_ = c.writePacket(0xB0, []byte{byte(pid >> 8), byte(pid), 0})
+	} else {
+		_ = c.writeAck(0xB0, pid)
+	}
 }
 
 func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool) error {
@@ -218,16 +259,47 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 		pid := uint16(1)
 		body = append(body, byte(pid>>8), byte(pid))
 	}
+	if c.version == 5 {
+		body = append(body, 0) // property length 0
+	}
 	body = append(body, payload...)
 	return c.writePacket(header, body)
 }
 
-func (c *client) writeConnack(code byte) error {
+func (c *client) writeConnack(version, code byte) error {
+	if version == 5 {
+		return c.writePacket(0x20, []byte{0, code, 0}) // session present, reason, properties
+	}
 	return c.writePacket(0x20, []byte{0, code})
 }
 
 func (c *client) writeAck(header byte, pid uint16) error {
 	return c.writePacket(header, []byte{byte(pid >> 8), byte(pid)})
+}
+
+func (c *client) writeAckReason(header byte, pid uint16, reason byte) error {
+	return c.writePacket(header, []byte{byte(pid >> 8), byte(pid), reason, 0})
+}
+
+func connackNotAuthorized(version byte) byte {
+	if version == 5 {
+		return 0x87
+	}
+	return 5
+}
+
+func connackClientIDInvalid(version byte) byte {
+	if version == 5 {
+		return 0x85
+	}
+	return 2
+}
+
+func connackQuotaExceeded(version byte) byte {
+	if version == 5 {
+		return 0x97
+	}
+	return 5
 }
 
 func (c *client) writePacket(header byte, body []byte) error {

@@ -5,7 +5,8 @@
 - [x] Auth & ACL hook interfaces
 - [x] Connect modes (UNIQUE/KICK), limits, connection rate limiting, metrics hooks
 - [x] TLS / WebSocket / WSS listeners
-- [ ] MQTT 5 handshake and reason codes
+- [x] MQTT 5 handshake, property skipping and basic reason codes
+- [ ] Full MQTT 5 properties/semantics
 - [ ] Full QoS 2 state machine and inflight limits
 - [ ] Cluster membership + session/topic routing + kick broadcast
 - [ ] Client library

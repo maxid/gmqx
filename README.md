@@ -2,14 +2,15 @@
 
 A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
-> Status: **v0.3.0** — MQTT 3.1.1 broker with TCP/TLS/WebSocket/WSS listeners,
+> Status: **v0.4.0** — MQTT 3.1.1/5 broker with TCP/TLS/WebSocket/WSS listeners,
 > pluggable authentication/ACL/event/metrics hooks, connect modes and limits.
 > API may change before v1.0.
 
 ## Features
 
-- MQTT 3.1.1 over TCP, TLS, WebSocket and WSS
-- CONNECT, SUBSCRIBE, PUBLISH, PING, DISCONNECT
+- MQTT 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
+- CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
+- MQTT 5 property blocks skipped, v5 CONNACK/SUBACK/UNSUBACK and reason codes
 - QoS 0/1 basic flows and QoS 2 handshake
 - Retained messages, wildcard subscriptions (`+`/`#`), will messages, keepalive
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
@@ -64,7 +65,7 @@ broker, _ := gmqx.New(gmqx.Config{
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
 
-MQTT 5, full QoS 2, clustering and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+Full MQTT 5 properties/semantics, full QoS 2, clustering and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
 ## License
 

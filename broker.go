@@ -498,15 +498,15 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte) {
 	}
 }
 
-func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, retain bool) {
+func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, retain bool) bool {
 	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, topic, AclPublish) {
 		b.metrics.RecordDroppedMessage("acl_publish")
-		return
+		return false
 	}
 	for _, it := range b.cfg.Interceptors {
 		if !it.OnPublish(context.Background(), from.id, topic, payload, qos) {
 			b.metrics.RecordDroppedMessage("interceptor")
-			return
+			return false
 		}
 	}
 	if retain {
@@ -551,6 +551,7 @@ func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, r
 	for _, c := range targets {
 		_ = c.sendPublish(topic, payload, qos, false)
 	}
+	return true
 }
 
 func minQoS(a, b byte) byte {
