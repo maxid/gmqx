@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.6.0-dev.1] - 2026-10-29
+
+- Transport migrated to gnety (`RawHandler`) for TCP/TLS/WS/WSS; MQTT codec and
+  broker state machine remain in gmqx.
+
+
 - Transport migration: TCP/TLS/WebSocket/WSS listeners now come from the gnety
   transport framework (RawHandler); MQTT codec and broker state machine stay in gmqx.
 

@@ -2,7 +2,7 @@
 
 A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
-> Status: **v0.5.0** — MQTT 3.1.1/5 broker with TCP/TLS/WebSocket/WSS listeners,
+> Status: **v0.6.0-dev.1** — MQTT 3.1.1/5 broker; TCP/TLS/WebSocket/WSS transport via gnety,
 > pluggable authentication/ACL/event/metrics hooks, connect modes and limits.
 > API may change before v1.0.
 
