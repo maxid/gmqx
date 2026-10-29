@@ -2,7 +2,7 @@
 
 Go implementation of [jmqx](https://github.com/maxid/jmqx) (MQTT broker/client/cluster) with feature parity, written in Go.
 
-> Status: **v0.2.0** — single-node MQTT 3.1.1 TCP broker with jmqx-aligned SPIs, connect modes, limits and metrics. API may change before v1.0. See [docs/PARITY.md](docs/PARITY.md) for the Java jmqx parity matrix.
+> Status: **v0.2.2** — single-node MQTT 3.1.1 TCP broker with jmqx-aligned SPIs, connect modes, limits and metrics. API may change before v1.0. See [docs/PARITY.md](docs/PARITY.md) for the Java jmqx parity matrix.
 
 ## Features (v0.1.0)
 

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-29
+
+- Bump version constant to match tags (connect mode tests included).
+
+
 ## [0.2.0] - 2026-10-29
 
 - Align broker SPI with jmqx: AuthManager/AclManager/EventSink/MetricsManager/Interceptor.
