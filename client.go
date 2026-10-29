@@ -17,14 +17,17 @@ type client struct {
 	r      *bufio.Reader
 	wmu    sync.Mutex
 
-	mu        sync.Mutex
-	id        string
-	info      ConnectInfo
-	subs      map[string]byte
-	keepAlive time.Duration
-	closed    bool
-	closeErr  error
-	will      *retainedMessage
+	mu         sync.Mutex
+	id         string
+	info       ConnectInfo
+	subs       map[string]byte
+	keepAlive  time.Duration
+	closed     bool
+	closeErr   error
+	will       *retainedMessage
+	username   string
+	registered bool
+	lost       bool
 }
 
 func newClient(b *Broker, conn net.Conn) *client {
@@ -64,10 +67,19 @@ func (c *client) handshake() error {
 	c.id = info.ClientID
 	c.info = info
 	c.keepAlive = time.Duration(info.KeepAlive) * time.Second
+	c.username = info.Username
 	if info.WillTopic != "" {
 		c.will = &retainedMessage{topic: info.WillTopic, payload: info.WillPayload}
 	}
 	c.mu.Unlock()
+	if err := c.broker.register(c); err != nil {
+		code := byte(5)
+		if errors.Is(err, ErrClientIDInUse) {
+			code = 2
+		}
+		_ = c.writeConnack(code)
+		return err
+	}
 	if err := c.writeConnack(0); err != nil {
 		return err
 	}
@@ -86,10 +98,10 @@ func (c *client) loop() {
 
 		header, payload, err := c.readPacket()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				c.close(true)
-				return
-			}
+			c.mu.Lock()
+			c.lost = true
+			c.mu.Unlock()
+			_ = io.EOF
 			c.close(true)
 			return
 		}
@@ -107,9 +119,13 @@ func (c *client) loop() {
 			c.handleUnsubscribe(payload)
 		case 12: // PINGREQ
 			_ = c.writePacket(0xD0, nil)
+			if c.broker.cfg.Sink != nil {
+				c.broker.cfg.Sink.OnPing(context.Background(), c.id)
+			}
 		case 14: // DISCONNECT
 			c.mu.Lock()
 			c.will = nil
+			c.lost = false
 			c.mu.Unlock()
 			c.close(false)
 			return

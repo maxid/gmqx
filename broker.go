@@ -2,7 +2,7 @@
 //
 // The broker is a general-purpose library: it has no knowledge of XDMP
 // business concepts. Device authentication/ACL/telemetry semantics belong to
-// the calling application (for XDMP: modules/protocol/mqtt adapter).
+// the calling application.
 package gmqx
 
 import (
@@ -17,26 +17,12 @@ import (
 	"time"
 )
 
-// Config configures a Broker.
-type Config struct {
-	// Addr is the TCP listen address, e.g. ":1883" or "127.0.0.1:0".
-	Addr string
-	// MaxPacketSize limits incoming packet size in bytes (default 4 MiB).
-	MaxPacketSize int
-	// Auth authenticates connecting clients. Defaults to AllowAll.
-	Auth Authenticator
-	// ACL authorizes subscribe/publish. Defaults to AllowAll.
-	ACL ACL
-	// Sink receives lifecycle/message events. Optional.
-	Sink EventSink
-	// Logger is optional.
-	Logger *slog.Logger
-}
-
 // Broker is a single-node MQTT 3.1.1 broker.
 type Broker struct {
-	cfg Config
-	log *slog.Logger
+	cfg     Config
+	log     *slog.Logger
+	metrics MetricsManager
+	limiter *rateLimiter
 
 	mu       sync.RWMutex
 	clients  map[string]*client
@@ -56,10 +42,20 @@ type retainedMessage struct {
 // New creates a Broker. Start must be called to listen.
 func New(cfg Config) (*Broker, error) {
 	if cfg.Addr == "" {
-		cfg.Addr = ":1883"
+		port := cfg.Port
+		if port == 0 {
+			port = 1883
+		}
+		cfg.Addr = fmt.Sprintf(":%d", port)
 	}
 	if cfg.MaxPacketSize <= 0 {
 		cfg.MaxPacketSize = 4 << 20
+	}
+	if cfg.ConnectMode == "" {
+		cfg.ConnectMode = ConnectModeUnique
+	}
+	if cfg.NotKickSeconds <= 0 {
+		cfg.NotKickSeconds = 30
 	}
 	if cfg.Auth == nil {
 		cfg.Auth = AllowAll{}
@@ -67,17 +63,31 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.ACL == nil {
 		cfg.ACL = AllowAll{}
 	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = NoopMetrics{}
+	}
+	if cfg.WebsocketPath == "" {
+		cfg.WebsocketPath = "/mqtt"
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Broker{
+	b := &Broker{
 		cfg:      cfg,
 		log:      logger,
+		metrics:  cfg.Metrics,
 		clients:  make(map[string]*client),
 		retained: make(map[string]retainedMessage),
 		done:     make(chan struct{}),
-	}, nil
+	}
+	if cfg.ConnectionRateLimit > 0 {
+		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
+	}
+	if cfg.TLS.Enabled || cfg.SecurePort > 0 || cfg.WebsocketPort > 0 || cfg.WebsocketSecurePort > 0 {
+		logger.Warn("gmqx: TLS/WS listeners are configured but not implemented yet", "secure_port", cfg.SecurePort, "ws_port", cfg.WebsocketPort)
+	}
+	return b, nil
 }
 
 // Start begins listening. It returns once the listener is ready.
@@ -167,6 +177,22 @@ func (b *Broker) acceptLoop() {
 			}
 			return
 		}
+		if b.limiter != nil && !b.limiter.allow() {
+			b.metrics.RecordDroppedMessage("connection_rate_limit")
+			_ = conn.Close()
+			continue
+		}
+		if b.cfg.MaxConnections > 0 {
+			b.mu.RLock()
+			n := len(b.clients)
+			b.mu.RUnlock()
+			if n >= b.cfg.MaxConnections {
+				b.metrics.RecordDroppedMessage("max_connections")
+				b.metrics.RecordOverflow("connections")
+				_ = conn.Close()
+				continue
+			}
+		}
 		b.wg.Add(1)
 		go b.serve(conn)
 	}
@@ -176,54 +202,99 @@ func (b *Broker) serve(conn net.Conn) {
 	defer b.wg.Done()
 	c := newClient(b, conn)
 	if err := c.handshake(); err != nil {
+		if c.registered {
+			b.unregister(c)
+		}
 		b.log.Debug("gmqx handshake failed", "remote", conn.RemoteAddr(), "err", err)
 		_ = conn.Close()
 		return
 	}
-	b.register(c)
 	defer b.unregister(c)
 	c.loop()
 }
 
-func (b *Broker) register(c *client) {
+// register enforces connect mode and connection limits, then records the
+// session and calls the dispatcher. It mirrors jmqx's SessionRegistry.
+func (b *Broker) register(c *client) error {
 	b.mu.Lock()
 	if old, ok := b.clients[c.id]; ok && old != c {
+		if b.cfg.ConnectMode == ConnectModeUnique {
+			b.mu.Unlock()
+			return ErrClientIDInUse
+		}
+		delete(b.clients, c.id)
 		b.mu.Unlock()
 		old.close(false)
 		b.mu.Lock()
 	}
+	if b.cfg.MaxConnections > 0 && len(b.clients) >= b.cfg.MaxConnections {
+		b.mu.Unlock()
+		return ErrMaxConnections
+	}
 	b.clients[c.id] = c
+	c.registered = true
+	n := len(b.clients)
 	b.mu.Unlock()
+
+	b.metrics.IncrementConnections()
+	b.metrics.RecordConnections(n)
 	if b.cfg.Sink != nil {
 		b.cfg.Sink.OnConnect(context.Background(), c.info)
 	}
+	return nil
 }
 
 func (b *Broker) unregister(c *client) {
+	if !c.registered {
+		return
+	}
+	c.registered = false
 	b.mu.Lock()
 	if current, ok := b.clients[c.id]; ok && current == c {
 		delete(b.clients, c.id)
 	}
+	n := len(b.clients)
 	b.mu.Unlock()
+
+	b.metrics.DecrementConnections()
+	b.metrics.IncrementDisconnectEvents()
+	b.metrics.RecordConnections(n)
 	if b.cfg.Sink != nil {
-		b.cfg.Sink.OnDisconnect(context.Background(), c.id, c.closeErr)
+		if c.lost {
+			b.cfg.Sink.OnConnectionLost(context.Background(), c.id, c.closeErr)
+		} else {
+			b.cfg.Sink.OnDisconnect(context.Background(), c.id, c.closeErr)
+		}
 	}
 }
 
 func (b *Broker) subscribe(c *client, filter string, qos byte) byte {
-	if !b.cfg.ACL.CanSubscribe(context.Background(), c.id, filter) {
+	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
+		b.metrics.RecordDroppedMessage("acl_subscribe")
 		return 0x80
 	}
 	c.mu.Lock()
+	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions {
+		if _, exists := c.subs[filter]; !exists {
+			c.mu.Unlock()
+			b.metrics.RecordDroppedMessage("max_subscriptions")
+			return 0x80
+		}
+	}
 	c.subs[filter] = qos
 	c.mu.Unlock()
+	b.metrics.IncrementSubscribeEvents()
 	return qos
 }
 
 func (b *Broker) unsubscribe(c *client, filter string) {
 	c.mu.Lock()
+	_, existed := c.subs[filter]
 	delete(c.subs, filter)
 	c.mu.Unlock()
+	if existed {
+		b.metrics.DecrementSubscribeEvents()
+	}
 }
 
 func (b *Broker) sendRetained(c *client, filter string, qos byte) {
@@ -241,48 +312,56 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte) {
 }
 
 func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, retain bool) {
-	if !b.cfg.ACL.CanPublish(context.Background(), from.id, topic) {
+	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, topic, AclPublish) {
+		b.metrics.RecordDroppedMessage("acl_publish")
 		return
+	}
+	for _, it := range b.cfg.Interceptors {
+		if !it.OnPublish(context.Background(), from.id, topic, payload, qos) {
+			b.metrics.RecordDroppedMessage("interceptor")
+			return
+		}
 	}
 	if retain {
 		b.mu.Lock()
 		if len(payload) == 0 {
 			delete(b.retained, topic)
 		} else {
-			b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos}
+			_, exists := b.retained[topic]
+			if b.cfg.MaxRetainMessages <= 0 || exists || int64(len(b.retained)) < b.cfg.MaxRetainMessages {
+				b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos}
+			} else {
+				b.metrics.RecordDroppedMessage("max_retain")
+			}
 		}
 		b.mu.Unlock()
 	}
 	if b.cfg.Sink != nil {
 		b.cfg.Sink.OnPublish(context.Background(), from.id, topic, payload, qos)
 	}
+	b.metrics.IncrementPublishedMessages()
+
 	b.mu.RLock()
-	subs := make([]*client, 0)
-	seen := make(map[*client]bool)
+	targets := make([]*client, 0)
 	for _, c := range b.clients {
 		if c == from {
 			continue
 		}
 		c.mu.Lock()
-		granted := byte(0)
 		found := false
-		for filter, q := range c.subs {
+		for filter := range c.subs {
 			if matchTopic(filter, topic) {
 				found = true
-				if q > granted {
-					granted = q
-				}
+				break
 			}
 		}
 		c.mu.Unlock()
-		if found && !seen[c] {
-			seen[c] = true
-			subs = append(subs, c)
-			_ = granted
+		if found {
+			targets = append(targets, c)
 		}
 	}
 	b.mu.RUnlock()
-	for _, c := range subs {
+	for _, c := range targets {
 		_ = c.sendPublish(topic, payload, qos, false)
 	}
 }
@@ -298,4 +377,33 @@ func randomID() string {
 	buf := make([]byte, 8)
 	_, _ = rand.Read(buf)
 	return "gmqx-" + hex.EncodeToString(buf)
+}
+
+// rateLimiter is a simple token bucket used for connection rate limiting.
+type rateLimiter struct {
+	mu     sync.Mutex
+	rate   float64
+	burst  float64
+	tokens float64
+	last   time.Time
+}
+
+func newRateLimiter(rate int) *rateLimiter {
+	return &rateLimiter{rate: float64(rate), burst: float64(rate), tokens: float64(rate), last: time.Now()}
+}
+
+func (r *rateLimiter) allow() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	r.tokens += now.Sub(r.last).Seconds() * r.rate
+	if r.tokens > r.burst {
+		r.tokens = r.burst
+	}
+	r.last = now
+	if r.tokens < 1 {
+		return false
+	}
+	r.tokens--
+	return true
 }
