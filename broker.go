@@ -441,39 +441,73 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 	}
 }
 
-func (b *Broker) publish(from *client, topic string, payload []byte, qos byte, retain bool, props []byte) bool {
-	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, topic, AclPublish) {
+// publish authorizes, hands the message to the sink and only then delivers it.
+// The returned verdict decides whether the caller may acknowledge, so nothing
+// here may claim durability the sink did not confirm.
+func (b *Broker) publish(from *client, ev PublishEvent) PublishResult {
+	ev.ConnectionID = from.connID
+	ev.ClientID = from.id
+	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, ev.Topic, AclPublish) {
 		b.metrics.RecordDroppedMessage("acl_publish")
-		return false
+		return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 	}
 	for _, it := range b.cfg.Interceptors {
-		if !it.OnPublish(context.Background(), from.id, topic, payload, qos) {
+		if !it.OnPublish(context.Background(), from.id, ev.Topic, ev.Payload, ev.QoS) {
 			b.metrics.RecordDroppedMessage("interceptor")
-			return false
+			return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 		}
 	}
-	if retain {
+	if res := b.callSink(ev); !res.Accepted() {
+		reason := "sink_rejected"
+		if res.Disposition == PublishRetryable {
+			reason = "sink_retryable"
+		}
+		b.metrics.RecordDroppedMessage(reason)
+		return res
+	}
+	// Retain is stored only for accepted publishes: a rejected message must not
+	// become the retained value new subscribers receive.
+	if ev.Retain {
 		b.mu.Lock()
-		if len(payload) == 0 {
-			delete(b.retained, topic)
+		if len(ev.Payload) == 0 {
+			delete(b.retained, ev.Topic)
 		} else {
-			_, exists := b.retained[topic]
+			_, exists := b.retained[ev.Topic]
 			if b.cfg.MaxRetainMessages <= 0 || exists || int64(len(b.retained)) < b.cfg.MaxRetainMessages {
-				b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: append([]byte(nil), props...)}
+				b.retained[ev.Topic] = retainedMessage{topic: ev.Topic, payload: append([]byte(nil), ev.Payload...), qos: ev.QoS, props: append([]byte(nil), ev.Properties...)}
 			} else {
 				b.metrics.RecordDroppedMessage("max_retain")
 			}
 		}
 		b.mu.Unlock()
 	}
-	if b.cfg.Sink != nil {
-		b.cfg.Sink.OnPublish(context.Background(), from.id, topic, payload, qos)
-	}
 	b.metrics.IncrementPublishedMessages()
 
-	b.deliverLocal(topic, payload, qos, from, props, retain)
-	b.spreadPublish(topic, payload, qos, retain, props)
-	return true
+	b.deliverLocal(ev.Topic, ev.Payload, ev.QoS, from, ev.Properties, ev.Retain)
+	b.spreadPublish(ev.Topic, ev.Payload, ev.QoS, ev.Retain, ev.Properties)
+	return PublishResult{Disposition: PublishAccepted}
+}
+
+// callSink runs the sink, optionally with a bounded wait. Without a configured
+// timeout the call is synchronous and allocation-free on the hot path.
+func (b *Broker) callSink(ev PublishEvent) PublishResult {
+	if b.cfg.Sink == nil {
+		return PublishResult{Disposition: PublishAccepted}
+	}
+	timeout := b.cfg.PublishCallbackTimeout
+	if timeout <= 0 {
+		return b.cfg.Sink.OnPublish(context.Background(), ev)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	done := make(chan PublishResult, 1)
+	go func() { done <- b.cfg.Sink.OnPublish(ctx, ev) }()
+	select {
+	case res := <-done:
+		return res
+	case <-ctx.Done():
+		return PublishResult{Disposition: PublishRetryable, ReasonCode: ReasonQuotaExceeded}
+	}
 }
 
 func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *client, props []byte, retain bool) int {

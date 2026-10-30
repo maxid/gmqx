@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+- **H1: result-bearing publish.** `EventSink.OnPublish` now receives a
+  `PublishEvent` (connection id, client id, topic, payload, QoS, packet id,
+  retain, properties) and returns a `PublishResult` (`PublishAccepted` /
+  `PublishRetryable` / `PublishRejected` + MQTT 5 reason code). PUBACK/PUBREC is
+  sent **only** after an accepted result: MQTT 3.1.1 has no negative ack, so a
+  retryable or rejected publish is left unacknowledged rather than acknowledged
+  optimistically. `Config.PublishCallbackTimeout` bounds the sink wait and makes
+  an expired wait retryable. Retained state is now written only for accepted
+  publishes, so a rejected message cannot become the retained value.
+
+- Publisher identity: `ConnectionID` is a process-unique physical connection id,
+  distinct from the client id that survives reconnects.
+
 - MQTT 3.1 (`MQIsdp`, protocol level 3) CONNECT compatibility; v3.1 client-id rules.
 
 

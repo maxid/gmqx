@@ -42,12 +42,64 @@ type AclManager interface {
 	RequiresOffload() bool
 }
 
+// ConnectionID identifies one physical connection. A client that reconnects
+// gets a new ConnectionID even when it keeps its ClientID.
+type ConnectionID string
+
+// Disposition is the sink's verdict on an inbound PUBLISH.
+type Disposition byte
+
+const (
+	// PublishAccepted means the message is durable enough to acknowledge.
+	PublishAccepted Disposition = iota
+	// PublishRetryable means the broker must not acknowledge; the client may
+	// retry later. A bounded wait that expires is Retryable.
+	PublishRetryable
+	// PublishRejected means the message must be neither delivered nor
+	// acknowledged.
+	PublishRejected
+)
+
+// MQTT 5 reason codes used when a sink does not pick one.
+const (
+	ReasonUnspecified   byte = 0x80
+	ReasonNotAuthorized byte = 0x87
+	ReasonQuotaExceeded byte = 0x97
+)
+
+// PublishResult is what the sink hands back. ReasonCode 0 lets the broker choose
+// a default for the disposition.
+type PublishResult struct {
+	Disposition Disposition
+	ReasonCode  byte
+}
+
+// Accepted reports whether the publish may be acknowledged and delivered.
+func (r PublishResult) Accepted() bool { return r.Disposition == PublishAccepted }
+
+// PublishEvent describes one inbound PUBLISH.
+type PublishEvent struct {
+	ConnectionID ConnectionID
+	ClientID     string
+	Topic        string
+	Payload      []byte
+	QoS          byte
+	PacketID     uint16
+	Retain       bool
+	Properties   []byte
+}
+
 // EventSink receives broker lifecycle and message events.
+//
+// OnPublish returns the verdict that decides the acknowledgement: the broker
+// sends PUBACK/PUBREC only after an Accepted result. MQTT 3.1.1 has no negative
+// PUBACK, so a retryable or rejected publish is simply not acknowledged — never
+// acknowledged optimistically.
 type EventSink interface {
 	OnConnect(ctx context.Context, info ConnectInfo)
 	OnDisconnect(ctx context.Context, clientID string, err error)
 	OnConnectionLost(ctx context.Context, clientID string, err error)
-	OnPublish(ctx context.Context, clientID, topic string, payload []byte, qos byte)
+	OnPublish(ctx context.Context, ev PublishEvent) PublishResult
 	OnPing(ctx context.Context, clientID string)
 }
 

@@ -67,12 +67,16 @@ type Config struct {
 	ConnectionRateLimit   int
 
 	// SPI
-	Auth         AuthManager
-	ACL          AclManager
-	Sink         EventSink
-	Metrics      MetricsManager
-	Interceptors []Interceptor
-	Cluster      ClusterConfig
+	Auth AuthManager
+	ACL  AclManager
+	Sink EventSink
+	// PublishCallbackTimeout bounds how long a publish waits for the sink. When
+	// it expires the publish is Retryable and no success ACK is sent. Zero waits
+	// without a bound (the sink must respect ctx).
+	PublishCallbackTimeout time.Duration
+	Metrics                MetricsManager
+	Interceptors           []Interceptor
+	Cluster                ClusterConfig
 	// ClusterBackend enables cross-node routing (optional).
 	ClusterBackend Cluster
 	// NodeID identifies this broker in the cluster (default random).

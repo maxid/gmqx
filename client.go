@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +23,7 @@ type subscription struct {
 type client struct {
 	broker *Broker
 	conn   net.Conn
+	connID ConnectionID
 	r      *bufio.Reader
 	wmu    sync.Mutex
 
@@ -44,6 +47,7 @@ type client struct {
 func newClient(b *Broker, conn net.Conn) *client {
 	return &client{
 		broker:       b,
+		connID:       nextConnectionID(),
 		conn:         conn,
 		r:            bufio.NewReaderSize(conn, 4096),
 		subs:         make(map[string]subscription),
@@ -203,20 +207,21 @@ func (c *client) handlePublish(header byte, payload []byte) {
 	if !validTopic(topic) {
 		return
 	}
-	allowed := c.broker.publish(c, topic, rest, qos, retain, props)
+	res := c.broker.publish(c, PublishEvent{
+		ConnectionID: c.connID,
+		ClientID:     c.id,
+		Topic:        topic,
+		Payload:      rest,
+		QoS:          qos,
+		PacketID:     pid,
+		Retain:       retain,
+		Properties:   props,
+	})
 	switch qos {
 	case 1:
-		if c.version == 5 && !allowed {
-			_ = c.writeAckReason(0x40, pid, 0x87)
-		} else {
-			_ = c.writeAck(0x40, pid)
-		}
+		c.ackPublish(0x40, pid, res)
 	case 2:
-		if c.version == 5 && !allowed {
-			_ = c.writeAckReason(0x50, pid, 0x87)
-		} else {
-			_ = c.writeAck(0x50, pid)
-		}
+		c.ackPublish(0x50, pid, res)
 	}
 }
 
@@ -369,7 +374,7 @@ func (c *client) close(withWill bool) {
 	c.mu.Unlock()
 	_ = c.conn.Close()
 	if will != nil && c.broker != nil {
-		c.broker.publish(c, will.topic, will.payload, 0, false, nil)
+		_ = c.broker.publish(c, PublishEvent{Topic: will.topic, Payload: will.payload})
 	}
 }
 
@@ -392,4 +397,33 @@ func connackQuotaExceeded(version byte) byte {
 		return 0x97
 	}
 	return 5
+}
+
+// ackPublish acknowledges an accepted publish. A retryable or rejected publish
+// gets no success ACK: MQTT 3.1.1 has no negative PUBACK, and an optimistic ACK
+// would claim durability the broker does not have. MQTT 5 clients get the reason
+// code instead.
+func (c *client) ackPublish(header byte, pid uint16, res PublishResult) {
+	if res.Accepted() {
+		_ = c.writeAck(header, pid)
+		return
+	}
+	code := res.ReasonCode
+	if code == 0 {
+		if res.Disposition == PublishRetryable {
+			code = ReasonQuotaExceeded
+		} else {
+			code = ReasonUnspecified
+		}
+	}
+	if c.version == 5 {
+		_ = c.writeAckReason(header, pid, code)
+	}
+}
+
+var connSeq atomic.Uint64
+
+// nextConnectionID returns a process-unique connection identifier.
+func nextConnectionID() ConnectionID {
+	return ConnectionID(strconv.FormatUint(connSeq.Add(1), 10))
 }
