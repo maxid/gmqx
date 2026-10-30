@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/maxid/gnety v0.0.0-20261029145257-69f54fb93e0b
+	github.com/maxid/gnety v0.0.0-20261029145257-cc4561dc704f
 )
 
 require (
