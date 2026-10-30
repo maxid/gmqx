@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- MQTT 3.1 (`MQIsdp`, protocol level 3) CONNECT compatibility; v3.1 client-id rules.
+
+
 - Cluster interface (`Cluster`/`ClusterMessage`) and broker hooks for cross-node
   publish and kick; in-memory two-node test.
 

@@ -39,11 +39,12 @@ func parseConnect(payload []byte) (ConnectInfo, byte, connectProperties, error) 
 	if err != nil {
 		return info, 0, props, err
 	}
-	if name != "MQTT" || len(rest) < 4 {
+	if len(rest) < 4 {
 		return info, 0, props, ErrUnsupportedProtocol
 	}
 	level := rest[0]
-	if level != 4 && level != 5 {
+	// MQTT 3.1 uses protocol name "MQIsdp" with level 3; 3.1.1/5.0 use "MQTT".
+	if !((name == "MQTT" && (level == 4 || level == 5)) || (name == "MQIsdp" && level == 3)) {
 		return info, 0, props, ErrUnsupportedProtocol
 	}
 	flags := rest[1]

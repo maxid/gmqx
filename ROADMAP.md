@@ -1,6 +1,6 @@
 # Roadmap
 
-- [x] MQTT 3.1.1 TCP packet codec
+- [x] MQTT 3.1/3.1.1 TCP packet codec
 - [x] Session/subscriptions/wildcards/QoS 0–2 basic/retained/will/keepalive
 - [x] Auth & ACL hook interfaces
 - [x] TCP/TLS/WS/WSS transport via gnety (`RawHandler`); MQTT codec/state machine in gmqx

@@ -8,7 +8,7 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
 ## Features
 
-- MQTT 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
+- MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
 - MQTT 5: CONNACK capability properties, Topic Alias, User Property forwarding,
   subscription options (no-local / retain-as-published / retain-handling), reason codes

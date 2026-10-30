@@ -72,12 +72,16 @@ func (c *client) handshake() error {
 	}
 	assigned := ""
 	if info.ClientID == "" {
-		if !info.CleanSession {
+		if version == 3 || !info.CleanSession {
 			_ = c.writeConnack(version, connackClientIDInvalid(version), "")
-			return fmt.Errorf("%w: empty client id requires clean session", ErrMalformedPacket)
+			return fmt.Errorf("%w: empty client id is not allowed", ErrMalformedPacket)
 		}
 		info.ClientID = randomID()
 		assigned = info.ClientID
+	}
+	if version == 3 && len(info.ClientID) > 23 {
+		_ = c.writeConnack(version, connackClientIDInvalid(version), "")
+		return fmt.Errorf("%w: MQTT 3.1 client id exceeds 23 characters", ErrMalformedPacket)
 	}
 	c.mu.Lock()
 	c.id = info.ClientID
