@@ -119,12 +119,13 @@ func (b *Broker) Start(ctx context.Context) error {
 	var started []*gnety.Server
 	for _, spec := range specs {
 		srv, err := gnety.New(gnety.Config{
-			Network:     spec.network,
-			Addr:        spec.addr,
-			Path:        spec.path,
-			Subprotocol: spec.subprotocol,
-			TLS:         spec.tls,
-			RawHandler:  b.handleRaw,
+			Network:        spec.network,
+			Addr:           spec.addr,
+			Path:           spec.path,
+			Subprotocol:    spec.subprotocol,
+			AllowAnyOrigin: spec.allowAnyOrigin,
+			TLS:            spec.tls,
+			RawHandler:     b.handleRaw,
 		})
 		if err == nil {
 			err = srv.Start(ctx)
@@ -165,12 +166,13 @@ func (b *Broker) Start(ctx context.Context) error {
 }
 
 type listenerSpec struct {
-	name        string
-	network     string
-	addr        string
-	path        string
-	subprotocol string
-	tls         gnety.TLSConfig
+	name           string
+	network        string
+	addr           string
+	path           string
+	subprotocol    string
+	allowAnyOrigin bool
+	tls            gnety.TLSConfig
 }
 
 func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
@@ -195,11 +197,12 @@ func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
 	}
 	if addr := addrOrPort(b.cfg.WebsocketAddr, b.cfg.WebsocketPort); addr != "" {
 		specs = append(specs, listenerSpec{
-			name:        "ws",
-			network:     "ws",
-			addr:        addr,
-			path:        b.cfg.WebsocketPath,
-			subprotocol: "mqtt",
+			name:           "ws",
+			network:        "ws",
+			addr:           addr,
+			path:           b.cfg.WebsocketPath,
+			subprotocol:    "mqtt",
+			allowAnyOrigin: true, // preserve jmqx/device gateway behavior; no browser Origin boundary
 		})
 	}
 	if addr := addrOrPort(b.cfg.WebsocketSecureAddr, b.cfg.WebsocketSecurePort); addr != "" {
@@ -207,12 +210,13 @@ func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
 			return nil, errors.New("gmqx: WSS requires TLS.Enabled and certificate")
 		}
 		specs = append(specs, listenerSpec{
-			name:        "wss",
-			network:     "wss",
-			addr:        addr,
-			path:        b.cfg.WebsocketPath,
-			subprotocol: "mqtt",
-			tls:         b.gnetyTLS(),
+			name:           "wss",
+			network:        "wss",
+			addr:           addr,
+			path:           b.cfg.WebsocketPath,
+			subprotocol:    "mqtt",
+			allowAnyOrigin: true, // preserve jmqx/device gateway behavior; no browser Origin boundary
+			tls:            b.gnetyTLS(),
 		})
 	}
 	return specs, nil
