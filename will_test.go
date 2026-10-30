@@ -104,8 +104,9 @@ func dialWithConnect(t *testing.T, addr string, body []byte) *testClient {
 
 // TestWillOnCleanDisconnectAndLoss pins both halves of the will contract: a
 // DISCONNECT ends the session cleanly and drops the will, while a dropped
-// connection is a loss that publishes it. The clean leg is the one the typed
-// packet layer has to reach as a real packet instead of waiting for more bytes.
+// connection is a loss that publishes it. The clean leg also pins that an
+// empty-body MQTT 5 DISCONNECT is a complete frame the decoder consumes on its
+// own.
 func TestWillOnCleanDisconnectAndLoss(t *testing.T) {
 	sink := &lifecycleSink{}
 	b := startBroker(t, Config{Sink: sink})
@@ -152,5 +153,50 @@ func TestWillOnCleanDisconnectAndLoss(t *testing.T) {
 	waitEnded(t, sink, 3)
 	if cleanCount, lostCount := sink.counts(); cleanCount != 2 || lostCount != 1 {
 		t.Fatalf("dropped connection recorded as %d clean / %d lost", cleanCount, lostCount)
+	}
+}
+
+// TestMQTT5DisconnectDecodedByCodec is the regression pin for the frames the
+// decoder must consume on its own: the minimal E0 00 DISCONNECT a client sends
+// on a clean shutdown and one that carries a reason code. Both end the session
+// cleanly: the will is dropped and the sink sees OnDisconnect, never
+// OnConnectionLost.
+func TestMQTT5DisconnectDecodedByCodec(t *testing.T) {
+	tests := []struct {
+		name       string
+		clientID   string
+		disconnect []byte
+	}{
+		{"empty body", "disc-empty", []byte{0xE0, 0x00}},
+		{"reason code", "disc-reason", []byte{0xE0, 0x01, 0x00}}, // Normal disconnection
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sink := &lifecycleSink{}
+			b := startBroker(t, Config{Sink: sink})
+
+			sub := dialTestClient(t, b.Addr(), "disc-sub-"+tt.clientID)
+			subBody := []byte{0, 1}
+			subBody = appendString(subBody, "will/topic")
+			subBody = append(subBody, 0)
+			sub.writePacket(0x82, subBody)
+			if h, p, err := sub.readPacket(); err != nil || h != 0x90 || len(p) < 3 || p[2] != 0 {
+				t.Fatalf("suback: %x %v %v", h, p, err)
+			}
+
+			c := dialWithConnect(t, b.Addr(), connectV5WithWillPayload(tt.clientID, "will/topic", "published"))
+			if _, err := c.conn.Write(tt.disconnect); err != nil {
+				t.Fatal(err)
+			}
+			waitEnded(t, sink, 1)
+			if clean, lost := sink.counts(); clean != 1 || lost != 0 {
+				t.Fatalf("disconnect recorded as %d clean / %d lost", clean, lost)
+			}
+
+			_ = sub.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			if h, _, err := sub.readPacket(); err == nil {
+				t.Fatalf("will published on a clean disconnect: %#x", h)
+			}
+		})
 	}
 }

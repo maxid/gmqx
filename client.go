@@ -72,34 +72,8 @@ func (c *client) header() mqtt.MessageHeader {
 // readMessage reads and decodes one control packet. The typed codec owns the
 // wire format, so gmqx never branches on a fixed-header byte.
 func (c *client) readMessage() (mqtt.Message, error) {
-	if m, ok := c.emptyDisconnect(); ok {
-		return m, nil
-	}
 	d := mqtt.Decoder{Version: c.version, MaxPacketSize: c.broker.cfg.MaxPacketSize}
 	return d.Decode(c.r)
-}
-
-// emptyDisconnect consumes the DISCONNECT an MQTT 5 client sends when it says
-// goodbye: type and flags 0xE0, remaining length 0, nothing else.
-//
-// The typed decoder cannot take that frame. For a zero remaining length it gives
-// its body reader a one-byte budget, so the decoder's own "no body left?" test
-// sees a byte and reads the optional reason code — from whatever comes next on
-// the stream. gmqx recognizes the two-byte frame instead of waiting for a byte a
-// well-behaved client never sends. Every other DISCONNECT (with a reason code,
-// with properties, or any MQTT 3.1.1 one) still goes through the decoder.
-func (c *client) emptyDisconnect() (mqtt.Message, bool) {
-	if c.version != mqtt.Version5 {
-		return nil, false
-	}
-	head, err := c.r.Peek(2)
-	if err != nil || head[0] != mqtt.TypeDisconnect<<4 || head[1] != 0 {
-		return nil, false
-	}
-	if _, err := c.r.Discard(2); err != nil {
-		return nil, false
-	}
-	return &mqtt.Disconnect{MessageHeader: c.header()}, true
 }
 
 // writeMessage encodes one packet and writes it, serialized per connection.
