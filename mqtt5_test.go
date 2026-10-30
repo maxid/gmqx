@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/maxid/gnety/codec/mqtt"
 )
 
 func connectV5Payload(clientID string, props []byte) []byte {
@@ -200,10 +202,14 @@ func TestMQTT5TopicAliasAndUserProperty(t *testing.T) {
 	if topic != "alias/topic" || string(payload) != "one" {
 		t.Fatalf("unexpected first publish: topic=%q payload=%q", topic, payload)
 	}
-	if !containsProperty(gotProps, 0x26) {
+	forwarded, err := decodePropertyBlock(gotProps)
+	if err != nil {
+		t.Fatalf("forwarded properties %x: %v", gotProps, err)
+	}
+	if len(forwarded.UserProperties) != 1 || forwarded.UserProperties[0].Key != "key" || forwarded.UserProperties[0].Value != "v" {
 		t.Fatalf("user property not forwarded: %x", gotProps)
 	}
-	if containsProperty(gotProps, 0x23) {
+	if forwarded.TopicAlias != 0 {
 		t.Fatalf("topic alias should not be forwarded: %x", gotProps)
 	}
 
@@ -214,22 +220,6 @@ func TestMQTT5TopicAliasAndUserProperty(t *testing.T) {
 	if topic != "alias/topic" || string(payload) != "two" {
 		t.Fatalf("alias resolve failed: topic=%q payload=%q", topic, payload)
 	}
-}
-
-func containsProperty(props []byte, want byte) bool {
-	for len(props) > 0 {
-		id := props[0]
-		props = props[1:]
-		n, err := lengthOfProperty(id, props)
-		if err != nil {
-			return false
-		}
-		if id == want {
-			return true
-		}
-		props = props[n:]
-	}
-	return false
 }
 
 func readPacketFrom(r *bufio.Reader) (byte, []byte, error) {
@@ -260,26 +250,44 @@ func TestMQTT5ConnackProperties(t *testing.T) {
 	frame := appendRemainingLength([]byte{0x10}, len(body))
 	frame = append(frame, body...)
 	_, _ = conn.Write(frame)
-	r := bufio.NewReader(conn)
-	header, err := r.ReadByte()
+
+	decoder := mqtt.Decoder{Version: mqtt.Version5}
+	msg, err := decoder.Decode(bufio.NewReader(conn))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("decode connack: %v", err)
 	}
-	n, _ := readRemainingLength(r)
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		t.Fatal(err)
+	ack, ok := msg.(*mqtt.Connack)
+	if !ok {
+		t.Fatalf("expected CONNACK, got %T", msg)
 	}
-	if header>>4 != 2 || len(payload) < 3 || payload[1] != 0 {
-		t.Fatalf("unexpected connack: %x %v", header, payload)
+	if ack.ReasonCode != 0 || ack.SessionPresent {
+		t.Fatalf("connack reason=%d session=%v", ack.ReasonCode, ack.SessionPresent)
 	}
-	props, _, err := readPropertyBlock(payload[2:])
-	if err != nil {
-		t.Fatalf("read connack properties: %v", err)
+	p := ack.Properties
+	if p.RetainAvailable == nil || !*p.RetainAvailable {
+		t.Fatalf("CONNACK does not declare retain support: %+v", p)
 	}
-	for _, id := range []byte{0x25, 0x28, 0x24, 0x27, 0x22, 0x29, 0x2A} {
-		if !containsProperty(props, id) {
-			t.Fatalf("connack properties missing 0x%02x: %x", id, props)
-		}
+	if p.WildcardSubscriptionAvailable == nil || !*p.WildcardSubscriptionAvailable {
+		t.Fatalf("CONNACK does not declare wildcard subscriptions: %+v", p)
+	}
+	if p.SubscriptionIdentifierAvailable == nil || *p.SubscriptionIdentifierAvailable {
+		t.Fatalf("CONNACK must declare subscription identifiers unsupported: %+v", p)
+	}
+	if p.SharedSubscriptionAvailable == nil || *p.SharedSubscriptionAvailable {
+		t.Fatalf("CONNACK must declare shared subscriptions unsupported: %+v", p)
+	}
+	if p.TopicAliasMaximum != topicAliasMaximum {
+		t.Fatalf("topic alias maximum = %d, want %d", p.TopicAliasMaximum, topicAliasMaximum)
+	}
+	if want := uint32(b.cfg.MaxPacketSize); p.MaximumPacketSize != want {
+		t.Fatalf("maximum packet size = %d, want %d", p.MaximumPacketSize, want)
+	}
+	// Absent Maximum QoS means QoS 2, and the specification allows no other
+	// value than 0 or 1 for it.
+	if p.MaximumQoS != nil {
+		t.Fatalf("CONNACK must not cap the maximum QoS: %d", *p.MaximumQoS)
+	}
+	if p.AssignedClientID != "" {
+		t.Fatalf("unexpected assigned client id %q", p.AssignedClientID)
 	}
 }

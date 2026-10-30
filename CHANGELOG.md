@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+- **Packet layer on the typed codec.** gmqx no longer parses or builds MQTT
+  packets byte by byte: `mqtt.Decoder` reads every packet, `mqtt.Encode` writes
+  every packet, and the connection loop switches on the concrete message type
+  (`*mqtt.Publish`, `*mqtt.Subscribe`, ...) instead of the fixed-header byte.
+  `packet.go` and `properties.go` are deleted; the new `props.go` holds only the
+  seam that converts the typed MQTT 5 property set to and from the property
+  bytes `PublishEvent.Properties` and `ClusterMessage.Props` carry. Public API is
+  unchanged. Wire-visible differences, all spec-correct: the CONNACK no longer
+  advertises the invalid `Maximum QoS 2` (an absent value already means QoS 2),
+  MQTT 5 UNSUBACK carries one reason code per filter, and MQTT 5 unacknowledged
+  defaults (reason code 0, empty property block) are omitted as the
+  specification allows. MQTT 3.1 keeps working: its CONNECT is rewritten to the
+  3.1.1 spelling before the codec sees it.
+
 - **H1: result-bearing publish.** `EventSink.OnPublish` now receives a
   `PublishEvent` (connection id, client id, topic, payload, QoS, packet id,
   retain, properties) and returns a `PublishResult` (`PublishAccepted` /

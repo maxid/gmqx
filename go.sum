@@ -1,8 +1,8 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/maxid/gnety v0.0.0-20261030061629-c27f7dc577c3 h1:RyQ8FE1UFlsUiEWlYc1K+TPYGFV4wsXHqkp+QP8nEYo=
-github.com/maxid/gnety v0.0.0-20261030061629-c27f7dc577c3/go.mod h1:uVjoynffjJX5EZV0eS8cpUJ8X2Nhzmnq0Ywqq0ia2es=
+github.com/maxid/gnety v0.0.0-20261030085136-3bdd021c31cd h1:OaI0Snf4oNySX05Fl8Bq+CvMuRneLdLMRb+sN89SA0s=
+github.com/maxid/gnety v0.0.0-20261030085136-3bdd021c31cd/go.mod h1:uVjoynffjJX5EZV0eS8cpUJ8X2Nhzmnq0Ywqq0ia2es=
 github.com/pion/dtls/v2 v2.2.12 h1:KP7H5/c1EiVAAKUmXyCzPiQe5+bCJrpOeKg/L05dunk=
 github.com/pion/dtls/v2 v2.2.12/go.mod h1:d9SYc9fch0CqK90mRk1dC7AkzzpwJj6u2GU3u+9pqFE=
 github.com/pion/logging v0.2.2 h1:M9+AIj/+pxNsDfAT64+MAVgJO0rsyLnoJKCqf//DoeY=

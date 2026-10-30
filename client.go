@@ -2,7 +2,9 @@ package gmqx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/maxid/gnety/codec/mqtt"
+	"github.com/maxid/gnety/codec/wire"
 )
 
 // subscription stores MQTT 5 subscription options.
@@ -38,10 +43,13 @@ type client struct {
 	username     string
 	registered   bool
 	lost         bool
-	version      byte
-	props        connectProperties
 	topicAliases map[uint16]string
 	outPID       uint16
+
+	// version is the protocol level of the connection: mqtt.Version311 or
+	// mqtt.Version5. MQTT 3.1 clients decode and encode with the 3.1.1 layout,
+	// which is byte-identical for everything except CONNECT.
+	version byte
 }
 
 func newClient(b *Broker, conn net.Conn) *client {
@@ -52,39 +60,152 @@ func newClient(b *Broker, conn net.Conn) *client {
 		r:            bufio.NewReaderSize(conn, 4096),
 		subs:         make(map[string]subscription),
 		topicAliases: make(map[uint16]string),
+		version:      mqtt.Version311,
 	}
 }
 
+// header is the protocol level every packet this client sends carries.
+func (c *client) header() mqtt.MessageHeader {
+	return mqtt.MessageHeader{Level: c.version}
+}
+
+// readMessage reads and decodes one control packet. The typed codec owns the
+// wire format, so gmqx never branches on a fixed-header byte.
+func (c *client) readMessage() (mqtt.Message, error) {
+	if m, ok := c.emptyDisconnect(); ok {
+		return m, nil
+	}
+	d := mqtt.Decoder{Version: c.version, MaxPacketSize: c.broker.cfg.MaxPacketSize}
+	return d.Decode(c.r)
+}
+
+// emptyDisconnect consumes the DISCONNECT an MQTT 5 client sends when it says
+// goodbye: type and flags 0xE0, remaining length 0, nothing else.
+//
+// The typed decoder cannot take that frame. For a zero remaining length it gives
+// its body reader a one-byte budget, so the decoder's own "no body left?" test
+// sees a byte and reads the optional reason code — from whatever comes next on
+// the stream. gmqx recognizes the two-byte frame instead of waiting for a byte a
+// well-behaved client never sends. Every other DISCONNECT (with a reason code,
+// with properties, or any MQTT 3.1.1 one) still goes through the decoder.
+func (c *client) emptyDisconnect() (mqtt.Message, bool) {
+	if c.version != mqtt.Version5 {
+		return nil, false
+	}
+	head, err := c.r.Peek(2)
+	if err != nil || head[0] != mqtt.TypeDisconnect<<4 || head[1] != 0 {
+		return nil, false
+	}
+	if _, err := c.r.Discard(2); err != nil {
+		return nil, false
+	}
+	return &mqtt.Disconnect{MessageHeader: c.header()}, true
+}
+
+// writeMessage encodes one packet and writes it, serialized per connection.
+func (c *client) writeMessage(m mqtt.Message) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return mqtt.Encode(c.conn, m)
+}
+
+// readConnect reads the opening packet of a connection, which must be CONNECT.
+//
+// The frame is read first because the typed codec models MQTT 3.1.1 and 5.0
+// only: MQTT 3.1 (protocol name "MQIsdp", level 3) shares the CONNECT layout, so
+// a 3.1 body is rewritten to its 3.1.1 spelling and decoded by the codec like
+// any other packet. v31 reports that the client asked for 3.1, which only the
+// client-id rule cares about.
+func (c *client) readConnect() (connect *mqtt.Connect, v31 bool, err error) {
+	header, body, err := mqtt.ReadPacket(c.r, c.broker.cfg.MaxPacketSize)
+	if err != nil {
+		return nil, false, err
+	}
+	if header>>4 != mqtt.TypeConnect {
+		return nil, false, fmt.Errorf("%w: first packet is not CONNECT", ErrMalformedPacket)
+	}
+	body, v31 = normalizeV31Connect(body)
+	frame := mqtt.AppendRemainingLength([]byte{header}, len(body))
+	frame = append(frame, body...)
+	d := mqtt.Decoder{MaxPacketSize: c.broker.cfg.MaxPacketSize}
+	msg, err := d.Decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		return nil, false, connectError(err)
+	}
+	connect, ok := msg.(*mqtt.Connect)
+	if !ok {
+		return nil, false, fmt.Errorf("%w: first packet is not CONNECT", ErrMalformedPacket)
+	}
+	return connect, v31, nil
+}
+
+// normalizeV31Connect rewrites an MQTT 3.1 CONNECT body ("MQIsdp", level 3) to
+// the 3.1.1 spelling ("MQTT", level 4). Both versions lay out the connect flags,
+// the keep-alive and the payload identically, so the protocol name and the level
+// are the whole difference.
+func normalizeV31Connect(body []byte) ([]byte, bool) {
+	const name = "MQIsdp"
+	if len(body) < 2+len(name)+1 {
+		return body, false
+	}
+	if binary.BigEndian.Uint16(body) != uint16(len(name)) || string(body[2:2+len(name)]) != name || body[2+len(name)] != 3 {
+		return body, false
+	}
+	out := make([]byte, 0, len(body)-2)
+	out = append(out, 0, 4)
+	out = append(out, "MQTT"...)
+	out = append(out, mqtt.Version311)
+	return append(out, body[2+len(name)+1:]...), true
+}
+
+// connectError keeps "not an MQTT version this broker speaks" distinguishable
+// from "malformed CONNECT", as ErrUnsupportedProtocol documents.
+func connectError(err error) error {
+	if errors.Is(err, wire.ErrUnsupported) {
+		return fmt.Errorf("%w: %w", ErrUnsupportedProtocol, err)
+	}
+	return err
+}
+
+// connectInfo maps a decoded CONNECT onto the public ConnectInfo the SPI sees.
+func connectInfo(m *mqtt.Connect) ConnectInfo {
+	info := ConnectInfo{
+		ClientID:     string(m.ClientID),
+		Username:     string(m.Username),
+		Password:     m.Password,
+		KeepAlive:    m.KeepAlive,
+		CleanSession: m.CleanSession,
+	}
+	if m.Will != nil {
+		info.WillTopic = m.Will.Topic
+		info.WillPayload = m.Will.Payload
+	}
+	return info
+}
+
 func (c *client) handshake() error {
-	header, payload, err := c.readPacket()
+	connect, v31, err := c.readConnect()
 	if err != nil {
 		return err
 	}
-	if header>>4 != 1 {
-		return fmt.Errorf("%w: first packet is not CONNECT", ErrMalformedPacket)
-	}
-	info, version, props, err := parseConnect(payload)
-	if err != nil {
-		return err
-	}
-	c.version = version
-	c.props = props
+	c.version = connect.Version()
+	info := connectInfo(connect)
 	info.RemoteAddr = c.conn.RemoteAddr().String()
 	if err := c.broker.cfg.Auth.Authenticate(context.Background(), info); err != nil {
-		_ = c.writeConnack(version, connackNotAuthorized(version), "")
+		_ = c.writeConnack(connackNotAuthorized(c.version), "")
 		return fmt.Errorf("%w: %v", ErrUnauthorized, err)
 	}
 	assigned := ""
 	if info.ClientID == "" {
-		if version == 3 || !info.CleanSession {
-			_ = c.writeConnack(version, connackClientIDInvalid(version), "")
+		if v31 || !info.CleanSession {
+			_ = c.writeConnack(connackClientIDInvalid(c.version), "")
 			return fmt.Errorf("%w: empty client id is not allowed", ErrMalformedPacket)
 		}
 		info.ClientID = randomID()
 		assigned = info.ClientID
 	}
-	if version == 3 && len(info.ClientID) > 23 {
-		_ = c.writeConnack(version, connackClientIDInvalid(version), "")
+	if v31 && len(info.ClientID) > 23 {
+		_ = c.writeConnack(connackClientIDInvalid(c.version), "")
 		return fmt.Errorf("%w: MQTT 3.1 client id exceeds 23 characters", ErrMalformedPacket)
 	}
 	c.mu.Lock()
@@ -100,14 +221,14 @@ func (c *client) handshake() error {
 		code := byte(5)
 		switch {
 		case errors.Is(err, ErrClientIDInUse):
-			code = connackClientIDInvalid(version)
+			code = connackClientIDInvalid(c.version)
 		case errors.Is(err, ErrMaxConnections):
-			code = connackQuotaExceeded(version)
+			code = connackQuotaExceeded(c.version)
 		}
-		_ = c.writeConnack(version, code, "")
+		_ = c.writeConnack(code, "")
 		return err
 	}
-	if err := c.writeConnack(version, 0, assigned); err != nil {
+	if err := c.writeConnack(0, assigned); err != nil {
 		return err
 	}
 	return nil
@@ -123,7 +244,7 @@ func (c *client) loop() {
 		c.mu.Unlock()
 		_ = c.conn.SetReadDeadline(deadline)
 
-		header, payload, err := c.readPacket()
+		msg, err := c.readMessage()
 		if err != nil {
 			c.mu.Lock()
 			c.lost = true
@@ -131,28 +252,21 @@ func (c *client) loop() {
 			c.close(true)
 			return
 		}
-		switch header >> 4 {
-		case 3: // PUBLISH
-			c.handlePublish(header, payload)
-		case 6: // PUBREL
-			if len(payload) >= 2 {
-				pid := uint16(payload[0])<<8 | uint16(payload[1])
-				if c.version == 5 {
-					_ = c.writePacket(0x70, []byte{byte(pid >> 8), byte(pid), 0, 0})
-				} else {
-					_ = c.writeAck(0x70, pid)
-				}
-			}
-		case 8: // SUBSCRIBE
-			c.handleSubscribe(payload)
-		case 10: // UNSUBSCRIBE
-			c.handleUnsubscribe(payload)
-		case 12: // PINGREQ
-			_ = c.writePacket(0xD0, nil)
+		switch m := msg.(type) {
+		case *mqtt.Publish:
+			c.handlePublish(m)
+		case *mqtt.Pubrel:
+			c.handlePubrel(m)
+		case *mqtt.Subscribe:
+			c.handleSubscribe(m)
+		case *mqtt.Unsubscribe:
+			c.handleUnsubscribe(m)
+		case *mqtt.Pingreq:
+			_ = c.writeMessage(&mqtt.Pingresp{MessageHeader: c.header()})
 			if c.broker.cfg.Sink != nil {
 				c.broker.cfg.Sink.OnPing(context.Background(), c.id)
 			}
-		case 14: // DISCONNECT
+		case *mqtt.Disconnect:
 			c.mu.Lock()
 			c.will = nil
 			c.lost = false
@@ -160,48 +274,42 @@ func (c *client) loop() {
 			c.close(false)
 			return
 		default:
-			c.broker.log.Debug("gmqx ignoring packet type", "type", header>>4)
+			c.broker.log.Debug("gmqx ignoring packet type", "type", msg.Type())
 		}
 	}
 }
 
-func (c *client) handlePublish(header byte, payload []byte) {
-	qos := (header >> 1) & 0x3
-	retain := header&0x1 == 1
-	topic, rest, err := readString(payload)
-	if err != nil {
-		return
-	}
-	var pid uint16
-	if qos > 0 {
-		pid, rest, err = readUint16(rest)
-		if err != nil {
-			return
-		}
-	}
-	var props []byte
-	if c.version == 5 {
-		block, next, err := readPropertyBlock(rest)
-		if err != nil {
-			return
-		}
-		var alias *uint16
-		props, alias, err = filterPublishProperties(block)
-		if err != nil {
-			return
-		}
-		rest = next
+// handlePubrel releases an inbound QoS 2 publish: the client waits for the
+// PUBCOMP before it reuses the packet id.
+func (c *client) handlePubrel(m *mqtt.Pubrel) {
+	_ = c.writeMessage(&mqtt.Pubcomp{MessageHeader: c.header(), PacketID: m.PacketID})
+}
+
+func (c *client) handlePublish(m *mqtt.Publish) {
+	topic := m.Topic
+	props := m.Properties
+	// Topic Alias and Subscription Identifier are hop-local: the alias resolves
+	// (and records) the topic name, and neither property is forwarded.
+	alias := props.TopicAlias
+	props.TopicAlias = 0
+	props.SubscriptionIdentifiers = nil
+	var wireProps []byte
+	if c.version == mqtt.Version5 {
 		if topic == "" {
-			if alias == nil {
+			if alias == 0 {
 				return
 			}
-			resolved, ok := c.topicAliases[*alias]
+			resolved, ok := c.topicAliases[alias]
 			if !ok {
 				return
 			}
 			topic = resolved
-		} else if alias != nil {
-			c.topicAliases[*alias] = topic
+		} else if alias != 0 {
+			c.topicAliases[alias] = topic
+		}
+		var err error
+		if wireProps, err = encodePropertyBlock(props); err != nil {
+			return
 		}
 	}
 	if !validTopic(topic) {
@@ -211,153 +319,90 @@ func (c *client) handlePublish(header byte, payload []byte) {
 		ConnectionID: c.connID,
 		ClientID:     c.id,
 		Topic:        topic,
-		Payload:      rest,
-		QoS:          qos,
-		PacketID:     pid,
-		Retain:       retain,
-		Properties:   props,
-	})
-	switch qos {
-	case 1:
-		c.ackPublish(0x40, pid, res)
-	case 2:
-		c.ackPublish(0x50, pid, res)
+		Payload:      m.Payload,
+		QoS:          m.QoS,
+		PacketID:     m.PacketID,
+		Retain:       m.Retain,
+		Properties:   wireProps,
+	}, props)
+	switch m.QoS {
+	case 1, 2:
+		c.ackPublish(m.QoS, m.PacketID, res)
 	}
 }
 
-func (c *client) handleSubscribe(payload []byte) {
-	pid, rest, err := readUint16(payload)
-	if err != nil {
-		return
-	}
-	if c.version == 5 {
-		block, next, err := readPropertyBlock(rest)
-		if err != nil {
-			return
-		}
-		_ = block
-		rest = next
-	}
-	type req struct {
-		filter string
-		sub    subscription
-	}
-	var reqs []req
-	for len(rest) > 0 {
-		filter, next, err := readString(rest)
-		if err != nil || len(next) < 1 {
-			return
-		}
-		opts := next[0]
-		sub := subscription{qos: opts & 0x03}
-		if c.version == 5 {
-			sub.noLocal = opts&0x04 != 0
-			sub.retainAsPublished = opts&0x08 != 0
-			sub.retainHandling = (opts >> 4) & 0x03
-		}
-		reqs = append(reqs, req{filter: filter, sub: sub})
-		rest = next[1:]
-	}
-	codes := make([]byte, 0, len(reqs))
-	existed := make([]bool, 0, len(reqs))
-	for _, r := range reqs {
-		code, had := c.broker.subscribe(c, r.filter, r.sub)
-		if c.version == 5 && code == 0x80 {
+func (c *client) handleSubscribe(m *mqtt.Subscribe) {
+	codes := make([]byte, 0, len(m.Subscriptions))
+	existed := make([]bool, 0, len(m.Subscriptions))
+	for _, req := range m.Subscriptions {
+		code, had := c.broker.subscribe(c, req.Filter, subscription{
+			qos:               req.QoS,
+			noLocal:           req.NoLocal,
+			retainAsPublished: req.RetainAsPublished,
+			retainHandling:    req.RetainHandling,
+		})
+		if c.version == mqtt.Version5 && code == 0x80 {
 			code = 0x87
 		}
 		codes = append(codes, code)
 		existed = append(existed, had)
 	}
-	suback := []byte{byte(pid >> 8), byte(pid)}
-	if c.version == 5 {
-		suback = append(suback, 0)
-	}
-	suback = append(suback, codes...)
-	_ = c.writePacket(0x90, suback)
-	for i, r := range reqs {
+	_ = c.writeMessage(&mqtt.Suback{
+		MessageHeader: c.header(),
+		PacketID:      m.PacketID,
+		ReasonCodes:   codes,
+	})
+	for i, req := range m.Subscriptions {
 		if codes[i] == 0x80 || codes[i] == 0x87 {
 			continue
 		}
-		if r.sub.retainHandling == 2 || (r.sub.retainHandling == 1 && existed[i]) {
+		if req.RetainHandling == 2 || (req.RetainHandling == 1 && existed[i]) {
 			continue
 		}
-		c.broker.sendRetained(c, r.filter, r.sub.qos, r.sub.retainAsPublished)
+		c.broker.sendRetained(c, req.Filter, req.QoS, req.RetainAsPublished)
 	}
 }
 
-func (c *client) handleUnsubscribe(payload []byte) {
-	pid, rest, err := readUint16(payload)
-	if err != nil {
-		return
-	}
-	if c.version == 5 {
-		block, next, err := readPropertyBlock(rest)
-		if err != nil {
-			return
-		}
-		_ = block
-		rest = next
-	}
-	for len(rest) > 0 {
-		filter, next, err := readString(rest)
-		if err != nil {
-			return
-		}
+func (c *client) handleUnsubscribe(m *mqtt.Unsubscribe) {
+	// MQTT 5 answers with one reason code per filter, all Success: a filter that
+	// was not subscribed is a no-op for this broker. MQTT 3.1.1 carries none.
+	codes := make([]byte, len(m.Filters))
+	for i, filter := range m.Filters {
 		c.broker.unsubscribe(c, filter)
-		rest = next
+		codes[i] = 0
 	}
-	if c.version == 5 {
-		_ = c.writePacket(0xB0, []byte{byte(pid >> 8), byte(pid), 0})
-	} else {
-		_ = c.writeAck(0xB0, pid)
-	}
+	_ = c.writeMessage(&mqtt.Unsuback{
+		MessageHeader: c.header(),
+		PacketID:      m.PacketID,
+		ReasonCodes:   codes,
+	})
 }
 
-func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool, props []byte) error {
-	header := byte(0x30) | (qos << 1)
-	if retain {
-		header |= 1
-	}
-	body := appendString(nil, topic)
+func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
+	var pid uint16
 	if qos > 0 {
 		c.mu.Lock()
 		c.outPID++
-		pid := c.outPID
+		pid = c.outPID
 		c.mu.Unlock()
-		body = append(body, byte(pid>>8), byte(pid))
 	}
-	if c.version == 5 {
-		body = append(body, prefixPropertyLength(props)...)
+	return c.writeMessage(&mqtt.Publish{
+		MessageHeader: c.header(),
+		Topic:         topic,
+		Payload:       payload,
+		QoS:           qos,
+		PacketID:      pid,
+		Retain:        retain,
+		Properties:    props,
+	})
+}
+
+func (c *client) writeConnack(code byte, assignedClientID string) error {
+	ack := &mqtt.Connack{MessageHeader: c.header(), ReasonCode: code}
+	if c.version == mqtt.Version5 && code == 0 {
+		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize))
 	}
-	body = append(body, payload...)
-	return c.writePacket(header, body)
-}
-
-func (c *client) writeConnack(version, code byte, assignedClientID string) error {
-	if version == 5 {
-		var props []byte
-		if code == 0 {
-			props = buildConnackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize), 16)
-		} else {
-			props = []byte{0}
-		}
-		return c.writePacket(0x20, append([]byte{0, code}, props...))
-	}
-	return c.writePacket(0x20, []byte{0, code})
-}
-
-func (c *client) writeAck(header byte, pid uint16) error {
-	return c.writePacket(header, []byte{byte(pid >> 8), byte(pid)})
-}
-
-func (c *client) writeAckReason(header byte, pid uint16, reason byte) error {
-	return c.writePacket(header, []byte{byte(pid >> 8), byte(pid), reason, 0})
-}
-
-func (c *client) writePacket(header byte, body []byte) error {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	return writePacket(c.conn, header, body)
+	return c.writeMessage(ack)
 }
 
 func (c *client) close(withWill bool) {
@@ -374,26 +419,26 @@ func (c *client) close(withWill bool) {
 	c.mu.Unlock()
 	_ = c.conn.Close()
 	if will != nil && c.broker != nil {
-		_ = c.broker.publish(c, PublishEvent{Topic: will.topic, Payload: will.payload})
+		_ = c.broker.publish(c, PublishEvent{Topic: will.topic, Payload: will.payload}, mqtt.Properties{})
 	}
 }
 
 func connackNotAuthorized(version byte) byte {
-	if version == 5 {
+	if version == mqtt.Version5 {
 		return 0x87
 	}
 	return 5
 }
 
 func connackClientIDInvalid(version byte) byte {
-	if version == 5 {
+	if version == mqtt.Version5 {
 		return 0x85
 	}
 	return 2
 }
 
 func connackQuotaExceeded(version byte) byte {
-	if version == 5 {
+	if version == mqtt.Version5 {
 		return 0x97
 	}
 	return 5
@@ -403,9 +448,9 @@ func connackQuotaExceeded(version byte) byte {
 // gets no success ACK: MQTT 3.1.1 has no negative PUBACK, and an optimistic ACK
 // would claim durability the broker does not have. MQTT 5 clients get the reason
 // code instead.
-func (c *client) ackPublish(header byte, pid uint16, res PublishResult) {
+func (c *client) ackPublish(qos byte, pid uint16, res PublishResult) {
 	if res.Accepted() {
-		_ = c.writeAck(header, pid)
+		_ = c.writePublishAck(qos, pid, 0)
 		return
 	}
 	code := res.ReasonCode
@@ -416,9 +461,18 @@ func (c *client) ackPublish(header byte, pid uint16, res PublishResult) {
 			code = ReasonUnspecified
 		}
 	}
-	if c.version == 5 {
-		_ = c.writeAckReason(header, pid, code)
+	if c.version == mqtt.Version5 {
+		_ = c.writePublishAck(qos, pid, code)
 	}
+}
+
+// writePublishAck writes the PUBACK of a QoS 1 publish or the PUBREC of a QoS 2
+// one. The reason code is only encoded on MQTT 5.
+func (c *client) writePublishAck(qos byte, pid uint16, reason byte) error {
+	if qos == 2 {
+		return c.writeMessage(&mqtt.Pubrec{MessageHeader: c.header(), PacketID: pid, ReasonCode: reason})
+	}
+	return c.writeMessage(&mqtt.Puback{MessageHeader: c.header(), PacketID: pid, ReasonCode: reason})
 }
 
 var connSeq atomic.Uint64

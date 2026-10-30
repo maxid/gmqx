@@ -12,7 +12,9 @@ var (
 	// ErrMalformedPacket indicates an invalid MQTT packet.
 	// It aliases the wire codec error so callers can match either sentinel.
 	ErrMalformedPacket = mqtt.ErrMalformedPacket
-	// ErrUnsupportedProtocol indicates a non-MQTT-3.1.1 CONNECT.
+	// ErrUnsupportedProtocol indicates a CONNECT whose protocol name or level
+	// this broker does not speak. MQTT 3.1, 3.1.1 and 5 are supported; the codec
+	// reports any other version and gmqx keeps the sentinel on top.
 	ErrUnsupportedProtocol = errors.New("gmqx: unsupported protocol level")
 	// ErrClientIDInUse is returned in ConnectModeUnique when the clientId exists.
 	ErrClientIDInUse = errors.New("gmqx: client id already in use")

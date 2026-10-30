@@ -74,8 +74,9 @@ Full MQTT 5 properties/semantics, full QoS 2 and the client library are on the r
 
 TCP/TLS/WebSocket/WSS listeners are provided by the
 [`gnety`](https://github.com/maxid/gnety) transport framework (`RawHandler`
-mode). The MQTT wire format lives in `gnety/codec/mqtt`; gmqx owns the broker
-state machine.
+mode). The MQTT wire format lives in `gnety/codec/mqtt`: every packet is read
+with its typed `Decoder` and written with `mqtt.Encode`, so gmqx owns the broker
+state machine and no packet layout of its own.
 
 ## Cluster backend
 

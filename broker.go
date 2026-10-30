@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/maxid/gnety"
+	"github.com/maxid/gnety/codec/mqtt"
 )
 
 // Broker is a single-node MQTT 3.1.1 broker.
@@ -40,7 +41,7 @@ type retainedMessage struct {
 	topic   string
 	payload []byte
 	qos     byte
-	props   []byte
+	props   mqtt.Properties
 }
 
 // New creates a Broker. Start must be called to listen.
@@ -444,7 +445,11 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 // publish authorizes, hands the message to the sink and only then delivers it.
 // The returned verdict decides whether the caller may acknowledge, so nothing
 // here may claim durability the sink did not confirm.
-func (b *Broker) publish(from *client, ev PublishEvent) PublishResult {
+//
+// ev.Properties is the payload of the SPI contract (one MQTT 5 property block,
+// no length prefix); props is the same set in typed form, which is what routing,
+// retained state and outgoing packets use.
+func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) PublishResult {
 	ev.ConnectionID = from.connID
 	ev.ClientID = from.id
 	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, ev.Topic, AclPublish) {
@@ -474,7 +479,7 @@ func (b *Broker) publish(from *client, ev PublishEvent) PublishResult {
 		} else {
 			_, exists := b.retained[ev.Topic]
 			if b.cfg.MaxRetainMessages <= 0 || exists || int64(len(b.retained)) < b.cfg.MaxRetainMessages {
-				b.retained[ev.Topic] = retainedMessage{topic: ev.Topic, payload: append([]byte(nil), ev.Payload...), qos: ev.QoS, props: append([]byte(nil), ev.Properties...)}
+				b.retained[ev.Topic] = retainedMessage{topic: ev.Topic, payload: append([]byte(nil), ev.Payload...), qos: ev.QoS, props: props}
 			} else {
 				b.metrics.RecordDroppedMessage("max_retain")
 			}
@@ -483,8 +488,8 @@ func (b *Broker) publish(from *client, ev PublishEvent) PublishResult {
 	}
 	b.metrics.IncrementPublishedMessages()
 
-	b.deliverLocal(ev.Topic, ev.Payload, ev.QoS, from, ev.Properties, ev.Retain)
-	b.spreadPublish(ev.Topic, ev.Payload, ev.QoS, ev.Retain, ev.Properties)
+	b.deliverLocal(ev.Topic, ev.Payload, ev.QoS, from, props, ev.Retain)
+	b.spreadPublish(ev.Topic, ev.Payload, ev.QoS, ev.Retain, props)
 	return PublishResult{Disposition: PublishAccepted}
 }
 
@@ -510,7 +515,7 @@ func (b *Broker) callSink(ev PublishEvent) PublishResult {
 	}
 }
 
-func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *client, props []byte, retain bool) int {
+func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *client, props mqtt.Properties, retain bool) int {
 	b.mu.RLock()
 	type target struct {
 		client *client
@@ -550,14 +555,19 @@ func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *clie
 	return len(targets)
 }
 
-func (b *Broker) spreadPublish(topic string, payload []byte, qos byte, retain bool, props []byte) {
+func (b *Broker) spreadPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) {
 	if b.cfg.ClusterBackend == nil {
+		return
+	}
+	wireProps, err := encodePropertyBlock(props)
+	if err != nil {
+		b.log.Warn("gmqx cluster publish properties", "err", err)
 		return
 	}
 	msg := ClusterMessage{
 		Type: ClusterPublish, NodeID: b.nodeID, Topic: topic,
 		Payload: append([]byte(nil), payload...), QoS: qos, Retain: retain,
-		Props: append([]byte(nil), props...),
+		Props: wireProps,
 	}
 	if err := b.cfg.ClusterBackend.Spread(context.Background(), msg); err != nil {
 		b.log.Warn("gmqx cluster spread failed", "err", err)
@@ -577,7 +587,12 @@ func (b *Broker) spreadKick(clientID string) {
 
 // OnRemotePublish implements ClusterHandler.
 func (b *Broker) OnRemotePublish(msg ClusterMessage) {
-	b.deliverLocal(msg.Topic, msg.Payload, msg.QoS, nil, msg.Props, msg.Retain)
+	props, err := decodePropertyBlock(msg.Props)
+	if err != nil {
+		b.log.Warn("gmqx cluster publish properties", "err", err)
+		return
+	}
+	b.deliverLocal(msg.Topic, msg.Payload, msg.QoS, nil, props, msg.Retain)
 }
 
 // OnRemoteKick implements ClusterHandler.
