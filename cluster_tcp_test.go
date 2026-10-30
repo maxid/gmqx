@@ -43,6 +43,8 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
+// waitPeers waits until want links exist and the handshake admitted the same
+// number of members: a link alone is not yet routable.
 func waitPeers(t *testing.T, c Cluster, want int) {
 	t.Helper()
 	tc, ok := c.(*tcpCluster)
@@ -51,12 +53,12 @@ func waitPeers(t *testing.T, c Cluster, want int) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if tc.peerCount() >= want {
+		if tc.peerCount() >= want && len(tc.Members()) >= want {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("cluster peers = %d, want %d", tc.peerCount(), want)
+	t.Fatalf("cluster peers = %d (%d members), want %d", tc.peerCount(), len(tc.Members()), want)
 }
 
 func newTCPClusterPair(t *testing.T) (Cluster, Cluster, *recClusterHandler, *recClusterHandler) {
@@ -226,6 +228,10 @@ func TestTCPClusterBrokerCrossNodeKick(t *testing.T) {
 	waitPeers(t, cb, 1)
 
 	remote := dialTestClient(t, b.Addr(), "dup")
+	// The kick b just spread is delivered asynchronously: let it reach a before
+	// the same client id connects there, otherwise b's kick for its own older
+	// session can close a's newer one (both nodes would legitimately kick).
+	time.Sleep(50 * time.Millisecond)
 	_ = dialTestClient(t, a.Addr(), "dup") // same client id on another node must take over
 
 	_ = remote.conn.SetReadDeadline(time.Now().Add(2 * time.Second))

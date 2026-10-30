@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -388,9 +389,17 @@ func (b *Broker) unregister(c *client) {
 	n := len(b.clients)
 	b.mu.Unlock()
 
+	c.mu.Lock()
+	hadSubscriptions := len(c.subs) > 0
+	c.mu.Unlock()
+
 	b.metrics.DecrementConnections()
 	b.metrics.IncrementDisconnectEvents()
 	b.metrics.RecordConnections(n)
+	if hadSubscriptions {
+		// The session's filters left the routing summary with it.
+		b.subscriptionsChanged()
+	}
 	if b.cfg.Sink != nil {
 		if c.lost {
 			b.cfg.Sink.OnConnectionLost(context.Background(), c.id, c.closeErr)
@@ -415,6 +424,9 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 	c.subs[filter] = sub
 	c.mu.Unlock()
 	b.metrics.IncrementSubscribeEvents()
+	if !exists {
+		b.subscriptionsChanged()
+	}
 	return sub.qos, exists
 }
 
@@ -425,7 +437,46 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 	c.mu.Unlock()
 	if existed {
 		b.metrics.DecrementSubscribeEvents()
+		b.subscriptionsChanged()
 	}
+}
+
+// subscriptionFilters implements subscriptionProvider: every topic filter a
+// local session is subscribed to, sorted and de-duplicated. The built-in TCP
+// cluster advertises it so peers can route a publish only to the nodes that have
+// a matching subscriber.
+func (b *Broker) subscriptionFilters() []string {
+	b.mu.RLock()
+	clients := make([]*client, 0, len(b.clients))
+	for _, c := range b.clients {
+		clients = append(clients, c)
+	}
+	b.mu.RUnlock()
+
+	seen := make(map[string]struct{}, len(clients))
+	for _, c := range clients {
+		c.mu.Lock()
+		for filter := range c.subs {
+			seen[filter] = struct{}{}
+		}
+		c.mu.Unlock()
+	}
+	out := make([]string, 0, len(seen))
+	for filter := range seen {
+		out = append(out, filter)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// subscriptionsChanged tells a cluster backend that can push subscription
+// summaries that the local filter set changed.
+func (b *Broker) subscriptionsChanged() {
+	notifier, ok := b.cfg.ClusterBackend.(subscriptionChangeNotifier)
+	if !ok {
+		return
+	}
+	notifier.subscriptionsChanged()
 }
 
 func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool) {

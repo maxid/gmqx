@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+- **Built-in TCP cluster: membership, deduplication, directed routing.** The
+  cluster is no longer a bare flood of `ClusterMessage` payloads.
+
+  *Membership.* Every link now starts with a versioned handshake frame (node id,
+  advertised listen address, random per-`Start` process incarnation and the
+  sender's member view); a peer speaking another wire version is refused, so a
+  version mismatch cannot create a second logical member. Exactly one logical
+  member exists per node id: a duplicate link to the same incarnation collapses
+  to the link dialed by the lower advertised address and is logged, a new
+  incarnation (peer restart) replaces the old link and resets `Since`. Heartbeats
+  run every `HeartbeatInterval` and a member that misses `HeartbeatMissBudget`
+  intervals is evicted and its link closed; a link that never handshakes within
+  the same window is closed. `Members()` (new optional `MemberView` interface,
+  `Member{NodeID, Addr, Incarnation, Since}`) exposes the view without changing
+  the `Cluster` interface. Events from an unknown or evicted node are still
+  handled but never resurrect it.
+
+  *Deduplication.* `ClusterMessage` gains additive `Origin` and `Seq` fields: the
+  cluster stamps every locally produced event with its node id and a
+  monotonically increasing per-node sequence. Receivers keep a bounded, TTL'd
+  table of applied `(Origin, Seq)` identities (`DedupSize`, `DedupTTL`, lazy
+  sweep, oldest evicted first) and apply a duplicate once. A received event is
+  never forwarded and an event whose origin is the receiving node is dropped, so
+  a re-broadcasting topology cannot loop. Drops are counted and reported through
+  the optional `TCPClusterConfig.Metrics`.
+
+  *Directed routing.* Peers advertise the topic filters their local sessions are
+  subscribed to, refreshed every `SummaryInterval` and immediately when a
+  subscription changes (the broker gained the push path). Publishes go only to
+  peers whose summary matches the topic; a peer whose summary is unknown or stale
+  still receives the publish — that peer alone, never a flood. Retained publishes
+  and kicks keep going to every peer (retained state must exist everywhere; a
+  kick names a client id, not a topic). The summary is capped at
+  `MaxSummaryFilters` per node, oldest filters evicted first.
+
+  *Behavior changes.* The wire format is versioned and incompatible with the
+  previous bare-JSON frames: mixed-version nodes refuse each other at the
+  handshake instead of half-working. `Spread` returns an error when the cluster
+  is not running, refuses an event that carries another node's `Origin`, and
+  re-stamps `NodeID`/`Origin` with the local node id on locally produced events.
+  Routing is summary-based, so a subscriber that appears after the publisher's
+  last summary update can miss a message for at most one `SummaryInterval`;
+  delivery remains best-effort.
+
 - **Packet layer on the typed codec.** gmqx no longer parses or builds MQTT
   packets byte by byte: `mqtt.Decoder` reads every packet, `mqtt.Encode` writes
   every packet, and the connection loop switches on the concrete message type

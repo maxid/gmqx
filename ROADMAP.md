@@ -12,7 +12,8 @@
 - [ ] Full QoS 2 state machine and inflight limits
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)
 - [x] Built-in TCP cluster backend (static seeds, cross-node publish/kick, reconnect)
-- [ ] Cluster presence routing (clientId/topicFilter → node) and Redis backend
+- [x] Cluster membership (handshake, heartbeats, eviction, duplicate collapse), event dedup, subscription-aware directed routing
+- [ ] Client-id presence routing and Redis/gossip cluster backends
 - [ ] Client library
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests
