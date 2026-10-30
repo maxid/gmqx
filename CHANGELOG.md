@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+- **Redis cluster backend.** `NewRedisCluster` adds a centralized alternative to
+  the O(N²) TCP mesh: nodes share Redis instead of dialing each other, and
+  membership, routing and directed delivery live in Redis.
+
+  *Layout.* `<ChannelPrefix>:node:<nodeID>` is a node's private event channel —
+  the only channel it subscribes to; `<ChannelPrefix>:member:<nodeID>` holds
+  liveness and identity with `NodeTTL`; `<ChannelPrefix>:subs:<nodeID>` holds the
+  subscription summary with `SummaryTTL`. A publish is one `PUBLISH` per node
+  whose summary matches its topic, so N nodes cost O(N) operations instead of
+  O(N²) links, and no shared broadcast channel exists for publishes.
+
+  *Same semantics as the TCP backend.* Origin/Seq stamping, the shared bounded TTL
+  dedup table, the origin-before-dedup loop guard, "a received event is never
+  forwarded", the drop reasons (`cluster_duplicate`, `cluster_loop`,
+  `cluster_forward`), summary matching with the oldest-filters cap and the
+  retained/kick broadcast rules are reused rather than reimplemented; the summary
+  computation moved to `cluster_summary.go` and is now shared by both backends.
+
+  *Membership.* The member key TTL is the whole membership protocol: a node that
+  stops refreshing leaves every view when its key expires, with no eviction pass
+  and no clean shutdown required. `Members()` (optional `MemberView`) reads the
+  member keys, returns `[]Member` sorted by node id (peers only, `Addr` empty
+  because Redis has no peer address) and reports no peers when Redis cannot be
+  read. A restart is a new incarnation; `Stop` deletes the node's keys so peers
+  drop it immediately.
+
+  *Failure behaviour.* `Start` fails when Redis is unreachable or the config
+  cannot be honoured (empty `Addr`, negative TTL/size, TTL that cannot outlive
+  `SummaryInterval`). At runtime a locally produced `Spread` returns the new
+  `ErrClusterUnavailable` (wrapping the cause) instead of retrying in place, and
+  the receive loop keeps re-subscribing with a bounded backoff (50ms→1s) until
+  `Stop`; only transitions into and out of the degraded state are logged. `Stop`
+  is idempotent and leaves no goroutine behind.
+
+  *Dependencies.* `github.com/redis/go-redis/v9` (client) and, for tests only,
+  `github.com/alicebob/miniredis/v2`.
+
 - **Built-in TCP cluster: membership, deduplication, directed routing.** The
   cluster is no longer a bare flood of `ClusterMessage` payloads.
 

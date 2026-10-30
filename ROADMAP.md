@@ -13,7 +13,8 @@
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)
 - [x] Built-in TCP cluster backend (static seeds, cross-node publish/kick, reconnect)
 - [x] Cluster membership (handshake, heartbeats, eviction, duplicate collapse), event dedup, subscription-aware directed routing
-- [ ] Client-id presence routing and Redis/gossip cluster backends
+- [x] Redis cluster backend (per-node channels, TTL membership in Redis, directed routing)
+- [ ] Client-id presence routing and a gossip cluster backend
 - [ ] Client library
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests

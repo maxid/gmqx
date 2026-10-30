@@ -141,11 +141,11 @@ type clusterPeerWire struct {
 // gnety's length-prefixed TCP transport.
 func NewTCPCluster(cfg TCPClusterConfig) Cluster {
 	return &tcpCluster{
-		cfg:      cfg,
-		links:    map[*clusterLink]struct{}{},
-		members:  map[string]*clusterMember{},
-		seeds:    map[string]string{},
-		localSet: map[string]struct{}{},
+		cfg:     cfg,
+		links:   map[*clusterLink]struct{}{},
+		members: map[string]*clusterMember{},
+		seeds:   map[string]string{},
+		local:   newSummarySet(),
 	}
 }
 
@@ -203,10 +203,8 @@ type tcpCluster struct {
 	// seeds maps a dialed seed address to the node id behind it, so a dial loop
 	// stops dialing while another link already backs that node.
 	seeds map[string]string
-	// localOrder is the advertised filter summary, oldest first. localSet
-	// mirrors it for membership tests.
-	localOrder []string
-	localSet   map[string]struct{}
+	// local is the advertised filter summary, oldest first.
+	local *summarySet
 	// summaryMu serialises summary computation and broadcast, so a peer cannot
 	// end up with an older snapshot than the one already sent.
 	summaryMu sync.Mutex
@@ -580,11 +578,7 @@ func (c *tcpCluster) handleSummary(l *clusterLink, f clusterFrame) {
 	if m == nil || m.link != l {
 		return
 	}
-	filters := f.Filters
-	if max := c.maxSummaryFilters(); len(filters) > max {
-		filters = filters[len(filters)-max:]
-	}
-	m.filters = append(make([]string, 0, len(filters)), filters...)
+	m.filters = capFilters(f.Filters, c.maxSummaryFilters())
 	m.filtersKnown = true
 	m.filtersAt = time.Now()
 }
@@ -600,48 +594,7 @@ func (c *tcpCluster) refreshLocalFilters() ([]string, bool) {
 	current := provider.subscriptionFilters()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	present := make(map[string]struct{}, len(current))
-	for _, f := range current {
-		if f != "" {
-			present[f] = struct{}{}
-		}
-	}
-	kept := c.localOrder[:0]
-	for _, f := range c.localOrder {
-		if _, ok := present[f]; ok {
-			kept = append(kept, f)
-		}
-	}
-	c.localOrder = kept
-	for f := range c.localSet {
-		if _, ok := present[f]; !ok {
-			delete(c.localSet, f)
-		}
-	}
-	// New filters are appended in a stable order so the advertised list does not
-	// depend on map iteration.
-	var added []string
-	for f := range present {
-		if _, ok := c.localSet[f]; !ok {
-			added = append(added, f)
-		}
-	}
-	sort.Strings(added)
-	for _, f := range added {
-		c.localOrder = append(c.localOrder, f)
-		c.localSet[f] = struct{}{}
-	}
-	return c.localSummaryLocked(), true
-}
-
-// localSummaryLocked returns the filters to advertise, oldest first. Over the
-// cap the oldest filters are evicted: the newest subscriptions keep routing.
-func (c *tcpCluster) localSummaryLocked() []string {
-	order := c.localOrder
-	if max := c.maxSummaryFilters(); len(order) > max {
-		order = order[len(order)-max:]
-	}
-	return append(make([]string, 0, len(order)), order...)
+	return c.local.refresh(current, c.maxSummaryFilters()), true
 }
 
 func (c *tcpCluster) advertiseSummary(l *clusterLink) {

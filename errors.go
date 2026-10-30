@@ -20,4 +20,11 @@ var (
 	ErrClientIDInUse = errors.New("gmqx: client id already in use")
 	// ErrMaxConnections is returned when the configured connection limit is reached.
 	ErrMaxConnections = errors.New("gmqx: max connections reached")
+	// ErrClusterUnavailable reports that a cluster backend cannot reach the
+	// transport it fans out on (for example Redis). It is a retryable condition:
+	// the backend keeps its own loops running and recovers by itself, so a caller
+	// may treat the event as undelivered and move on instead of retrying in a
+	// loop. Spread wraps it with the underlying cause, so both stay matchable
+	// with errors.Is.
+	ErrClusterUnavailable = errors.New("gmqx: cluster backend unavailable")
 )
