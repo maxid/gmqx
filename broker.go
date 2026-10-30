@@ -202,7 +202,7 @@ func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
 			addr:           addr,
 			path:           b.cfg.WebsocketPath,
 			subprotocol:    "mqtt",
-			allowAnyOrigin: true, // preserve jmqx/device gateway behavior; no browser Origin boundary
+			allowAnyOrigin: true, // device gateways are not browser clients; Origin is not a security boundary
 		})
 	}
 	if addr := addrOrPort(b.cfg.WebsocketSecureAddr, b.cfg.WebsocketSecurePort); addr != "" {
@@ -215,7 +215,7 @@ func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
 			addr:           addr,
 			path:           b.cfg.WebsocketPath,
 			subprotocol:    "mqtt",
-			allowAnyOrigin: true, // preserve jmqx/device gateway behavior; no browser Origin boundary
+			allowAnyOrigin: true, // device gateways are not browser clients; Origin is not a security boundary
 			tls:            b.gnetyTLS(),
 		})
 	}
