@@ -9,7 +9,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 )
 
-// MQTT wire format lives in gnety/codec/mqtt (Netty-style codec layer). The
+// MQTT wire format lives in gnety/codec/mqtt (codec layer). The
 // shims below keep the broker code and tests stable during G1; call sites move
 // to the codec package directly in G1b.
 
