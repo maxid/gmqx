@@ -2,7 +2,7 @@ module github.com/maxid/gmqx
 
 go 1.27
 
-require github.com/maxid/gnety v0.0.0-20261030060811-93ff23249b72
+require github.com/maxid/gnety v0.0.0-20261030061629-c27f7dc577c3
 
 require (
 	github.com/pion/dtls/v2 v2.2.12 // indirect
