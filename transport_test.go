@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/maxid/gnety"
 )
 
 func writeConnect(w io.Writer, clientID string) error {
@@ -45,6 +45,16 @@ func readConnack(r io.Reader) (byte, error) {
 		return 0, io.ErrUnexpectedEOF
 	}
 	return payload[1], nil
+}
+
+type webSocketConnectCodec struct{}
+
+func (webSocketConnectCodec) Encode(w io.Writer, msg any) error {
+	return writeConnect(w, msg.(string))
+}
+
+func (webSocketConnectCodec) Decode(r *bufio.Reader) (any, error) {
+	return readConnack(r)
 }
 
 func selfSignedCert(t *testing.T) (certFile, keyFile string) {
@@ -122,20 +132,21 @@ func TestWebSocketListener(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	c, _, err := websocket.Dial(ctx, "ws://"+addr+"/mqtt", &websocket.DialOptions{Subprotocols: []string{"mqtt"}})
+	cli, err := gnety.Dial(ctx, gnety.ClientConfig{
+		Network: "ws", Addr: addr, Path: "/mqtt", Subprotocol: "mqtt", Codec: webSocketConnectCodec{},
+	})
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
-	defer c.Close(websocket.StatusNormalClosure, "")
-	conn := websocket.NetConn(context.Background(), c, websocket.MessageBinary)
-	if err := writeConnect(conn, "ws-client"); err != nil {
+	defer cli.Close()
+	if err := cli.Send("ws-client"); err != nil {
 		t.Fatal(err)
 	}
-	code, err := readConnack(conn)
+	msg, err := cli.Receive(ctx)
 	if err != nil {
 		t.Fatalf("read connack: %v", err)
 	}
-	if code != 0 {
+	if code := msg.(byte); code != 0 {
 		t.Fatalf("connack code = %d", code)
 	}
 }
@@ -148,7 +159,11 @@ func TestWebSocketRequiresSubprotocol(t *testing.T) {
 	addr := b.WebsocketAddr()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, _, err := websocket.Dial(ctx, "ws://"+addr+"/mqtt", nil); err == nil {
+	cli, err := gnety.Dial(ctx, gnety.ClientConfig{
+		Network: "ws", Addr: addr, Path: "/mqtt", Codec: webSocketConnectCodec{},
+	})
+	if err == nil {
+		_ = cli.Close()
 		t.Fatal("expected dial failure without mqtt subprotocol")
 	}
 }

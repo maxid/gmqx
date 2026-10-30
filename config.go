@@ -16,7 +16,7 @@ const (
 	ConnectModeKick ConnectMode = "KICK"
 )
 
-// TLSConfig holds TLS listener settings. TLS is not implemented yet (roadmap).
+// TLSConfig holds TLS listener settings.
 type TLSConfig struct {
 	Enabled           bool
 	CA                string
@@ -25,9 +25,8 @@ type TLSConfig struct {
 	RequireClientCert bool
 }
 
-// ClusterConfig holds cluster settings. Clustering is not implemented yet
-// (roadmap); the interface is provided so a backend can be plugged in without
-// changing the broker API.
+// ClusterConfig holds cluster settings. ClusterBackend selects the optional
+// cross-node implementation; the built-in TCP backend uses these settings where applicable.
 type ClusterConfig struct {
 	Enabled                  bool
 	URL                      string
