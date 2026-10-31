@@ -5,6 +5,61 @@
 
 ## [Unreleased]
 
+- **Persistent-session storage, bounded offline queue and broker-side QoS 1/2
+  retransmission.** Two parity gaps of the reference broker of this family are
+  closed together, because a queued offline message is pointless if delivery after
+  the reconnect is never confirmed or retried. Defaults are bounded and chosen
+  here; every earlier behavior that a deployment relied on is reachable.
+
+  *Session store seam.* `SessionStore` (`Load`, `Save`, `Delete`, `Keys`) now
+  holds the state of a session with no live connection: subscriptions, queued
+  messages and the expiry deadline. `Config.SessionStore` defaults to
+  `MemorySessionStore`, which is the in-memory behavior of earlier versions, and
+  no network or disk backend ships here. `Broker.sessions` is gone; a connected
+  session owns its state, so a publication reaches a session exactly once.
+
+  *Session expiry.* MQTT 5's Session Expiry Interval is now enforced:
+  `ConnectInfo.SessionExpiry` is stamped as a deadline on disconnect, a bounded
+  sweeper (`SessionSweepInterval`, default 30 s, at most 512 sessions per tick)
+  deletes expired sessions with their subscriptions and queued messages, and the
+  CONNECT path refuses to resume a session whose deadline passed. A zero interval
+  on a non-clean session keeps the previous behavior and never expires (MQTT 3.1.1
+  has no interval); on MQTT 5 a zero interval still ends the session with the
+  connection.
+
+  *Offline queue.* A persistent session with no live connection keeps the
+  messages its subscriptions match, per session in FIFO order, and receives them
+  right after the next CONNACK with packet ids assigned at drain time. A message
+  that cannot get a free packet id or an inflight slot is delivered at QoS 0
+  rather than dropped or reordered. `MaxOfflineQueueSize` (default 1000) drops the
+  oldest message of a full session; `MaxTotalOfflineMessages` (default 100000)
+  rejects the newest one at the global cap. Clean sessions never queue (the
+  reference queues for them too — that is not copied). Both drops are visible
+  through `MetricsManager` (`offline_queue_full`, `offline_queue_total`), and
+  `RecordQueueDepth("offline", n)` reports the current depth.
+
+  *Outbound QoS 1/2.* Every unconfirmed QoS 1/2 delivery is kept in a
+  per-connection inflight table keyed by packet id, driven by one timer per
+  connection and not one goroutine per message. `QoSRetryInterval` (default 5 s)
+  is the base interval, doubled per attempt, and `QoSMaxRetries` (default 5) caps
+  the attempts. Retransmitted PUBLISHes carry DUP (the reference never sets it —
+  not copied); QoS 2 runs PUBLISH → PUBREC → PUBREL → PUBCOMP with the PUBREL
+  retried until PUBCOMP. `MaxInflightQoS1` (default 64) bounds the unconfirmed
+  QoS 1 deliveries of a connection and `MaxInflightQoS2` (default 64) its QoS 2
+  exchanges in each direction; a delivery over the window is skipped and counted
+  (`inflight_full`) instead of blocking the publisher, and an inbound QoS 2
+  PUBLISH over the window is answered with PUBREC 0x97 Quota exceeded on MQTT 5.
+  `MaxInflightQoS2` was declared but read by nothing before this change.
+
+  Behavior notes: a clean session no longer accumulates anything; the session
+  sweeper runs one goroutine per broker and `Stop` waits for it; the inflight
+  exchange and the inbound QoS 2 state are per connection, so a reconnect resumes
+  the offline queue but not the unconfirmed deliveries of the previous connection;
+  `LocalTargets` may return an offline target (`LocalTarget.Offline`), and a
+  custom `Dispatcher` that loops over all targets now reaches offline sessions as
+  well. A deployment that wants the previous "retry nothing, drop nothing" flow
+  sets `MaxInflightQoS1` and `QoSMaxRetries` to negative values.
+
 - **Dispatcher SPI, connection context and namespace isolation.** Three
   portability gaps from the reference broker of this family are closed with Go
   equivalents; every existing deployment keeps its behavior because the zero

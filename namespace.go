@@ -1,5 +1,7 @@
 package gmqx
 
+import "strings"
+
 // Namespace isolation
 //
 // A Broker serves exactly one namespace (Config.Namespace). The reference broker
@@ -33,4 +35,15 @@ func namespaceKey(namespace, name string) string {
 		return name
 	}
 	return namespace + "\x00" + name
+}
+
+// keyInNamespace reports whether a session key belongs to namespace. A
+// SessionStore can be shared by brokers of different namespaces (a store is not
+// owned by a namespace), so the broker only routes to, and only expires, the keys
+// of its own scope.
+func keyInNamespace(namespace, key string) bool {
+	if namespace == "" {
+		return !strings.Contains(key, "\x00")
+	}
+	return strings.HasPrefix(key, namespace+"\x00")
 }

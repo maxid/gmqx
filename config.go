@@ -71,8 +71,48 @@ type Config struct {
 	MaxConnections        int
 	MaxTopicSubscriptions int
 	MaxRetainMessages     int64
-	MaxInflightQoS2       int
 	ConnectionRateLimit   int
+
+	// Outbound delivery. MaxInflightQoS1 bounds the unconfirmed QoS 1 PUBLISHes of
+	// one connection and MaxInflightQoS2 the QoS 2 exchanges of one connection, in
+	// each direction. Zero selects the default (64); a negative value means
+	// unlimited. A QoS 1/2 delivery that would exceed its window is skipped and
+	// counted with Metrics.RecordDroppedMessage("inflight_full") instead of
+	// blocking the publishing goroutine, and an inbound QoS 2 PUBLISH over the
+	// window is answered with PUBREC 0x97 (Quota exceeded) on MQTT 5.
+	MaxInflightQoS1 int
+	MaxInflightQoS2 int
+	// QoSRetryInterval is the base interval of the outbound retransmission timer
+	// (default 5 s): the first retransmission of a QoS 1/2 exchange is sent after
+	// one interval, and every further attempt doubles the wait. QoSMaxRetries caps
+	// how many retransmissions one exchange gets (default 5); zero selects the
+	// default and a negative value disables retransmission. Retransmitted
+	// PUBLISHes carry the DUP flag; a PUBREL retransmission is a PUBREL again.
+	QoSRetryInterval time.Duration
+	QoSMaxRetries    int
+
+	// Offline queue of persistent sessions. MaxOfflineQueueSize bounds the
+	// messages one session keeps while it has no live connection (default 1000); a
+	// full queue drops its oldest message. MaxTotalOfflineMessages bounds them
+	// across all sessions of this broker (default 100000); at the global cap a new
+	// message is rejected. Both caps drop/reject through
+	// Metrics.RecordDroppedMessage and both are disabled by a negative value. Only
+	// a persistent session (Clean Session / Clean Start cleared) queues; a clean
+	// session never does.
+	MaxOfflineQueueSize     int
+	MaxTotalOfflineMessages int
+	// SessionSweepInterval is how often the broker looks for sessions whose
+	// Session Expiry Interval elapsed (default 30 s); each tick is bounded. A
+	// negative value disables the sweeper, which only means an expired session is
+	// then removed when it is next loaded — a CONNECT never resumes one either way.
+	SessionSweepInterval time.Duration
+
+	// SessionStore is where persistent-session state lives while no connection
+	// owns it (subscriptions, queued messages, expiry deadline). Nil installs
+	// MemorySessionStore, which is exactly the broker's behavior before the seam
+	// existed. A deployment can supply another implementation; this package ships
+	// only the in-memory one.
+	SessionStore SessionStore
 
 	// SPI
 	Auth AuthManager

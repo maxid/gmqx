@@ -18,9 +18,17 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - MQTT 5: CONNACK capability properties, Topic Alias, User Property forwarding,
   subscription options (no-local / retain-as-published / retain-handling), reason
   codes and DISCONNECT on protocol errors
-- QoS 0/1 flows with per-subscription QoS capping and a QoS 2 handshake that
-  suppresses inbound duplicates (broker-side retransmission and inflight limits
-  are still on the roadmap)
+- Persistent-session storage with a bounded offline queue and MQTT 5 Session
+  Expiry Interval: a session with no live connection keeps what its subscriptions
+  match (FIFO, caps per session and globally), drains it right after the next
+  CONNACK, and is deleted by a bounded sweeper when its expiry interval elapses.
+  The state lives behind the `SessionStore` seam (`Load`/`Save`/`Delete`/`Keys`),
+  whose default is the in-memory store of earlier versions.
+- QoS 0/1/2 flows with per-subscription QoS capping, broker-side outbound QoS 1/2
+  retransmission (DUP on PUBLISH retries, PUBREL retries until PUBCOMP, one timer
+  per connection, capped exponential backoff) and inflight windows that skip
+  instead of blocking. An inbound QoS 2 handshake suppresses duplicates and is
+  held to `MaxInflightQoS2` with PUBREC 0x97.
 - Retained messages, wildcard subscriptions (`+`/`#`), will messages with their
   QoS, retain flag and properties, keepalive
 - Wire-level MQTT 3.1.1/5 conformance suite (`TestConformance`)
@@ -40,8 +48,9 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   publish of one namespace never reaches a session of another; the default empty
   namespace keeps single-namespace deployments unchanged
 - Connect modes: `UNIQUE` / `KICK` (client id takeover)
-- Limits: max connections, max subscriptions, max retained messages,
-  connection rate limiting
+- Limits: max connections, max subscriptions, max retained messages, inflight
+  windows per direction, offline queue size per session and globally, connection
+  rate limiting
 - Graceful shutdown and client-id session takeover
 - Pluggable `Cluster` interface with a built-in TCP backend (static seeds,
   handshake membership with heartbeats and eviction, event deduplication and
@@ -107,12 +116,28 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `MaxTopicSubscriptions` | 0 | per-session subscription limit |
 | `MaxRetainMessages` | 0 | retained message count limit |
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
+| `MaxInflightQoS1` | 64 | unconfirmed QoS 1 PUBLISHes per connection (negative: unlimited) |
+| `MaxInflightQoS2` | 64 | QoS 2 exchanges per connection and direction (negative: unlimited) |
+| `QoSRetryInterval` | 5 s | base retransmission interval, doubled per attempt |
+| `QoSMaxRetries` | 5 | retransmissions per exchange before giving up (negative: none) |
+| `MaxOfflineQueueSize` | 1000 | messages queued per offline session; the oldest is dropped |
+| `MaxTotalOfflineMessages` | 100000 | messages queued for all offline sessions; new ones are rejected |
+| `SessionSweepInterval` | 30 s | how often expired sessions are deleted (negative: never) |
+| `SessionStore` | `MemorySessionStore` | persistence seam for offline session state |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
 | `Namespace` | `""` (default) | isolation scope for sessions, retained state and cluster traffic |
 | `Dispatcher` | `DefaultDispatcher` | routing SPI: local delivery plus cluster spread by default |
 | `ConnContext` | nil | enrich the per-connection context at CONNECT |
 
-Full MQTT 5 properties/semantics, full QoS 2 and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+The delivery limits that came with the offline queue and the inflight windows are
+bounded on purpose: an absent value selects the documented default, because an
+unbounded queue and an unbounded window both turn a slow client into unbounded
+broker memory. A negative value means unlimited (`MaxInflightQoS1`,
+`MaxInflightQoS2`, `MaxOfflineQueueSize`, `MaxTotalOfflineMessages`), no
+retransmission (`QoSMaxRetries`) or no sweeper (`SessionSweepInterval`).
+
+Remaining MQTT 5 properties/semantics (receive maximum, packet limits), QoS 2 state
+across a reconnect and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
 ## Dispatcher, connection context and namespaces
 
@@ -151,6 +176,73 @@ partitioned by it, and a remote cluster event that belongs to another namespace
 is dropped by both built-in backends. The empty string is the default namespace
 (the zero value), so a deployment that does not set it behaves exactly as before,
 including the documented Redis key layout.
+
+## Persistent sessions, the offline queue and QoS 1/2 retransmission
+
+A persistent session (Clean Session cleared; on MQTT 5, Clean Start cleared and a
+non-zero Session Expiry Interval) keeps state while it has no live connection:
+its subscriptions, the messages published to those subscriptions, and the
+deadline after which the state ends. All of it lives behind `SessionStore`, and
+the state of a session with no owner is what the store holds — a live connection
+owns its session, so a publication reaches a session exactly once.
+
+`SessionStore` (`Load`, `Save`, `Delete`, `Keys`) exists so a deployment can move
+session state out of process. `New` installs `MemorySessionStore` when
+`Config.SessionStore` is nil, which is exactly the in-memory behavior of earlier
+versions; this package ships no network or disk backend. The broker calls the
+store with its own session lock held, so an implementation must not call back
+into the broker, and `Keys` is required because routing to offline sessions and
+expiring them both need to enumerate the stored keys.
+
+**Expiry.** MQTT 5's Session Expiry Interval is a deadline:
+`ConnectInfo.SessionExpiry` is stamped on disconnect as `now + interval`, and a
+bounded sweeper (`SessionSweepInterval`, at most 512 stored sessions per tick)
+deletes the session with its subscriptions and its queued messages when the
+deadline passes. The CONNECT path checks the deadline as well, so a session that
+expired is never resumed even before the sweeper reaches it. A zero interval on
+a non-clean session keeps the previous behavior and never expires — that is the
+MQTT 3.1.1 case (the protocol has no interval), and on MQTT 5 a zero interval
+means the session ends with the connection, so nothing is stored and there is
+nothing to expire.
+
+**Queue.** Only a persistent session queues (the reference broker of this family
+queues for clean sessions too, which delivers messages to a session that asked
+for none; gmqx does not copy that). The queue is a per-session FIFO of what a
+PUBLISH needs — topic, QoS, retain flag, payload, MQTT 5 properties — with no
+packet id: ids are assigned at drain time. `MaxOfflineQueueSize` bounds one
+session and drops its oldest message; `MaxTotalOfflineMessages` bounds the broker
+and rejects the newest message. Both drops are counted
+(`RecordDroppedMessage("offline_queue_full")`, `RecordDroppedMessage("offline_queue_total")`),
+and `RecordQueueDepth("offline", n)` reports the current depth. The queue drains
+in order immediately after the CONNACK of the next CONNECT. A message that cannot
+get a slot in the inflight window or a free packet id is delivered at QoS 0
+instead of stalling the session, which is the degradation the reference broker
+applies when its packet ids run out.
+
+**Retransmission.** An outbound QoS 1/2 delivery is kept in a per-connection
+inflight table keyed by packet id until the client confirms it. One timer per
+connection (not one per message) drives every retransmission: the first retry is
+sent after `QoSRetryInterval` (default 5 s), every further attempt doubles the
+wait, and `QoSMaxRetries` (default 5) caps the attempts, after which the exchange
+is left unconfirmed and its packet id stays reserved. A PUBLISH retransmission
+carries the DUP flag and the original packet id (the reference broker never sets
+DUP — not copied). QoS 2 runs PUBLISH → PUBREC → PUBREL → PUBCOMP, and the PUBREL
+is retried until the PUBCOMP arrives. `MaxInflightQoS1` bounds the unconfirmed
+QoS 1 PUBLISHes of a connection; `MaxInflightQoS2` bounds its QoS 2 exchanges in
+each direction (an inbound QoS 2 PUBLISH over the window is answered with PUBREC
+0x97 Quota exceeded on MQTT 5). A delivery that would exceed its window is
+skipped and counted (`RecordDroppedMessage("inflight_full")`): a slow or absent
+client never blocks the publishing goroutine or the cluster fan-out. Every timer
+and goroutine ends with its connection; the session sweeper is waited for by
+`Stop`.
+
+Deliberate limitations, all documented above with their reason: an inflight
+exchange is per connection, so a reconnect resumes the offline queue but not the
+unconfirmed deliveries of the previous connection; an inbound QoS 2 exchange is
+dropped when the connection closes (as in the reference); the queue is local to
+the node that received the publication, and the subscription summary a cluster
+peer advertises covers live sessions only, so a publication on another node does
+not queue for an offline session here.
 
 ## Transport layering
 

@@ -8,8 +8,10 @@
 - [x] TLS / WebSocket / WSS listeners
 - [x] MQTT 5 handshake, property skipping and basic reason codes
 - [x] MQTT 5: CONNACK capabilities, Topic Alias, User Property forwarding, subscription options
-- [ ] Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)
-- [ ] Full QoS 2 state machine and inflight limits
+- [x] Persistent-session storage behind the `SessionStore` seam, bounded offline queue, MQTT 5 session expiry and a bounded sweeper
+- [x] Outbound QoS 1/2 retransmission (DUP, PUBREL retries, one timer per connection) and inflight windows in both directions
+- [ ] Remaining MQTT 5 properties/semantics (receive maximum, packet limits)
+- [ ] QoS 2 state across a reconnect
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)
 - [x] Built-in TCP cluster backend (static seeds, cross-node publish/kick, reconnect)
 - [x] Cluster membership (handshake, heartbeats, eviction, duplicate collapse), event dedup, subscription-aware directed routing

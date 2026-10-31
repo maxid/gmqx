@@ -505,7 +505,7 @@ func test5SessionExpiry(t *testing.T) {
 	_ = fourth
 
 	t.Run("expires_after_interval", func(t *testing.T) {
-		t.Skip("timed session expiry is not implemented (sessions are in-memory and never expired by a clock): ROADMAP.md lists \"Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)\" as open")
+		t.Skip("this row would have to wait out the 60 s Session Expiry Interval it connected with; the sweeper is covered with a 1 s interval and a short sweep period by TestSessionExpirySweepSessions")
 	})
 }
 

@@ -17,8 +17,13 @@
 - MQTT 5：CONNACK 能力属性、Topic Alias、User Property 转发、
   订阅选项（no-local / retain-as-published / retain-handling）、原因码，
   以及协议错误时的 DISCONNECT
-- QoS 0/1 流程（按订阅 QoS 降级）与抑制入站重复的 QoS 2 握手（broker 侧重传与
-  inflight 限制仍在路线图上）
+- 持久会话存储、有界离线队列与 MQTT 5 Session Expiry Interval：没有活动连接的会话
+  保留其订阅匹配到的消息（FIFO，按会话与全局双重上限），在下次 CONNACK 之后立即按序
+  投递，并在过期间隔到达后由有界清扫器删除。状态位于 `SessionStore` 接缝之后
+  （`Load`/`Save`/`Delete`/`Keys`），默认即为早期版本的内存存储。
+- QoS 0/1/2 流程（按订阅 QoS 降级）、broker 侧出站 QoS 1/2 重传（PUBLISH 重传带 DUP、
+  PUBREL 重传到 PUBCOMP、每连接一个定时器、有上限的指数退避）以及“跳过而不阻塞”的
+  inflight 窗口。入站 QoS 2 握手抑制重复，并受 `MaxInflightQoS2` 约束（PUBREC 0x97）。
 - 保留消息、通配符订阅（`+`/`#`）、带 QoS/retain/属性的遗嘱消息、keepalive
 - 线级 MQTT 3.1.1/5 一致性测试套件（`TestConformance`）
 - 可插拔钩子：`AuthManager`、`AclManager`、`EventSink`（生命周期/消息）、
@@ -33,8 +38,8 @@
   一个命名空间的 publish 永远不会到达另一命名空间的会话；默认空命名空间
   保持单命名空间部署的行为不变
 - 连接模式：`UNIQUE` / `KICK`（client id 接管）
-- 限制：最大连接数、最大订阅数、最大保留消息数、
-  连接速率限制
+- 限制：最大连接数、最大订阅数、最大保留消息数、每个方向的 inflight 窗口、
+  每会话与全局离线队列长度、连接速率限制
 - 优雅关闭与 client-id 会话接管
 - 可插拔的 `Cluster` 接口，提供内置 TCP 后端（静态 seeds、
   带心跳与驱逐的握手式成员关系、事件去重与订阅感知的定向路由、
@@ -99,12 +104,26 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `MaxTopicSubscriptions` | 0 | 每会话订阅数限制 |
 | `MaxRetainMessages` | 0 | 保留消息数量限制 |
 | `ConnectionRateLimit` | 0 | 连接数/秒的令牌桶 |
+| `MaxInflightQoS1` | 64 | 每连接未确认的 QoS 1 PUBLISH 数（负值：不限） |
+| `MaxInflightQoS2` | 64 | 每连接每个方向的 QoS 2 交换数（负值：不限） |
+| `QoSRetryInterval` | 5 s | 重传基准间隔，每次尝试翻倍 |
+| `QoSMaxRetries` | 5 | 每个交换放弃前的重传次数（负值：不重传） |
+| `MaxOfflineQueueSize` | 1000 | 每个离线会话的队列上限；满时丢弃最旧的 |
+| `MaxTotalOfflineMessages` | 100000 | 所有离线会话的队列上限；满时拒绝最新的 |
+| `SessionSweepInterval` | 30 s | 过期会话的清理间隔（负值：不清理） |
+| `SessionStore` | `MemorySessionStore` | 离线会话状态的持久化接缝 |
 | `Auth` / `ACL` / `Sink` / `Metrics` | 全部放行 / 空实现 | 可插拔 SPI |
 | `Namespace` | `""`（默认） | 会话、保留状态与集群流量的隔离作用域 |
 | `Dispatcher` | `DefaultDispatcher` | 路由 SPI：默认本地投递 + 集群传播 |
 | `ConnContext` | nil | 在 CONNECT 时增强每连接 context |
 
-完整的 MQTT 5 属性/语义、完整的 QoS 2 以及客户端库都在路线图中（见 [ROADMAP.md](ROADMAP.md)）。
+随离线队列与 inflight 窗口新增的投递限制刻意有界：未设置时取文档中的默认值，因为无界
+队列与无界窗口都会把慢速客户端变成无界的 broker 内存。负值表示不限
+（`MaxInflightQoS1`、`MaxInflightQoS2`、`MaxOfflineQueueSize`、`MaxTotalOfflineMessages`）、
+不重传（`QoSMaxRetries`）或不做清理（`SessionSweepInterval`）。
+
+其余 MQTT 5 属性/语义（receive maximum、数据包上限）、跨重连的 QoS 2 状态与客户端库
+都在路线图中（见 [ROADMAP.md](ROADMAP.md)）。
 
 ## Dispatcher、连接 context 与命名空间
 
@@ -135,6 +154,52 @@ context 在连接被接受时创建，在 CONNECT 时由 `Config.ConnContext` �
 `Config.Namespace` 是 broker 的隔离作用域。会话、订阅匹配、保留存储与对外通告的订阅摘要
 都按它划分，两个内置集群后端会丢弃属于其他命名空间的远端事件。空字符串是默认命名空间
 （零值），因此未设置它的部署行为完全不变，包括文档化的 Redis 键布局。
+
+## 持久会话、离线队列与 QoS 1/2 重传
+
+持久会话（Clean Session 清零；MQTT 5 上为 Clean Start 清零且 Session Expiry Interval
+非零）在没有活动连接时保留状态：订阅、投递给这些订阅的消息，以及状态结束的截止时间。
+这些状态都位于 `SessionStore` 之后，并且存储中保存的正是“没有归属连接”的会话——活动连接
+拥有自己的会话，因此一条 publish 只会到达一个会话一次。
+
+`SessionStore`（`Load`、`Save`、`Delete`、`Keys`）存在的目的是让部署可以把会话状态移出
+进程。当 `Config.SessionStore` 为 nil 时 `New` 安装 `MemorySessionStore`，即早期版本的
+内存行为完全不变；本包不提供网络或磁盘后端。broker 在持有自身会话锁的情况下调用存储，
+因此实现不得回调 broker；`Keys` 是必需的，因为路由到离线会话与清理过期会话都需要枚举键。
+
+**过期。** MQTT 5 的 Session Expiry Interval 是一个截止时间：断连时把
+`ConnectInfo.SessionExpiry` 记为 `now + interval`，有界清扫器（`SessionSweepInterval`，
+每轮最多检查 512 个存储会话）在截止时间过后删除该会话及其订阅与排队消息。CONNECT 路径
+也会检查截止时间，因此即使清扫器尚未到达，过期会话也绝不会被恢复。非 clean 会话上的零
+间隔保持旧行为且永不过期——这是 MQTT 3.1.1 的情况（协议没有该间隔），而在 MQTT 5 上零
+间隔意味着会话随连接结束，因此不会存储任何状态，也就没有可过期的东西。
+
+**队列。** 只有持久会话会排队（本家族的参考实现对 clean 会话也排队，从而把消息投递给
+一个明确表示不需要会话的客户端；gmqx 不复制该缺陷）。队列是每会话的 FIFO，元素是 PUBLISH
+所需的一切——topic、QoS、retain 标志、payload、MQTT 5 属性——但不含 packet id：id 在
+排空时分配。`MaxOfflineQueueSize` 限制单个会话并丢弃其最旧的消息；
+`MaxTotalOfflineMessages` 限制整个 broker 并拒绝最新的消息。两种丢弃都可观测
+（`RecordDroppedMessage("offline_queue_full")`、`RecordDroppedMessage("offline_queue_total")`），
+`RecordQueueDepth("offline", n)` 报告当前深度。队列在下次 CONNECT 的 CONNACK 之后立即
+按序排空。既拿不到 inflight 窗口、也拿不到空闲 packet id 的消息会降级为 QoS 0 投递，
+而不是让会话停滞——这正是参考实现在 packet id 用尽时采用的降级方式。
+
+**重传。** 出站 QoS 1/2 投递会以 packet id 为键保存在每连接的 inflight 表中，直到客户端
+确认。每个连接一个定时器（而不是每条消息一个）驱动所有重传：首次重传在
+`QoSRetryInterval`（默认 5 秒）之后，之后每次尝试等待翻倍，`QoSMaxRetries`（默认 5）
+限制尝试次数，达到上限后该交换保持未确认状态且其 packet id 继续保留。PUBLISH 重传携带
+DUP 标志与原始 packet id（参考实现从不设置 DUP——不复制该缺陷）。QoS 2 走
+PUBLISH → PUBREC → PUBREL → PUBCOMP，PUBREL 会重传直到收到 PUBCOMP。
+`MaxInflightQoS1` 限制连接的未确认 QoS 1 PUBLISH 数；`MaxInflightQoS2` 限制其每个方向的
+QoS 2 交换数（入站 QoS 2 PUBLISH 超出窗口时在 MQTT 5 上回复 PUBREC 0x97 Quota exceeded）。
+会超出窗口的投递被跳过并计数（`RecordDroppedMessage("inflight_full")`）：慢速或离线的
+客户端永远不会阻塞发布协程或集群扇出。所有定时器与协程都随连接结束；会话清扫器由 `Stop`
+等待（不留下 goroutine 与定时器）。
+
+有意保留的限制（上文均给出原因）：inflight 交换属于连接，因此重连会恢复离线队列但不会
+恢复上一次连接中未确认的投递；入站 QoS 2 交换在连接关闭时丢弃（与参考实现一致）；队列
+位于收到该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，因此其他节点上的
+publish 不会在此处为离线会话排队。
 
 ## 传输分层
 

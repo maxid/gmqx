@@ -62,6 +62,17 @@ type client struct {
 	topicAliases   map[uint16]string
 	outPID         uint16
 
+	// inflight holds the outbound QoS 1/2 exchanges this connection has not
+	// confirmed yet, keyed by packet id; retryWake asks retransmitLoop to
+	// recompute its deadline. Both belong to the connection and die with it.
+	inflight  map[uint16]*inflightMessage
+	retryWake chan struct{}
+	// queue is what the session queued while it was offline, owned by this
+	// connection between register (which takes it from the store) and unregister
+	// (which stores what a failed drain left behind). Filled and read on the
+	// connection's goroutine only.
+	queue []queuedMessage
+
 	// version is the protocol level of the connection: mqtt.Version311 or
 	// mqtt.Version5. MQTT 3.1 clients decode and encode with the 3.1.1 layout,
 	// which is byte-identical for everything except CONNECT.
@@ -83,6 +94,8 @@ func newClient(b *Broker, conn net.Conn) *client {
 		subs:         make(map[string]subscription),
 		inboundQoS2:  make(map[uint16]struct{}),
 		topicAliases: make(map[uint16]string),
+		inflight:     make(map[uint16]*inflightMessage),
+		retryWake:    make(chan struct{}, 1),
 		version:      mqtt.Version311,
 	}
 }
@@ -313,6 +326,11 @@ func (c *client) handshake() error {
 	if err := c.writeConnack(0, assigned); err != nil {
 		return err
 	}
+	// Outbound delivery is owned by the connection from here on: one
+	// retransmission timer for QoS 1/2 confirmations, and the queue the session
+	// collected while it was offline drained FIFO right behind the CONNACK.
+	c.startRetransmitter()
+	c.drainOfflineQueue()
 	return nil
 }
 
@@ -338,6 +356,12 @@ func (c *client) loop() {
 		switch m := msg.(type) {
 		case *mqtt.Publish:
 			c.handlePublish(m)
+		case *mqtt.Puback:
+			c.handlePuback(m)
+		case *mqtt.Pubrec:
+			c.handlePubrec(m)
+		case *mqtt.Pubcomp:
+			c.handlePubcomp(m)
 		case *mqtt.Pubrel:
 			c.handlePubrel(m)
 		case *mqtt.Subscribe:
@@ -454,9 +478,23 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 		// delivered again.
 		c.mu.Lock()
 		_, pending := c.inboundQoS2[m.PacketID]
+		full := !pending && c.inboundWindowFullLocked()
 		c.mu.Unlock()
 		if pending {
 			_ = c.writePublishAck(2, m.PacketID, 0)
+			return
+		}
+		if full {
+			// The inbound QoS 2 window is full. MQTT 5 names the reason with PUBREC
+			// 0x97 and the exchange never starts, so the message is not delivered and
+			// the packet id is not remembered; MQTT 3.1.1 has no reason code, so the
+			// PUBLISH is left unacknowledged and the client retries (the same rule
+			// the broker applies to a publish it cannot accept).
+			c.broker.metrics.RecordDroppedMessage("inflight_qos2_full")
+			c.broker.metrics.RecordOverflow("inflight_qos2")
+			if c.version == mqtt.Version5 {
+				_ = c.writePublishAck(2, m.PacketID, ReasonQuotaExceeded)
+			}
 			return
 		}
 	}
@@ -537,29 +575,6 @@ func (c *client) handleUnsubscribe(m *mqtt.Unsubscribe) {
 		MessageHeader: c.header(),
 		PacketID:      m.PacketID,
 		ReasonCodes:   codes,
-	})
-}
-
-func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
-	var pid uint16
-	if qos > 0 {
-		c.mu.Lock()
-		c.outPID++
-		if c.outPID == 0 {
-			// Packet id 0 is not a valid identifier.
-			c.outPID = 1
-		}
-		pid = c.outPID
-		c.mu.Unlock()
-	}
-	return c.writeMessage(&mqtt.Publish{
-		MessageHeader: c.header(),
-		Topic:         topic,
-		Payload:       payload,
-		QoS:           qos,
-		PacketID:      pid,
-		Retain:        retain,
-		Properties:    props,
 	})
 }
 

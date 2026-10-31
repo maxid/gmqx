@@ -156,6 +156,21 @@ type EventSink interface {
 }
 
 // MetricsManager is the metrics SPI.
+//
+// RecordDroppedMessage observes something the broker refused to deliver or keep.
+// The reasons this package records are "acl_publish", "acl_subscribe",
+// "interceptor", "sink_rejected", "sink_retryable", "max_retain",
+// "max_connections", "max_subscriptions", "connection_rate_limit",
+// "cluster_namespace", "inflight_full" (a QoS 1/2 delivery was skipped because the
+// connection's inflight window was full), "inflight_qos2_full" (an inbound QoS 2
+// PUBLISH over the window), "retry_exhausted" (an outbound exchange used up its
+// retransmissions), "offline_queue_full" (the per-session cap dropped the oldest
+// message), "offline_queue_total" (the global cap rejected the newest one),
+// "offline_queue_corrupt", "offline_session_missing" and "session_expired".
+// RecordQueueDepth("offline", n) reports the messages currently queued for
+// offline sessions across the broker; RecordOverflow reports a limit that was hit
+// without losing a message ("connections", "inflight", "inflight_qos2", and
+// "packet_ids" — a delivery degraded to QoS 0 because no packet id was free).
 type MetricsManager interface {
 	IncrementConnections()
 	DecrementConnections()
@@ -243,8 +258,15 @@ type LocalTarget struct {
 	// publication delivered to a subscription with retain-as-published.
 	Retain bool
 
-	client *client
+	client     *client
+	sessionKey string
 }
+
+// Offline reports whether the target is a persistent session with no live
+// connection. SendLocal queues the publication for such a target instead of
+// writing it, and the queue drains right after the session's next CONNACK;
+// ConnectionID is empty for it, because there is no connection to name.
+func (t LocalTarget) Offline() bool { return t.client == nil && t.sessionKey != "" }
 
 // AllowAll permits every connection/subscription/publish.
 type AllowAll struct{}

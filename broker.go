@@ -29,17 +29,25 @@ type Broker struct {
 	nodeID     string
 	namespace  string
 	dispatcher Dispatcher
+	store      SessionStore
 
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
 	clients  map[string]*client
-	sessions map[string]*session
 	retained map[string]retainedMessage
 	servers  []*gnety.Server
 	addrs    map[string]string
 	done     chan struct{}
 	started  bool
 	closed   bool
+	// offlineQueued counts the messages stored for offline sessions across all
+	// of them, which is what MaxTotalOfflineMessages bounds. It is maintained by
+	// the broker under mu and follows every message that enters or leaves a stored
+	// queue.
+	offlineQueued int
+	// background tracks the broker's own goroutines (the session sweeper) so Stop
+	// returns only once they are gone.
+	background sync.WaitGroup
 }
 
 type retainedMessage struct {
@@ -50,14 +58,8 @@ type retainedMessage struct {
 	props     mqtt.Properties
 }
 
-// session is the state a persistent session keeps while no connection owns it:
-// the subscriptions the client asked the server to remember. A reconnecting
-// client with the clean-session (MQTT 5: clean start) flag cleared resumes it and
-// the CONNACK reports Session Present.
-type session struct {
-	subs map[string]subscription
-}
-
+// copySubscriptions returns a detached copy of a session's subscription map, so
+// a stored session and a live connection never share one.
 func copySubscriptions(subs map[string]subscription) map[string]subscription {
 	if len(subs) == 0 {
 		return nil
@@ -68,6 +70,19 @@ func copySubscriptions(subs map[string]subscription) map[string]subscription {
 	}
 	return out
 }
+
+// Defaults for the delivery limits Config leaves at zero. They are bounded on
+// purpose: an unbounded offline queue and an unbounded inflight window both turn
+// a slow or absent client into unbounded broker memory.
+const (
+	defaultMaxOfflineQueueSize     = 1000
+	defaultMaxTotalOfflineMessages = 100000
+	defaultMaxInflightQoS1         = 64
+	defaultMaxInflightQoS2         = 64
+	defaultSessionSweepInterval    = 30 * time.Second
+	defaultQoSRetryInterval        = 5 * time.Second
+	defaultQoSMaxRetries           = 5
+)
 
 // New creates a Broker. Start must be called to listen.
 func New(cfg Config) (*Broker, error) {
@@ -102,6 +117,30 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = randomID()
 	}
+	if cfg.SessionStore == nil {
+		cfg.SessionStore = NewMemorySessionStore()
+	}
+	if cfg.MaxOfflineQueueSize == 0 {
+		cfg.MaxOfflineQueueSize = defaultMaxOfflineQueueSize
+	}
+	if cfg.MaxTotalOfflineMessages == 0 {
+		cfg.MaxTotalOfflineMessages = defaultMaxTotalOfflineMessages
+	}
+	if cfg.MaxInflightQoS1 == 0 {
+		cfg.MaxInflightQoS1 = defaultMaxInflightQoS1
+	}
+	if cfg.MaxInflightQoS2 == 0 {
+		cfg.MaxInflightQoS2 = defaultMaxInflightQoS2
+	}
+	if cfg.SessionSweepInterval == 0 {
+		cfg.SessionSweepInterval = defaultSessionSweepInterval
+	}
+	if cfg.QoSRetryInterval <= 0 {
+		cfg.QoSRetryInterval = defaultQoSRetryInterval
+	}
+	if cfg.QoSMaxRetries == 0 {
+		cfg.QoSMaxRetries = defaultQoSMaxRetries
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -112,7 +151,7 @@ func New(cfg Config) (*Broker, error) {
 		metrics:   cfg.Metrics,
 		namespace: cfg.Namespace,
 		clients:   make(map[string]*client),
-		sessions:  make(map[string]*session),
+		store:     cfg.SessionStore,
 		retained:  make(map[string]retainedMessage),
 		addrs:     make(map[string]string),
 		done:      make(chan struct{}),
@@ -202,6 +241,11 @@ func (b *Broker) Start(ctx context.Context) error {
 			return fmt.Errorf("gmqx: cluster start: %w", err)
 		}
 	}
+	b.background.Add(1)
+	go func() {
+		defer b.background.Done()
+		b.sessionSweeper()
+	}()
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -368,6 +412,9 @@ func (b *Broker) Stop(ctx context.Context) error {
 	for _, c := range clients {
 		c.close(false)
 	}
+	// The sweeper waits on done, which is closed above; waiting here makes Stop
+	// mean "every goroutine this broker started has ended".
+	b.background.Wait()
 	return errors.Join(errs...)
 }
 
@@ -396,10 +443,16 @@ func (b *Broker) serve(conn net.Conn) {
 // start cleared) is restored here: the stored subscriptions become the new
 // connection's subscriptions and the CONNACK that follows reports Session
 // Present. A clean connection discards any stored session.
+//
+// The stored session, when there is one, moves from the store to the connection:
+// from here on the connection owns its subscriptions and its queue, and the store
+// no longer holds the key. That is what keeps a publication from reaching a
+// session twice (once live, once through a stale queue). An expired session is
+// never resumed, even when the sweeper has not deleted it yet.
 func (b *Broker) register(c *client) error {
 	key := namespaceKey(b.namespace, c.id)
 	b.mu.Lock()
-	var takeover map[string]subscription
+	var takeover *session
 	if old, ok := b.clients[key]; ok && old != c {
 		if b.cfg.ConnectMode == ConnectModeUnique {
 			b.mu.Unlock()
@@ -412,10 +465,11 @@ func (b *Broker) register(c *client) error {
 		old.mu.Lock()
 		old.superseded = true
 		if old.persistentSession() {
-			if stored, ok := b.sessions[key]; ok {
-				takeover = copySubscriptions(stored.subs)
+			if stored, ok := b.takeStoredSession(key); ok {
+				takeover = stored
 			} else {
-				takeover = copySubscriptions(old.subs)
+				takeover = &session{clientID: old.id, subs: copySubscriptions(old.subs), queue: old.queue}
+				old.queue = nil
 			}
 		}
 		old.mu.Unlock()
@@ -429,15 +483,22 @@ func (b *Broker) register(c *client) error {
 	}
 
 	if c.resumesSession() {
-		if stored, ok := b.sessions[key]; ok {
-			c.subs = copySubscriptions(stored.subs)
+		if stored, ok := b.takeStoredSession(key); ok {
+			c.subs = stored.subs
+			c.queue = stored.queue
 			c.sessionPresent = true
 		} else if takeover != nil {
-			c.subs = takeover
+			c.subs = takeover.subs
+			c.queue = takeover.queue
 			c.sessionPresent = true
 		}
 	} else {
-		delete(b.sessions, key)
+		b.deleteStoredSession(key)
+	}
+	if c.subs == nil {
+		// A resumed session without subscriptions (or a store that returns none)
+		// must still be able to accept a SUBSCRIBE.
+		c.subs = make(map[string]subscription)
 	}
 
 	b.clients[key] = c
@@ -477,9 +538,9 @@ func (b *Broker) unregister(c *client) {
 	hadSubscriptions := len(c.subs) > 0
 	if !c.superseded {
 		if c.persistentSession() {
-			b.sessions[key] = &session{subs: copySubscriptions(c.subs)}
+			b.saveStoredSession(key, c)
 		} else {
-			delete(b.sessions, key)
+			b.deleteStoredSession(key)
 		}
 	}
 	c.mu.Unlock()
@@ -739,11 +800,15 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, pub Publication) error
 }
 
 // LocalTargets is the read-only half of the routing seam a Dispatcher uses: the
-// local sessions whose subscriptions match pub, with the per-session QoS cap and
-// retain flag already applied, and no-local subscriptions of the publishing
-// connection excluded. It re-reads live subscriptions on every call; it does not
-// cache a routing table. A publication of another namespace has no local target
-// here.
+// sessions whose subscriptions match pub, with the per-session QoS cap and retain
+// flag already applied, and no-local subscriptions of the publishing connection
+// excluded. It re-reads live subscriptions on every call; it does not cache a
+// routing table. A publication of another namespace has no local target here.
+//
+// A persistent session with no live connection is a local target too: its stored
+// subscriptions are matched and SendLocal queues the publication for it (see
+// LocalTarget.Offline). The two halves are disjoint — a session is either in the
+// client table or in the store — so a publication reaches one session once.
 func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
 	if pub.Namespace != b.namespace {
 		return nil
@@ -752,10 +817,12 @@ func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	targets := make([]LocalTarget, 0)
-	for _, c := range b.clients {
+	live := make(map[string]struct{}, len(b.clients))
+	for key, c := range b.clients {
 		if c.namespace != pub.Namespace {
 			continue
 		}
+		live[key] = struct{}{}
 		c.mu.Lock()
 		found := false
 		rap := false
@@ -789,17 +856,63 @@ func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
 			targets = append(targets, target)
 		}
 	}
+	for _, key := range b.store.Keys() {
+		if !keyInNamespace(b.namespace, key) {
+			// A store may be shared with a broker of another namespace.
+			continue
+		}
+		if _, connected := live[key]; connected {
+			// A live session was already matched above; a stored copy of it would
+			// be stale.
+			continue
+		}
+		state, ok := b.store.Load(key)
+		if !ok {
+			continue
+		}
+		if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
+			// Expired but not swept yet: nothing is queued for it.
+			continue
+		}
+		found := false
+		rap := false
+		var maxQoS byte
+		for filter, sub := range state.Subscriptions {
+			if !matchTopic(filter, pub.Topic) {
+				continue
+			}
+			// No Local names a connection and an offline session has none, so the
+			// option cannot exclude anything here.
+			found = true
+			if sub.QoS > maxQoS {
+				maxQoS = sub.QoS
+			}
+			if sub.RetainAsPublished {
+				rap = true
+			}
+		}
+		if !found {
+			continue
+		}
+		targets = append(targets, LocalTarget{
+			ClientID:   state.ClientID,
+			QoS:        minQoS(pub.QoS, maxQoS),
+			Retain:     rap && pub.Retain,
+			sessionKey: key,
+		})
+	}
 	return targets
 }
 
 // SendLocal is the write half of the routing seam: it writes pub to one target
-// returned by LocalTargets. The send is synchronous and best-effort, like the
-// broker's own delivery path; ctx is the publication's context (the publishing
+// returned by LocalTargets, or queues it for a target that is an offline
+// persistent session. The send is synchronous and best-effort, like the broker's
+// own delivery path; ctx is the publication's context (the publishing
 // connection's context for an accepted local publication) and is carried so a
 // dispatcher can observe cancellation, not to abort a write that is already on
 // the wire.
 func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publication) error {
-	if target.client == nil {
+	if target.client == nil && target.sessionKey == "" {
 		return errors.New("gmqx: local target was not produced by this broker")
 	}
 	props := pub.props
@@ -809,6 +922,10 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 			return fmt.Errorf("gmqx: local delivery properties: %w", err)
 		}
 		props = decoded
+	}
+	if target.client == nil {
+		b.enqueueOffline(target, pub, props)
+		return nil
 	}
 	return target.client.sendPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
 }

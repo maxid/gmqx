@@ -222,14 +222,14 @@ func TestRemoteEventsOfAnotherNamespaceAreDropped(t *testing.T) {
 // its broker's namespace.
 func TestNamespaceSessionTableIsPartitioned(t *testing.T) {
 	b := startBroker(t, Config{Namespace: "tenant-a"})
-	b.mu.Lock()
-	b.sessions[namespaceKey("tenant-a", "resumed")] = &session{subs: map[string]subscription{
-		"ns/#": {qos: 0},
-	}}
-	b.sessions[namespaceKey("tenant-b", "foreign")] = &session{subs: map[string]subscription{
-		"foreign/#": {qos: 0},
-	}}
-	b.mu.Unlock()
+	b.store.Save(namespaceKey("tenant-a", "resumed"), SessionState{
+		ClientID:      "resumed",
+		Subscriptions: map[string]SessionSubscription{"ns/#": {QoS: 0}},
+	})
+	b.store.Save(namespaceKey("tenant-b", "foreign"), SessionState{
+		ClientID:      "foreign",
+		Subscriptions: map[string]SessionSubscription{"foreign/#": {QoS: 0}},
+	})
 
 	resumed, sessionPresent := dialPersistentTestClient(t, b.Addr(), "resumed")
 	if sessionPresent != 1 {
