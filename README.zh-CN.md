@@ -44,8 +44,11 @@
 - 命名空间隔离：`Config.Namespace` 划分会话表、订阅匹配、保留状态以及集群订阅摘要/事件，
   一个命名空间的 publish 永远不会到达另一命名空间的会话；默认空命名空间
   保持单命名空间部署的行为不变
-- 连接模式：`UNIQUE` / `KICK`（client id 接管；MQTT 5 上被顶掉的连接收到 DISCONNECT 0x8E，
-  `NotKickSeconds` 防抖窗口，以及两种模式下都会关闭其他节点上重复连接的 CONNECT 时 kick）
+- 连接模式：`UNIQUE` / `KICK`（client id 接管；MQTT 5 上被顶掉的连接收到 DISCONNECT 0x8E；
+  `NotKickSeconds` 防抖窗口在 CONNECT 端与收到 kick 的对端都生效；CONNECT 时 kick 携带产生
+  该事件的连接的建立时间，因此它仍会关闭其他节点上的重复连接，而迟到的 kick 无法关闭更新的连接）
+- 集群内共享持久会话：可选的 `RedisSessionStore` 把订阅与离线队列放进集群后端所用的同一个
+  Redis，客户端重连到其他节点时会话得以恢复
 - CONNACK 宣告为不可用的能力会被显式拒绝而不是静默忽略：`$share/...` 过滤器回 SUBACK 0x9E
   （MQTT 3.1.1 回 0x80），带 Subscription Identifier 的 SUBSCRIBE 回 DISCONNECT 0x9A
 - 限制：最大连接数、最大订阅数、最大保留消息数、每个方向的 inflight 窗口、
@@ -115,7 +118,7 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `TLS` | 禁用 | `Enabled`、`Cert`、`Key`、`CA`、`RequireClientCert` |
 | `MaxPacketSize` | 4 MiB | 入站数据包上限 |
 | `ConnectMode` | `UNIQUE` | 拒绝或踢掉已存在的 client id |
-| `NotKickSeconds` | 30 | `KICK` 模式下接管的防抖窗口（负值：不设窗口） |
+| `NotKickSeconds` | 30 | 接管的防抖窗口，本地 CONNECT 与收到的对端 kick 都适用（负值：不设窗口） |
 | `ConnectTimeout` | 10 s | CONNECT 阶段读超时；只建连不发 CONNECT 的连接会被关闭 |
 | `AuthTimeout` | 5 s | `Authenticate` 与 `ACL.Check` 的时限；超时即拒绝（负值：不限） |
 | `MaxWillDelayInterval` | 5 min | 允许的最长 MQTT 5 Will Delay Interval（负值：不限） |
@@ -133,7 +136,7 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `MaxOfflineQueueSize` | 1000 | 每个离线会话的队列上限；满时丢弃最旧的 |
 | `MaxTotalOfflineMessages` | 100000 | 所有离线会话的队列上限；满时拒绝最新的 |
 | `SessionSweepInterval` | 30 s | 过期会话的清理间隔（负值：不清理） |
-| `SessionStore` | `MemorySessionStore` | 离线会话状态的持久化接缝 |
+| `SessionStore` | `MemorySessionStore` | 离线会话状态的持久化接缝；`NewRedisSessionStore` 使其在 Redis 集群各节点间共享 |
 | `Auth` / `ACL` / `Sink` / `Metrics` | 全部放行 / 空实现 | 可插拔 SPI |
 | `Namespace` | `""`（默认） | 会话、保留状态与集群流量的隔离作用域 |
 | `Dispatcher` | `DefaultDispatcher` | 路由 SPI：默认本地投递 + 集群传播 |
@@ -216,11 +219,62 @@ at-most-once），未命中通过 `RecordDroppedMessage("target_unknown")` 计�
 
 `SessionStore`（`Load`、`Save`、`Delete`、`Keys`）存在的目的是让部署可以把会话状态移出
 进程。当 `Config.SessionStore` 为 nil 时 `New` 安装 `MemorySessionStore`，即早期版本的
-内存行为完全不变；本包不提供网络或磁盘后端。broker 在持有自身会话锁的情况下调用存储，
+内存行为完全不变，且它仍是默认值；本包还提供另一个实现 `NewRedisSessionStore`（见下面的
+**共享会话**）。broker 在持有自身会话锁的情况下调用存储，
 因此实现不得回调 broker。路由完全不读取存储：broker 在保存会话时把其订阅写入路由索引，
 在接管或过期时移除。`Keys` 仍然必需——`New` 用它把部署在 broker 创建之前恢复进存储的会话
 索引一次，过期清扫器用它枚举需要执行的截止时间；运行中的 broker 不会重读被外部进程写入的
 存储。
+
+**共享会话。** 默认情况下会话只存在于持有它的节点上，因此重连到另一个节点的客户端会从零
+开始。`NewRedisSessionStore` 把这份状态放进 Redis，而
+`NewRedisClusterWithSessionStore(cfg)` 用一份 `RedisClusterConfig` 同时构建 Redis 集群后端
+与该存储，两者使用相同的地址、数据库与 `ChannelPrefix`：
+
+```go
+redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(gmqx.RedisClusterConfig{
+    Addr: "redis:6379",
+})
+if err != nil {
+    return err
+}
+defer sessions.Close()
+broker, _ := gmqx.New(gmqx.Config{
+    NodeID:         "n1",
+    ClusterBackend: redisCluster,
+    SessionStore:   sessions,
+})
+```
+
+存储为每个已存储会话保留一个键，位于集群前缀之下：
+
+| 键 | 内容 | TTL |
+|---|---|---|
+| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON `{v, client, expires, subs, queue}`：会话的订阅及其选项、排队消息（payload、QoS、retain 标志与属性块）以及会话截止时间 | 会话自身的截止时间 |
+
+键正是 broker 请求的那个键（已带命名空间前缀），因此共用同一个 Redis 的两个命名空间不会
+相撞，而 `session` 段与集群自己的 `node`、`owner`、`member`、`subs`、`client` 键没有任何
+重叠。TTL 是会话本身而不是缓存寿命：带 Session Expiry Interval 的会话即使没有清扫器运行也会
+在到期时从 Redis 消失，没有该间隔的会话（MQTT 3.1.1）不设 TTL，而截止时间已过的状态会被
+删除而不是写入。无法解码的值会被删除并计入
+（`RecordDroppedMessage("session_store_corrupt")`），一条坏记录不会让 CONNECT 失败；Redis
+命令失败计入 `"session_store_error"` 并退化为“没有会话”（与集群传输一样是至多一次语义）。
+
+两条规则避免同一个会话被两个节点同时服务：
+
+- 取出会话是原子操作（`Take`，一次 Redis 往返完成读取与删除），因此两个节点同时对同一个
+  client id 重连时不会都恢复该会话。该存储还实现了可选的 `SharedSessionStore` 接口，broker
+  在对端 kick 顶掉连接时使用它：被顶掉的节点既不把自己的副本写回（那会让对端正服务的会话
+  复活），也不删除该键（那会抹掉对端刚保存的状态）。使用默认内存存储时行为不变——被 kick
+  的会话状态留在原处，因为只有该节点能访问它。
+- clean CONNECT 无论落在哪个节点都会丢弃共享会话，而且每个节点的清扫器只清理自己命名空间
+  的键。
+
+存储搬运的是状态而不是路由：为已存储会话排队的，是把它放进自己路由索引的节点（保存它的
+节点，或启动时它就存在的节点）。与节点本地存储一样，另一个节点收到的 publish 不会为这里的
+离线会话排队，除非集群把它路由过来（见下面的已知限制）。`Save` 替换整条记录，而 broker
+的会话锁只串行化单个节点的写入，因此两个节点同时为同一个已存储会话排队时可能丢掉其中一条
+——离线会话的队列实际上由保存它的节点独占。
 
 **过期。** MQTT 5 的 Session Expiry Interval 是一个截止时间：断连时把
 `ConnectInfo.SessionExpiry` 记为 `now + interval`，有界清扫器（`SessionSweepInterval`，
@@ -268,7 +322,8 @@ PUBREL/PUBCOMP、SUBACK、PINGRESP。其队列有界（`MaxOutboundQueueSize`，
 有意保留的限制（上文均给出原因）：inflight 交换及其队列属于连接，因此重连会恢复离线队列
 但不会恢复上一次连接中未确认或已排队的投递；入站 QoS 2 交换在连接关闭时丢弃（与参考
 实现一致）；队列位于收到该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，
-因此其他节点上的 publish 不会在此处为离线会话排队。
+因此其他节点上的 publish 不会在此处为离线会话排队（共享会话存储搬运的是状态，而不是这条
+路由）。
 
 ## 接管、延迟 will 与保留消息过期
 
@@ -286,10 +341,36 @@ CONNECT 都立即接管——这是窗口出现之前的行为，也是 MQTT 本
 
 **跨节点接管。** 每次成功 CONNECT 都会向集群广播一次 kick，两种连接模式都一样：客户端重连到
 另一个节点时，旧节点上的连接否则会一直存活到 keepalive 过期，并在这段时间里重复投递每条
-消息。收到 kick 的节点和自己的本地接管一样处理（MQTT 5 上先发 DISCONNECT 0x8E），并取消它
+消息。真正顶掉连接的 kick 与本地接管一样处理（MQTT 5 上先发 DISCONNECT 0x8E），并取消本节点
 为该 client id 挂着的延迟 will。事件携带的是 client id 而不是 topic，所以发往所有对等节点，
-命名空间与 `(Origin, Seq)` 去重规则照旧。`NotKickSeconds` 只在收到 CONNECT 的节点上执行：
-对端无法知道本节点连接的年龄，那需要集群 presence 视图（见 [ROADMAP.md](ROADMAP.md)）。
+命名空间与 `(Origin, Seq)` 去重规则照旧。
+
+*kick 的 epoch。* kick 还携带产生它的节点，以及产生它的连接的建立时间
+（`ClusterMessage.ConnectTime`，该节点墙钟的 Unix 纳秒），接收端只对更旧的连接应用：
+
+| 本节点持有的连接 | kick | 结果 |
+|---|---|---|
+| 早于 kick 的 epoch | 更新 | 应用（顶掉） |
+| 晚于 kick 的 epoch | 更旧 | 拒绝，`RecordDroppedMessage("cluster_kick_stale")` |
+| 同一时刻，本节点 id 更大 | 相同 | 拒绝（本连接胜出） |
+| 同一时刻，本节点 id 更小 | 相同 | 应用（对端连接胜出） |
+| 没有 epoch（`ConnectTime` 为 0） | 旧版 | 应用，`RecordDroppedMessage("cluster_kick_legacy")` |
+
+因此迟到或乱序的 kick 无法关闭比它本应顶替的连接更新的连接，而同一时刻接受同一 client id
+的两个节点会得到同样的结论，而不是两边都关闭。被拒绝的 kick 会被计数并以 Debug 级别记录，
+绝不静默忽略。`Config.NotKickSeconds` 在这一侧同样生效：如果 kick 到达时它所指的连接仍年轻于
+窗口，该 kick 被拒绝（`RecordDroppedMessage("cluster_kick_rate_limit")`），因此两个节点
+无法以快于窗口的速度互相抢走 client id。
+
+*时钟假设。* epoch 是墙钟读数，因为单调时钟读数在另一个进程里没有意义。跨节点排序假设集群
+各节点时钟已按 NTP 同步到 `NotKickSeconds` 之内；更大的偏差不会让已被顶掉的连接复活（窗口
+拒绝为其兜底），只会让对端应用或拒绝一个它本会作出不同判断的 kick。单节点内部不跨时钟：
+本地窗口用 `time.Since` 比较连接的单调时钟起点。
+
+*滚动升级。* 没有 epoch 的 kick 来自早于 kick epoch 的构建。它会被无条件应用——正是那个构建
+本身的行为——并计入 `"cluster_kick_legacy"`，因此混合版本的集群退化为旧语义而不是拒绝所有
+kick。新节点的 kick 到达旧对端时，只是多了一个旧构建会忽略的 JSON 字段，所以线格式在两个
+方向上依然兼容。
 
 **Will Delay Interval。** MQTT 5 允许 WILL 指定延迟。will 在两件事中较早的一件发生时发布：
 延迟到期，或会话结束。
@@ -457,6 +538,20 @@ redisCluster := gmqx.NewRedisCluster(gmqx.RedisClusterConfig{
 broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 ```
 
+同一个 Redis 也可以保存集群的会话，使重连到另一个节点的客户端恢复其订阅与队列而不是从零
+开始。这是可选项，并且由同一份配置构建：
+
+```go
+redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(cfg) // cfg: RedisClusterConfig
+if err != nil {
+    return err
+}
+defer sessions.Close()
+broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, SessionStore: sessions})
+```
+
+键布局、TTL 规则以及接管对共享会话的影响见持久会话一节的 **共享会话**。
+
 ### 键与通道
 
 每个键与通道都位于同一个前缀之下（`ChannelPrefix`，默认
@@ -469,6 +564,7 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`：存活性与身份 | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`：订阅摘要 | `SummaryTTL` |
 | `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`：client id 由哪个节点持有 | `PresenceTTL` |
+| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON 会话记录，由配置的 `RedisSessionStore` 写入（见 [共享会话](#持久会话离线队列与-qos-12-重传)） | 会话的截止时间 |
 
 一个节点只订阅自己的通道，不订阅其他任何通道。一次 publish 会为每个
 感兴趣的节点各执行一次 `PUBLISH`，因此 N 个节点的代价是 O(N) 次 Redis 操作

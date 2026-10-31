@@ -107,8 +107,11 @@ func TestTCPClusterCrossNodePublish(t *testing.T) {
 
 func TestTCPClusterCrossNodeKick(t *testing.T) {
 	ca, _, _, hb := newTCPClusterPair(t)
+	// The epoch of a kick travels as a plain JSON field, so a peer that predates it
+	// ignores it and a peer that knows it can order the event.
+	epoch := time.Now().Add(-time.Second)
 	if err := ca.Spread(context.Background(), ClusterMessage{
-		Type: ClusterKick, NodeID: "a", ClientID: "device-1",
+		Type: ClusterKick, NodeID: "a", ClientID: "device-1", ConnectTime: epoch.UnixNano(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +123,9 @@ func TestTCPClusterCrossNodeKick(t *testing.T) {
 			hb.mu.Unlock()
 			if got.ClientID != "device-1" {
 				t.Fatalf("kick = %+v", got)
+			}
+			if got.ConnectTime != epoch.UnixNano() {
+				t.Fatalf("kick epoch = %d, want %d", got.ConnectTime, epoch.UnixNano())
 			}
 			return
 		}
@@ -218,19 +224,25 @@ func TestTCPClusterReconnect(t *testing.T) {
 	t.Fatalf("publish not delivered after reconnect (waited %v)", time.Since(start))
 }
 
+// TestTCPClusterBrokerCrossNodeKick pins the connect-time kick end to end: the
+// second node accepts the client id and the first node's connection is closed. The
+// anti-flap window is disabled (NotKickSeconds -1) because the two connections here
+// are milliseconds apart and the receive side now applies the same window: this
+// case is about the kick crossing the mesh, not about its rate.
 func TestTCPClusterBrokerCrossNodeKick(t *testing.T) {
 	aAddr, bAddr := freeAddr(t), freeAddr(t)
 	ca := NewTCPCluster(TCPClusterConfig{Addr: aAddr, Seeds: []string{bAddr}, ReconnectInterval: 20 * time.Millisecond})
 	cb := NewTCPCluster(TCPClusterConfig{Addr: bAddr, Seeds: []string{aAddr}, ReconnectInterval: 20 * time.Millisecond})
-	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca, ConnectMode: ConnectModeKick})
-	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb, ConnectMode: ConnectModeKick})
+	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca, ConnectMode: ConnectModeKick, NotKickSeconds: -1})
+	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb, ConnectMode: ConnectModeKick, NotKickSeconds: -1})
 	waitPeers(t, ca, 1)
 	waitPeers(t, cb, 1)
 
 	remote := dialTestClient(t, b.Addr(), "dup")
 	// The kick b just spread is delivered asynchronously: let it reach a before
-	// the same client id connects there, otherwise b's kick for its own older
-	// session can close a's newer one (both nodes would legitimately kick).
+	// the same client id connects there. A kick that is still in flight when a's
+	// newer connection exists is refused by the epoch ordering (it is older than
+	// that connection), so the two connections do not race.
 	time.Sleep(50 * time.Millisecond)
 	_ = dialTestClient(t, a.Addr(), "dup") // same client id on another node must take over
 

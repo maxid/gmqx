@@ -17,6 +17,8 @@
 - [x] MQTT 5 Will Delay Interval (cancelled by resume, cut short by session expiry, bounded by `MaxWillDelayInterval`)
 - [x] Retained message expiry (MQTT 5 Message Expiry Interval, replayed decremented, deleted when elapsed)
 - [x] Takeover parity across nodes (connect-time kick in both connect modes, DISCONNECT 0x8E) and the `NotKickSeconds` anti-flap window
+- [x] Kick epochs: a kick names the node and the connect time of the connection that produced it, so a delayed kick cannot close a newer connection, and the anti-flap window applies on the receiving side too
+- [x] Redis-backed shared session store (`NewRedisSessionStore`, atomic take, per-key TTL from the session expiry, namespace-scoped keys) so a client that reconnects to another node resumes its session
 - [ ] Remaining MQTT 5 properties/semantics (receive maximum, packet limits)
 - [ ] QoS 2 state across a reconnect
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)

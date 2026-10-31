@@ -62,6 +62,28 @@ type ClusterMessage struct {
 	// starting at 1. Receivers use (Origin, Seq) to drop duplicates. Seq 0 means
 	// "not stamped" and is delivered without deduplication.
 	Seq uint64
+
+	// ConnectTime is the epoch of a kick: when the connection that produced the
+	// event was registered on its own node, in Unix nanoseconds from that node's
+	// wall clock. It is set on ClusterKick only, and it is what lets a receiving
+	// node tell a delayed or reordered kick from a current one instead of closing
+	// a connection that is newer than the one the kick was meant to replace (see
+	// Broker.OnRemoteKick).
+	//
+	// Clock assumption: the value is a wall-clock reading, because a monotonic
+	// reading means nothing on another process. Cross-node ordering therefore
+	// assumes the clocks of a cluster are NTP-synchronised to within the
+	// Config.NotKickSeconds anti-flap window, which is what the receive-side
+	// window bounds: skew larger than that window cannot revive an already
+	// displaced connection, it can only make the peer refuse (or accept) a kick it
+	// would have decided differently, and a refused kick never closes a younger
+	// connection. Within one node nothing is compared across clocks: the local
+	// anti-flap window uses the monotonic reading of the connection's start time.
+	//
+	// Zero means "not stamped": a peer running a build from before kick epochs
+	// sends none, and its kick is applied with the pre-epoch behaviour (see
+	// Broker.OnRemoteKick).
+	ConnectTime int64
 }
 
 // ClusterHandler receives the remote events every backend delivers: a publish and

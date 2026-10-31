@@ -67,10 +67,18 @@ type Config struct {
 	// administrative ban (0x8A) and not a whole-server overload (0x89). Zero
 	// selects the default (30 s) and a negative value disables the window, which
 	// takes the session over on every CONNECT — the behaviour before the window
-	// existed and the one MQTT itself prescribes. The window is enforced on the
-	// node that receives the CONNECT, against the connections that node holds; a
-	// kick spread by a peer is applied without it, because the peer cannot know
-	// how old this node's connection is (that needs a cluster presence view).
+	// existed and the one MQTT itself prescribes.
+	//
+	// The window protects a connection on both ends of a cluster. On the node that
+	// receives the CONNECT it is enforced against that node's connections, as
+	// above. On a node that receives a peer's connect-time kick it is enforced
+	// against the connection the kick would close: a kick that arrives while the
+	// incumbent is younger than the window is refused (counted with
+	// Metrics.RecordDroppedMessage("cluster_kick_rate_limit")) instead of closing
+	// a connection that cannot be the one the peer replaced. A kick that carries no
+	// epoch, because its sender predates kick epochs, is applied without the
+	// window: a mixed cluster keeps the pre-epoch behaviour instead of refusing
+	// every kick.
 	NotKickSeconds int
 	// ConnectTimeout bounds the CONNECT phase of one connection: a read deadline
 	// is armed before the first packet is read and cleared once the handshake is
@@ -182,8 +190,11 @@ type Config struct {
 	// SessionStore is where persistent-session state lives while no connection
 	// owns it (subscriptions, queued messages, expiry deadline). Nil installs
 	// MemorySessionStore, which is exactly the broker's behavior before the seam
-	// existed. A deployment can supply another implementation; this package ships
-	// only the in-memory one.
+	// existed and stays the default. A deployment can supply another
+	// implementation; this package ships two, the node-local MemorySessionStore and
+	// the shared RedisSessionStore (NewRedisSessionStore), the latter being what
+	// lets a client that reconnects to another node of a cluster resume its
+	// session.
 	SessionStore SessionStore
 
 	// SPI

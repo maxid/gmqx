@@ -121,12 +121,16 @@ func sessionFromState(state SessionState) (*session, int) {
 //
 // An expired session is never handed over, even when the sweeper has not reached
 // it yet: the Session Expiry Interval is a deadline, not a hint.
+//
+// The removal is atomic when the store provides Take (a shared store must: see
+// sessionTaker), so two nodes that reconnect the same client id cannot both be
+// handed the session. A node-local store is taken with Load followed by Delete,
+// which its own broker lock already serialises.
 func (b *Broker) takeStoredSession(key string) (*session, bool) {
-	state, ok := b.store.Load(key)
+	state, ok := b.takeSessionState(key)
 	if !ok {
 		return nil, false
 	}
-	b.store.Delete(key)
 	b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
 	if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
 		b.metrics.RecordDroppedMessage("session_expired")
@@ -139,6 +143,28 @@ func (b *Broker) takeStoredSession(key string) (*session, bool) {
 		b.metrics.RecordDroppedMessage("offline_queue_corrupt")
 	}
 	return s, true
+}
+
+// takeSessionState removes the state stored under key and returns it: one atomic
+// operation for a store that implements Take, Load and Delete otherwise.
+func (b *Broker) takeSessionState(key string) (SessionState, bool) {
+	if taker, ok := b.store.(sessionTaker); ok {
+		return taker.Take(key)
+	}
+	state, ok := b.store.Load(key)
+	if !ok {
+		return SessionState{}, false
+	}
+	b.store.Delete(key)
+	return state, true
+}
+
+// sharedStore reports whether Config.SessionStore is read and written by several
+// broker nodes, which is what decides whether a connection displaced by a peer's
+// kick may still write to it (see unregister).
+func (b *Broker) sharedStore() bool {
+	shared, ok := b.store.(SharedSessionStore)
+	return ok && shared.SharedAcrossNodes()
 }
 
 // deleteStoredSession removes key and forgets its queued messages. The caller

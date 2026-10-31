@@ -191,7 +191,17 @@ type EventSink interface {
 // QoS 1/2 PUBLISH, an acknowledgement — hit a full writer queue, so the
 // connection is disconnected), "offline_queue_full" (the per-session cap dropped
 // the oldest message), "offline_queue_total" (the global cap rejected the newest
-// one), "offline_queue_corrupt", "offline_session_missing", "session_expired"
+// one), "offline_queue_corrupt", "offline_session_missing", "session_expired",
+// "session_store_corrupt" (a stored session in a SessionStore did not decode, so
+// it was dropped), "session_store_error" (a SessionStore command failed, so the
+// operation degraded to "no session"), "cluster_kick_stale" (a peer's kick is not
+// newer than the connection it would close, so it was refused and the connection
+// kept), "cluster_kick_rate_limit" (a peer's kick arrived inside the
+// Config.NotKickSeconds window of the connection it would close, so it was refused
+// and the connection kept), "cluster_kick_legacy" (a peer's kick carried no epoch
+// because its sender predates kick epochs, so it was applied with the pre-epoch
+// behavior; it is counted although it is not dropped, so an operator can see a
+// mixed-version cluster)
 // and "target_unknown" (a directed publish for a client id nobody holds: no
 // cluster backend is configured, the Redis presence view has no record for it, or
 // a TCP peer received the broadcast without holding the id — a directed publish is

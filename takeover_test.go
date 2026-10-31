@@ -117,15 +117,17 @@ func TestTakeoverAntiFlapWindow(t *testing.T) {
 // is in ConnectModeKick. Without it the old connection would keep receiving
 // deliveries until its keep-alive expired.
 func TestClusterTakeoverClosesZombieInUniqueMode(t *testing.T) {
-	// UNIQUE is the default connect mode; NotKickSeconds plays no part across
-	// nodes, so it is left at its default.
-	a, b := newClusterBrokerPair(t, Config{})
+	// UNIQUE is the default connect mode. NotKickSeconds -1 disables the anti-flap
+	// window on both nodes: the two connections of this case are milliseconds
+	// apart, and the receive side applies the window too, so this case is about the
+	// displacement itself.
+	a, b := newClusterBrokerPair(t, Config{NotKickSeconds: -1})
 
 	zombie, _ := mustConnect(t, a.Addr(), confConnect{version: mqtt.Version5, clientID: "roam", clean: true})
 	// This CONNECT spread a kick for "roam" too. Let the peer apply it before the
-	// second connection exists: a kick carries no epoch, so one that is still in
-	// flight when the new connection is accepted would displace it (the documented
-	// gap of a cross-node kick, which has no presence to compare ages against).
+	// second connection exists: a kick still in flight when the newer connection
+	// is registered would be refused as stale (it is older than that connection),
+	// which is the ordering rule this test is not about.
 	time.Sleep(200 * time.Millisecond)
 	// The same client id on another node: node b has no local record for it, so
 	// UNIQUE does not apply and b accepts it. Its CONNECT is spread, and a's

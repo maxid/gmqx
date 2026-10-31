@@ -485,11 +485,13 @@ func presenceNode(t *testing.T, mr *miniredis.Miniredis, key string) string {
 // node change: a client that reconnects to another node is kicked on the old one,
 // the old node stops refreshing the record (otherwise the two nodes would fight
 // over it every refresh), and a directed publish follows the client to its new
-// node.
+// node. NotKickSeconds -1 disables the anti-flap window, which the receive side
+// applies as well and which would refuse a kick for a connection this young: this
+// case is about presence following the client, not about the takeover rate.
 func TestRedisClusterPresenceFollowsTakeover(t *testing.T) {
 	mr := runMiniRedis(t)
-	a := startBroker(t, Config{NodeID: "a", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger()})
-	b := startBroker(t, Config{NodeID: "b", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger()})
+	a := startBroker(t, Config{NodeID: "a", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger(), NotKickSeconds: -1})
+	b := startBroker(t, Config{NodeID: "b", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger(), NotKickSeconds: -1})
 	ca := a.cfg.ClusterBackend.(*redisCluster)
 	cb := b.cfg.ClusterBackend.(*redisCluster)
 	waitRedisMembers(t, ca, "b")

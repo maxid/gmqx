@@ -13,14 +13,28 @@ import (
 // New installs MemorySessionStore, so a broker that does not configure a store
 // keeps the previous behavior. Config.SessionStore accepts another
 // implementation, which is how a deployment moves session state out of the
-// process without touching the broker; this package deliberately ships no
-// network or disk backend.
+// process without touching the broker. This package ships two: MemorySessionStore
+// (the default, node-local) and RedisSessionStore (opt-in, shared by the nodes of
+// a Redis cluster, see NewRedisSessionStore).
 //
 // The broker calls the store with its own session lock held, so an implementation
 // must not call back into the broker. Save receives a state the broker no longer
 // references, and Load must return a state the caller may keep: a store must
 // never hand out a map it still writes to. The payload and property bytes of a
 // QueuedMessage are immutable, so sharing them is enough.
+//
+// The interface stays this small on purpose; the two behaviors a store that
+// several nodes share must have are optional interfaces, exactly like the
+// optional cluster interfaces:
+//
+//   - SharedSessionStore says that peers of a cluster read and write the same
+//     store, which changes how a connection that a peer displaced is torn down
+//     (see Broker.unregister);
+//   - sessionTaker (implement the exported Take method) makes "load and remove"
+//     atomic, which is what keeps two nodes from taking the same session at the
+//     same time. A store without it is taken with Load followed by Delete.
+//
+// NewRedisSessionStore is the shared implementation this package ships.
 type SessionStore interface {
 	// Load returns the state stored under key.
 	Load(key string) (SessionState, bool)
@@ -37,6 +51,38 @@ type SessionStore interface {
 	// impossible. A store that another process keeps writing while this broker runs
 	// is not re-read.
 	Keys() []string
+}
+
+// SharedSessionStore is the optional interface of a SessionStore that several
+// broker nodes read and write at the same time: the store is the single copy of a
+// session, not a node-local one. The Redis-backed store implements it.
+//
+// The broker uses it when a connection is displaced by a peer's kick. A kick means
+// the client id now belongs to another node, and with a shared store that node is
+// the owner of the stored session too: the displaced node must neither save its
+// own copy back (which would resurrect a session the other node is serving, and
+// let two nodes serve one session) nor delete the key (which would erase the state
+// the other node just saved when its client disconnected). With a node-local store
+// the old behavior stays: the state of a kicked persistent session is kept where
+// it is, because it is only ever reachable through this node.
+//
+// A store that reports itself shared should also implement Take: a shared store is
+// written by several processes, so the Load-then-Delete fallback can hand one
+// session to two nodes.
+type SharedSessionStore interface {
+	// SharedAcrossNodes reports that more than one broker node may read and write
+	// this store at the same time.
+	SharedAcrossNodes() bool
+}
+
+// sessionTaker is implemented by a SessionStore that can remove a stored session
+// atomically and hand it to one caller. A shared store needs it: Load followed by
+// Delete is two round trips, so two nodes reconnecting the same client id at the
+// same time could both see the session and both serve it. The method is exported
+// so an implementation outside this package can provide it; the interface is
+// unexported because only the broker decides when to take a session.
+type sessionTaker interface {
+	Take(key string) (SessionState, bool)
 }
 
 // SessionState is the state of one persistent session that has no live
@@ -80,7 +126,9 @@ type QueuedMessage struct {
 
 // MemorySessionStore is the default SessionStore: an in-process map guarded by a
 // RWMutex. Its lifetime is the broker's, so session state does not survive the
-// process — that is the behavior every deployment had before the seam existed.
+// process — that is the behavior every deployment had before the seam existed. It
+// is not a SharedSessionStore: one broker owns it, so its state is node-local and
+// a peer's kick leaves the stored session where it is.
 type MemorySessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]SessionState

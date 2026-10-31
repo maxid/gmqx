@@ -5,6 +5,58 @@
 
 ## [Unreleased]
 
+- **Kicks carry an epoch, and a Redis-backed store lets the nodes of a cluster share
+  persistent sessions.**
+
+  *Kick epochs.* `ClusterMessage` carries `ConnectTime` — the connect time of the
+  connection that produced a kick — on `ClusterKick` events. Every successful CONNECT
+  sets it, and `Broker.OnRemoteKick` applies a kick only to a connection that is
+  strictly older, so a delayed or reordered kick can no longer close a connection that
+  is newer than the one it was meant to replace. Equal epochs are broken
+  deterministically by node id (the connection on the greater node id wins), so both
+  ends of one client id reach the same decision instead of closing both. Refused kicks
+  are counted with the new `RecordDroppedMessage` reasons `cluster_kick_stale` (lost
+  the epoch comparison) and `cluster_kick_rate_limit` (the incumbent is still inside
+  the `Config.NotKickSeconds` anti-flap window), and logged at Debug; a kick that does
+  displace still sends DISCONNECT 0x8E and cancels a pending delayed will.
+
+  Behavior notes for existing deployments:
+
+  - `Config.NotKickSeconds` is now enforced on the receiving side as well: a peer's
+    kick that arrives while the connection it names is younger than the window is
+    refused instead of closing it. A cluster whose clients move between nodes faster
+    than the window (which is what the window is for) therefore keeps the old
+    connection until the window elapses; set `NotKickSeconds` to a negative value to
+    keep the previous, window-less cross-node behavior.
+  - A kick received without `ConnectTime` — from a peer built before this change — is
+    applied unconditionally, which is that peer's behavior, and counted with
+    `cluster_kick_legacy`. A mixed cluster degrades to the previous semantics rather
+    than refusing every kick, and the wire stays compatible in both directions
+    (the field is additive; an older peer ignores it).
+  - Cross-node ordering assumes NTP-synchronised clocks within the anti-flap window;
+    the epoch is a wall-clock reading because a monotonic reading is meaningless in
+    another process. Within one node nothing crosses clocks (`time.Since`).
+
+  *Shared sessions.* `NewRedisSessionStore` is the second `SessionStore` this package
+  ships: it keeps each stored session in the cluster's Redis under
+  `<prefix>:session:<namespaceKey(ns, clientID)>`, with the session's own deadline as
+  the key's TTL (no TTL for a session without one, and no write at all for a state
+  whose deadline already passed). `NewRedisClusterWithSessionStore(RedisClusterConfig)`
+  builds the Redis cluster backend and the store from one configuration. A value that
+  does not decode is removed and counted (`session_store_corrupt`); a failed Redis
+  command is counted as `session_store_error` and degrades to "no session".
+
+  The store satisfies the new optional `SharedSessionStore` interface and the optional
+  `Take` method the broker uses to hand a stored session out atomically, so two nodes
+  reconnecting the same client id cannot both resume it. A connection that a peer's
+  kick displaces now leaves a shared store alone (it neither saves its own copy back
+  nor deletes the key), so the node that took the session over owns it; with the
+  default in-memory store nothing changes. `MemorySessionStore` stays the default and
+  the store seam is otherwise unchanged (`Keys`, `Load`, `Save`, `Delete`), so existing
+  deployments behave exactly as before. As with the node-local store, the store moves
+  state but not routing: a publication on a node that does not have a stored session in
+  its routing index does not queue for it.
+
 - **A subscription index replaces the per-publish scan, and a publication can be
   directed at one client id (locally or across the cluster).**
 

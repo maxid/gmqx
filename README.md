@@ -68,8 +68,13 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   publish of one namespace never reaches a session of another; the default empty
   namespace keeps single-namespace deployments unchanged
 - Connect modes: `UNIQUE` / `KICK` (client id takeover, DISCONNECT 0x8E for the
-  displaced MQTT 5 client, `NotKickSeconds` anti-flap window, and a connect-time
-  kick that closes a duplicate connection on another node in both modes)
+  displaced MQTT 5 client, `NotKickSeconds` anti-flap window on both the CONNECT and
+  the peer side, and a connect-time kick that carries the connect time of the
+  connection that produced it, so a duplicate connection on another node is closed
+  while a delayed kick cannot close a newer one)
+- Shared persistent sessions across the nodes of a cluster: the opt-in
+  `RedisSessionStore` keeps subscriptions and the offline queue in the same Redis the
+  cluster backend uses, so a client that reconnects to another node resumes them
 - Capabilities the CONNACK advertises as unavailable are refused, not silently
   ignored: a `$share/...` filter gets SUBACK 0x9E (0x80 on MQTT 3.1.1) and a
   SUBSCRIBE carrying a Subscription Identifier gets DISCONNECT 0x9A
@@ -137,7 +142,7 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `TLS` | disabled | `Enabled`, `Cert`, `Key`, `CA`, `RequireClientCert` |
 | `MaxPacketSize` | 4 MiB | inbound packet limit |
 | `ConnectMode` | `UNIQUE` | reject or kick an existing client id |
-| `NotKickSeconds` | 30 | anti-flap window of a takeover in `KICK` mode (negative: no window) |
+| `NotKickSeconds` | 30 | anti-flap window of a takeover, enforced for a local CONNECT and for a peer's kick (negative: no window) |
 | `ConnectTimeout` | 10 s | CONNECT-phase read deadline; a socket that says nothing is closed |
 | `AuthTimeout` | 5 s | bound on `Authenticate` and `ACL.Check`; an expiry is a refusal (negative: no bound) |
 | `MaxWillDelayInterval` | 5 min | largest MQTT 5 Will Delay Interval honoured (negative: unbounded) |
@@ -155,7 +160,7 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `MaxOfflineQueueSize` | 1000 | messages queued per offline session; the oldest is dropped |
 | `MaxTotalOfflineMessages` | 100000 | messages queued for all offline sessions; new ones are rejected |
 | `SessionSweepInterval` | 30 s | how often expired sessions are deleted (negative: never) |
-| `SessionStore` | `MemorySessionStore` | persistence seam for offline session state |
+| `SessionStore` | `MemorySessionStore` | persistence seam for offline session state; `NewRedisSessionStore` shares it across the nodes of a Redis cluster |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
 | `Namespace` | `""` (default) | isolation scope for sessions, retained state and cluster traffic |
 | `Dispatcher` | `DefaultDispatcher` | routing SPI: local delivery plus cluster spread by default |
@@ -262,7 +267,8 @@ owns its session, so a publication reaches a session exactly once.
 `SessionStore` (`Load`, `Save`, `Delete`, `Keys`) exists so a deployment can move
 session state out of process. `New` installs `MemorySessionStore` when
 `Config.SessionStore` is nil, which is exactly the in-memory behavior of earlier
-versions; this package ships no network or disk backend. The broker calls the
+versions and stays the default; `NewRedisSessionStore` is the other implementation
+this package ships (see **Shared sessions** below). The broker calls the
 store with its own session lock held, so an implementation must not call back
 into the broker. Routing does not read the store at all: the broker indexes a
 session's subscriptions when it saves it and removes them when it takes it over or
@@ -270,6 +276,68 @@ expires it. `Keys` is still required — `New` uses it once to index sessions a
 deployment restored before the broker was created, and the expiry sweeper uses it
 to find the deadlines to enforce. A store written behind a running broker's back
 is not re-read.
+
+**Shared sessions.** By default a session lives on the node that holds it, so a
+client that reconnects to another node starts from nothing.
+`NewRedisSessionStore` moves that state into Redis, and
+`NewRedisClusterWithSessionStore(cfg)` builds the Redis cluster backend and the
+store from one `RedisClusterConfig`, so both use the same address, database and
+`ChannelPrefix`:
+
+```go
+redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(gmqx.RedisClusterConfig{
+    Addr: "redis:6379",
+})
+if err != nil {
+    return err
+}
+defer sessions.Close()
+broker, _ := gmqx.New(gmqx.Config{
+    NodeID:         "n1",
+    ClusterBackend: redisCluster,
+    SessionStore:   sessions,
+})
+```
+
+The store keeps one key per stored session under the cluster prefix:
+
+| Key | Contents | TTL |
+|---|---|---|
+| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON `{v, client, expires, subs, queue}`: the session's subscriptions with their options, its queued messages with payload, QoS, retain flag and property block, and its deadline | the session's own deadline |
+
+The key is the one the broker asks for — already namespace-qualified — so two
+namespaces sharing one Redis never collide, and the segment `session` shares
+nothing with the cluster's own `node`, `owner`, `member`, `subs` and `client`
+keys. The TTL is the session, not a cache lifetime: a session with a Session Expiry
+Interval expires from Redis at its deadline even if no sweeper runs, a session
+without one (MQTT 3.1.1) is written without a TTL, and a state whose deadline
+already passed is deleted instead of written. A value that does not decode is
+removed and counted (`RecordDroppedMessage("session_store_corrupt")`) so one
+broken record cannot fail a CONNECT, and a failed Redis command is counted as
+`"session_store_error"` and degrades to "no session" (at-most-once, like the
+cluster transport).
+
+Two rules keep one session from being served by two nodes:
+
+- Taking a session is atomic (`Take`, one Redis round trip that reads and deletes),
+  so two nodes reconnecting the same client id at the same time cannot both resume
+  it. The store also satisfies the optional `SharedSessionStore` interface, which
+  the broker uses when a peer's kick displaces a connection: the displaced node
+  neither saves its own copy back (which would resurrect a session the peer is
+  already serving) nor deletes the key (which would erase the state the peer saved).
+  With the default in-memory store the previous behavior is unchanged — the state of
+  a kicked session stays where it is, because only that node can reach it.
+- A clean CONNECT discards the shared session wherever it is received, and the
+  sweeper of each node only expires the keys of its own namespace.
+
+The store carries state, not routing: a publication is queued for a stored session
+by a node that has it in its routing index (the node that stored it, or one that
+started with it present). As with the node-local store, a publication another node
+receives does not queue for an offline session here unless the cluster routes it
+there (see the limitations below). `Save` replaces the whole record, and the
+broker's session lock only serialises the writers of one node, so two nodes
+queueing for the same stored session at the same instant can lose one of them —
+the queue of an offline session is effectively owned by the node that stored it.
 
 **Expiry.** MQTT 5's Session Expiry Interval is a deadline:
 `ConnectInfo.SessionExpiry` is stamped on disconnect as `now + interval`, and a
@@ -343,7 +411,8 @@ previous connection; an inbound QoS 2 exchange is dropped when the connection
 closes (as in the reference); the queue is local to the node that received the
 publication, and the subscription summary a cluster peer advertises covers live
 sessions only, so a publication on another node does not queue for an offline
-session here.
+session here (a shared session store moves the state between nodes, not this
+routing).
 
 ## Takeover, delayed wills and retained expiry
 
@@ -368,13 +437,48 @@ MQTT itself prescribes.
 **Takeover across nodes.** Every successful CONNECT spreads a kick to the
 cluster, in both connect modes: a client that reconnects to another node
 otherwise leaves a connection behind that duplicates every delivery until its
-keep-alive expires. The receiving node displaces its copy exactly as a local
-takeover does (DISCONNECT 0x8E on MQTT 5) and cancels a delayed will it was
-holding for that client id. The event names a client id, not a topic, so it goes
-to every peer, and the usual namespace and `(Origin, Seq)` deduplication rules
-apply. `NotKickSeconds` is enforced on the node that receives the CONNECT only:
-the peer side cannot know how old this node's connection is, which would need a
-cluster presence view (see [ROADMAP.md](ROADMAP.md)).
+keep-alive expires. A kick that displaces a connection closes it exactly as a
+local takeover does (DISCONNECT 0x8E on MQTT 5) and cancels a delayed will the
+receiving node was holding for that client id. The event names a client id, not a
+topic, so it goes to every peer, and the usual namespace and `(Origin, Seq)`
+deduplication rules apply.
+
+*Kick epochs.* A kick also carries the node that produced it and the connect time
+of the connection that produced it (`ClusterMessage.ConnectTime`, Unix nanoseconds
+from that node's wall clock), and the receiving node applies it only to a
+connection that is strictly older:
+
+| Incumbent on this node | Kick | Result |
+|---|---|---|
+| older than the kick's epoch | newer | applied (displaced) |
+| newer than the kick's epoch | older | refused, `RecordDroppedMessage("cluster_kick_stale")` |
+| same instant, this node id greater | equal | refused (this connection wins) |
+| same instant, this node id smaller | equal | applied (the peer's connection wins) |
+| no epoch (`ConnectTime` 0) | legacy | applied, `RecordDroppedMessage("cluster_kick_legacy")` |
+
+A delayed or reordered kick therefore cannot close a connection that is newer than
+the one it was meant to replace, and two nodes that accepted the same client id at
+the same instant make the same decision instead of closing both. Refused kicks are
+counted and logged at Debug (never silently ignored).
+`Config.NotKickSeconds` applies on this side too: a kick that arrives while the
+connection it names is still younger than the window is refused
+(`RecordDroppedMessage("cluster_kick_rate_limit")`), so two nodes cannot take a
+client id away from each other faster than the window allows.
+
+*Clock assumption.* The epoch is a wall-clock reading, because a monotonic reading
+means nothing in another process. Cross-node ordering assumes the clocks of a
+cluster are NTP-synchronised to within `NotKickSeconds`; skew larger than that
+cannot revive a displaced connection (the window refusal bounds it), it can only
+make a peer apply or refuse a kick it would have decided differently. Inside one
+node nothing crosses clocks: the local window compares the connection's monotonic
+start time with `time.Since`.
+
+*Rolling upgrade.* A kick without an epoch comes from a peer built before kick
+epochs. It is applied unconditionally — the behavior of that peer's build — and
+counted as `"cluster_kick_legacy"`, so a mixed cluster degrades to the previous
+semantics instead of refusing every kick. A new node's kick reaching an old peer is
+just a kick with an extra JSON field the old build ignores, so the wire stays
+compatible in both directions.
 
 **Will Delay Interval.** MQTT 5 lets the WILL of a connection ask for a delay. The
 will is published when the earlier of two things happens: the delay elapses, or
@@ -571,6 +675,22 @@ redisCluster := gmqx.NewRedisCluster(gmqx.RedisClusterConfig{
 broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 ```
 
+The same Redis can also hold the sessions of the cluster, so a client that
+reconnects to another node resumes its subscriptions and its queue instead of
+starting from nothing. That is opt-in and built from the same configuration:
+
+```go
+redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(cfg) // cfg: RedisClusterConfig
+if err != nil {
+    return err
+}
+defer sessions.Close()
+broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, SessionStore: sessions})
+```
+
+See **Shared sessions** in the persistent-session section for the key layout, the
+TTL rule and what a takeover does to a shared session.
+
 ### Keys and channels
 
 Every key and channel sits under one prefix (`ChannelPrefix`, default
@@ -583,6 +703,7 @@ Every key and channel sits under one prefix (`ChannelPrefix`, default
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`: liveness and identity | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`: subscription summary | `SummaryTTL` |
 | `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`: which node holds the client id | `PresenceTTL` |
+| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON session record, written by `RedisSessionStore` when it is configured (see [Shared sessions](#persistent-sessions-the-offline-queue-and-qos-12-retransmission)) | the session's deadline |
 
 A node subscribes to its own channel and to nothing else. A publish is one
 `PUBLISH` per interested node, so N nodes cost O(N) Redis operations rather than

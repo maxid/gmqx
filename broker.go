@@ -632,7 +632,7 @@ func (b *Broker) register(c *client) error {
 	// event names a client id, not a topic, and the built-in backends stamp it
 	// with this node's identity, namespace and sequence number, so their
 	// deduplication and namespace rules apply unchanged (see spreadKick).
-	b.spreadKick(c.context(), c.id)
+	b.spreadKick(c.context(), c.id, c.connectedAt)
 	// A backend that tracks client-id presence is told about the connection, so a
 	// directed publish for this id can address this node instead of every node.
 	// The call only enqueues the presence write: no store or network call runs on
@@ -656,16 +656,30 @@ func (b *Broker) register(c *client) error {
 // loop. The caller holds b.mu, which is what orders the write of connectedAt in
 // register with this read.
 func (b *Broker) takeoverAllowed(old *client) bool {
+	return !b.insideNotKickWindow(old.connectedAt)
+}
+
+// insideNotKickWindow reports whether a connection that began at startedAt is
+// still inside the Config.NotKickSeconds anti-flap window, so nothing may
+// displace it. It is the single definition of the window: a CONNECT applies it to
+// the connection it would take over (takeoverAllowed) and a peer's kick applies it
+// to the connection it would close (OnRemoteKick), so the two ends of one client
+// id are protected by the same rule no matter which node they reach.
+//
+// The comparison is local to this process — both times come from this node's
+// clock, and time.Since uses the monotonic reading when there is one — so it is
+// unaffected by clock skew. A negative window is the documented "disabled".
+func (b *Broker) insideNotKickWindow(startedAt time.Time) bool {
 	window := b.cfg.NotKickSeconds
 	if window < 0 {
 		// The window is disabled: every CONNECT takes the session over, which is
 		// what MQTT prescribes and what this broker did before the window existed.
-		return true
+		return false
 	}
 	if window == 0 {
 		window = defaultNotKickSeconds
 	}
-	return time.Since(old.connectedAt) > time.Duration(window)*b.second()
+	return time.Since(startedAt) <= time.Duration(window)*b.second()
 }
 
 func (b *Broker) unregister(c *client) {
@@ -684,7 +698,17 @@ func (b *Broker) unregister(c *client) {
 	superseded := c.superseded
 	kicked := c.kicked
 	persistent := c.persistentSession()
-	if !superseded {
+	// movedAway reports that the session of this connection is not this node's any
+	// more: a local take-over installed a replacement here, or a peer's kick moved
+	// the client id away. With a store the nodes share, the node that holds the
+	// client id owns the stored session too, so this node must neither write its
+	// copy back (that would resurrect a session the peer is already serving, and
+	// let two nodes serve one session) nor delete the key (that would erase the
+	// state the peer saved when its own connection went away). With a node-local
+	// store the pre-existing behavior stays: the stored state of a kicked session
+	// is kept here, because only this node can ever reach it.
+	movedAway := superseded || (kicked && b.sharedStore())
+	if !movedAway {
 		if persistent {
 			b.saveStoredSession(key, c)
 		} else {
@@ -692,7 +716,7 @@ func (b *Broker) unregister(c *client) {
 		}
 	}
 	c.mu.Unlock()
-	if superseded {
+	if movedAway {
 		// A displaced connection whose replacement is not on this node (a peer's
 		// connect-time kick moved the session away) must not leave a live routing
 		// entry behind: nothing here can deliver to it any more. A local take-over
@@ -715,10 +739,11 @@ func (b *Broker) unregister(c *client) {
 	//     routed to this node and queued;
 	//   - a session that ended (a clean connection) or moved to another node (the
 	//     kick that displaced it) is forgotten, so this node stops refreshing a
-	//     record that would otherwise fight the new owner's. The stored state of a
-	//     kicked persistent session stays behind — a queue is node-local, exactly
-	//     as it is for a normal publish — but the client id itself belongs to the
-	//     node the client is connected to now.
+	//     record that would otherwise fight the new owner's. With a node-local store
+	//     the stored state of a kicked persistent session stays behind — a queue is
+	//     node-local, exactly as it is for a normal publish — while a shared store
+	//     leaves the session to the node that now holds the client id. Either way the
+	//     client id itself belongs to the node the client is connected to now.
 	if !persistent || superseded || kicked {
 		b.mu.RLock()
 		_, connected := b.clients[key]
@@ -1319,11 +1344,23 @@ func (b *Broker) spreadTarget(ctx context.Context, clientID string, pub Publicat
 // backends stamp Origin and Seq on locally produced events and drop an event
 // whose origin is the receiving node, so a re-broadcast topology cannot loop and
 // a redelivered kick is applied once.
-func (b *Broker) spreadKick(ctx context.Context, clientID string) {
+//
+// connectTime is the epoch of the event: the moment this node registered the
+// connection that made the client id its own. It travels as
+// ClusterMessage.ConnectTime so the receiving node can order the kick against the
+// connection it holds, instead of closing one that is newer than the one the
+// CONNECT actually took over (see OnRemoteKick).
+func (b *Broker) spreadKick(ctx context.Context, clientID string, connectTime time.Time) {
 	if b.cfg.ClusterBackend == nil || clientID == "" {
 		return
 	}
-	msg := ClusterMessage{Type: ClusterKick, NodeID: b.nodeID, Namespace: b.namespace, ClientID: clientID}
+	msg := ClusterMessage{
+		Type:        ClusterKick,
+		NodeID:      b.nodeID,
+		Namespace:   b.namespace,
+		ClientID:    clientID,
+		ConnectTime: connectTime.UnixNano(),
+	}
 	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
 		b.log.Warn("gmqx cluster kick spread failed", "err", err)
 	}
@@ -1388,12 +1425,34 @@ func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 
 // OnRemoteKick implements ClusterHandler. A peer node reports that a client id it
 // accepted is connected elsewhere (every successful CONNECT spreads one, see
-// spreadKick), so a connection this node holds for that id is a zombie and is
-// displaced: an MQTT 5 client gets DISCONNECT 0x8E (Session taken over) and the
+// spreadKick), so a connection this node holds for that id is usually a zombie and
+// is displaced: an MQTT 5 client gets DISCONNECT 0x8E (Session taken over) and the
 // socket, then the will is not published (the session moved, it did not die).
-// Config.NotKickSeconds is not applied here: this node cannot know whether the
-// peer's connection is older than the window, and a kick that is refused would
-// reintroduce the zombie this event exists to remove.
+//
+// A kick is applied only when it is newer than the connection it would close, so a
+// delayed or reordered kick cannot displace a connection that is younger than the
+// one the peer's CONNECT actually replaced:
+//
+//   - ClusterMessage.ConnectTime is the origin connection's registration time, and
+//     the incumbent here is closed only when that epoch is strictly greater than
+//     this node's own connectedAt for the client id;
+//   - equal epochs are broken deterministically by node id — the connection on the
+//     lexicographically greater node id wins — so two nodes that accepted the same
+//     id at the same instant reach the same decision instead of kicking each other
+//     in a loop;
+//   - the Config.NotKickSeconds anti-flap window applies here exactly as it does to
+//     a local CONNECT (see insideNotKickWindow): a kick that arrives while the
+//     incumbent is still inside its window is refused, so a peer can never close a
+//     younger connection;
+//   - a kick that carries no epoch comes from a peer built before kick epochs. It
+//     is applied unconditionally, which is the behaviour of that peer's build, and
+//     counted as "cluster_kick_legacy": a mixed cluster degrades to the previous
+//     semantics instead of refusing every kick.
+//
+// A refused kick is counted ("cluster_kick_stale" for a lost epoch comparison,
+// "cluster_kick_rate_limit" for the anti-flap window) and logged at Debug; it
+// never displaces, never cancels a pending will and never touches presence, because
+// the connection it names is not the one the peer replaced.
 //
 // A kick for another namespace is dropped: a client id is only unique inside its
 // namespace, so applying it would close an unrelated session that happens to
@@ -1405,13 +1464,36 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 		return
 	}
 	key := namespaceKey(b.namespace, msg.ClientID)
+	// The incumbent's registration time is written under b.mu (register), so it is
+	// read under the same lock here.
+	b.mu.RLock()
+	c := b.clients[key]
+	var incumbent time.Time
+	if c != nil {
+		incumbent = c.connectedAt
+	}
+	b.mu.RUnlock()
+
+	verdict := b.kickVerdict(msg, c != nil, incumbent)
+	if verdict != kickApply && verdict != kickLegacy {
+		b.metrics.RecordDroppedMessage(verdict.dropReason())
+		b.log.Debug("gmqx remote kick refused",
+			"reason", verdict.dropReason(), "client", msg.ClientID, "origin", kickOrigin(msg),
+			"kick_time", msg.ConnectTime, "incumbent_time", incumbent.UnixNano())
+		return
+	}
+	if verdict == kickLegacy {
+		// Applied, not dropped: the counter exists so an operator can see a cluster
+		// that still holds a peer from before kick epochs, whose kicks cannot be
+		// ordered.
+		b.metrics.RecordDroppedMessage(verdict.dropReason())
+		b.log.Debug("gmqx remote kick applied without an epoch", "client", msg.ClientID, "origin", kickOrigin(msg))
+	}
+
 	// The peer accepted this client id, so its session is alive: a will this node
 	// was still holding for it (from the connection a previous take-over ended)
 	// belongs to a session that has come back.
 	b.cancelPendingWill(key)
-	b.mu.RLock()
-	c := b.clients[key]
-	b.mu.RUnlock()
 	if c != nil {
 		// The displaced connection's teardown drops the routing entry and the
 		// presence claim of this node (see unregister).
@@ -1424,6 +1506,94 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 	// that would fight the new owner's, or a directed publish would keep being
 	// routed to a node whose session has no connection.
 	b.forgetClientPresence(msg.ClientID)
+}
+
+// kickVerdict is what a peer kick may do to the connection this node holds for a
+// client id.
+type kickVerdict int
+
+const (
+	// kickApply displaces the incumbent: the kick is newer than it, or there is no
+	// incumbent to compare with.
+	kickApply kickVerdict = iota
+	// kickLegacy displaces the incumbent without an ordering check, because the
+	// peer that sent the kick predates kick epochs.
+	kickLegacy
+	// kickStale refuses the kick: the incumbent is not older than the connection
+	// that produced it.
+	kickStale
+	// kickRateLimited refuses the kick: the incumbent is still inside its
+	// Config.NotKickSeconds anti-flap window.
+	kickRateLimited
+)
+
+// dropReason is the Metrics.RecordDroppedMessage reason a verdict is counted
+// under. A refused kick is a drop; a legacy kick is counted as well, although it
+// is applied.
+func (v kickVerdict) dropReason() string {
+	switch v {
+	case kickLegacy:
+		return "cluster_kick_legacy"
+	case kickStale:
+		return "cluster_kick_stale"
+	case kickRateLimited:
+		return "cluster_kick_rate_limit"
+	}
+	return ""
+}
+
+// kickVerdict decides what a peer kick may do to the connection this node holds
+// for a client id. See OnRemoteKick for the rules; they exist so that a kick is
+// only ever applied to a connection that is older than the connection that
+// produced it.
+//
+// The order of the checks is deliberate. A kick without an epoch comes first and
+// is applied unconditionally: its sender predates epochs, applies every kick it
+// receives, and refusing it would leave the zombie the event exists to remove
+// while the peer never learns why. Both refusals therefore only exist between two
+// nodes that can compare epochs.
+func (b *Broker) kickVerdict(msg ClusterMessage, hasIncumbent bool, incumbent time.Time) kickVerdict {
+	if !hasIncumbent {
+		// Nothing to close; the event still carries the presence signal the caller
+		// acts on.
+		return kickApply
+	}
+	if msg.ConnectTime == 0 {
+		return kickLegacy
+	}
+	if b.insideNotKickWindow(incumbent) {
+		// The peer accepted the id, but the connection here is younger than the
+		// anti-flap window, so it cannot be the connection the peer replaced. This
+		// is the receive-side half of Config.NotKickSeconds: two nodes cannot take
+		// a client id away from each other faster than the window allows.
+		return kickRateLimited
+	}
+	kickAt := time.Unix(0, msg.ConnectTime)
+	switch {
+	case kickAt.After(incumbent):
+		// Newer than the connection this node holds: the peer replaced it.
+		return kickApply
+	case kickAt.Before(incumbent):
+		// Older than the connection this node holds, so this node's connection is
+		// the one that replaced the peer's: the kick is a leftover.
+		return kickStale
+	}
+	// The same instant: break the tie by node id, the same way on both nodes, so
+	// the two ends of one client id agree on which connection survives instead of
+	// both closing or both keeping. The connection on the greater node id wins.
+	if kickOrigin(msg) > b.nodeID {
+		return kickApply
+	}
+	return kickStale
+}
+
+// kickOrigin names the node that produced a kick: a backend stamps Origin, and a
+// backend that only stamps NodeID still identifies the sender.
+func kickOrigin(msg ClusterMessage) string {
+	if msg.Origin != "" {
+		return msg.Origin
+	}
+	return msg.NodeID
 }
 
 // OnRemoteTarget implements targetHandler: a peer node handed this node a
