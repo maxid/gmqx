@@ -31,6 +31,14 @@ const topicAliasMaximum uint16 = 16
 // implemented (shared subscription routing lives in shared.go, subscription
 // identifiers in subscription_id.go), so all four are advertised as available.
 //
+// Maximum Packet Size and Receive Maximum are the broker's own inbound limits,
+// advertised so a client can size its packets and its QoS 1/2 pipeline: the first
+// is Config.MaxPacketSize (the codec enforces it on every inbound packet, see
+// client.readMessage), the second is Broker.receiveMaximum, the number of
+// unacknowledged inbound QoS 1/2 exchanges the broker really allows (see
+// client.handlePublish). Advertising either as a larger number than the broker
+// enforces would invite a client into a window it cannot use.
+//
 // authMethod is the enhanced authentication method the connection negotiated and
 // authData the final data of its exchange; both are empty for a connection that
 // authenticated any other way. MQTT 5 §3.2.2.3.8 makes the Authentication Method
@@ -38,7 +46,7 @@ const topicAliasMaximum uint16 = 16
 // method, and it must be that method, so this function never advertises a method
 // the client did not use. Authentication Data without a method is a Protocol
 // Error, which is why it is written only together with one.
-func connackProperties(assignedClientID string, maxPacketSize uint32, authMethod string, authData []byte) mqtt.Properties {
+func connackProperties(assignedClientID string, maxPacketSize uint32, receiveMaximum uint16, authMethod string, authData []byte) mqtt.Properties {
 	yes := true
 	props := mqtt.Properties{
 		RetainAvailable:                 &yes,
@@ -46,6 +54,7 @@ func connackProperties(assignedClientID string, maxPacketSize uint32, authMethod
 		SubscriptionIdentifierAvailable: &yes,
 		SharedSubscriptionAvailable:     &yes,
 		MaximumPacketSize:               maxPacketSize,
+		ReceiveMaximum:                  receiveMaximum,
 		TopicAliasMaximum:               topicAliasMaximum,
 		AssignedClientID:                assignedClientID,
 	}

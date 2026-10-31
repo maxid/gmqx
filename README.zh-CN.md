@@ -24,7 +24,23 @@
 - QoS 0/1/2 流程（按订阅 QoS 降级）、broker 侧出站 QoS 1/2 重传（PUBLISH 重传带 DUP、
   PUBREL 重传到 PUBCOMP、每连接一个定时器、有上限的指数退避）以及由每连接有界队列支撑的
   inflight 窗口：窗口满时按 FIFO 排队、腾出位置后再投递，既不阻塞也不丢弃。入站 QoS 2
-  握手抑制重复，并受 `MaxInflightQoS2` 约束（PUBREC 0x97）。
+  握手抑制重复，并受 broker 自身 receive maximum 约束（`ReceiveMaximum`，再被
+  `MaxInflightQoS2` 压低；PUBREC 0x97）。
+- MQTT 5 Receive Maximum 双向生效：客户端 CONNECT 里的值限制 broker 的出站窗口（每个 QoS
+  的有效窗口取 `MaxInflightQoS1/2` 与客户端值的较小者，两个 QoS 共用该窗口），broker 则在
+  CONNACK 中通告并对自己收到的 publish 执行自己的 receive maximum（超限的 QoS 1
+  publish 不投递也不确认，QoS 2 的直接以 PUBREC 0x97 拒绝）。
+- MQTT 5 客户端 Maximum Packet Size：broker 写出的每个包都按它计量，放不下的包——PUBLISH、
+  保留消息回放或控制包——被丢弃并计数（`max_packet_size_too_large`），绝不拆分、截断或超限发送。
+- 跨重连的 QoS 2 状态：发布方尚未用 PUBREL 释放的入站 packet id、以及 broker 尚未确认的
+  出站交换都属于持久会话状态（`SessionState.InboundQoS2` / `SessionState.Inflight`），
+  恢复的连接因此不会重复投递重传消息，并会用原 packet id 重发尚未完成的包
+  （PUBLISH 带 DUP，已确认的 QoS 2 发 PUBREL）。
+- 字节速率整形：每连接与全 broker 的读/写上限（`MaxReadByteRate`、`MaxWriteByteRate`、
+  `MaxTotalReadByteRate`、`MaxTotalWriteByteRate`），超出部分按“延迟”处理而不是丢弃，
+  被节流的字节数通过 `ByteRateMetrics` 统计
+- 监听端口回退：端口被占用时 `Start` 会继续尝试后续 `PortFallback` 个端口（默认 16）
+  而不是直接失败；每次尝试都是真实 bind，`Addrs()` 报告真正绑定的地址
 - 每连接一个写协程，配上有界出站队列与每包写超时（`MaxOutboundQueueSize`、`WriteTimeout`），
   因此停止读取的对端无法拖住发布方、遗嘱发布或集群接收协程。
 - 保留消息（含 MQTT 5 Message Expiry Interval：回放时携带剩余间隔，已过期的不再回放并删除）、
@@ -137,9 +153,13 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `MaxTopicSubscriptions` | 0 | 每会话订阅数限制 |
 | `MaxRetainMessages` | 0 | 保留消息数量限制 |
 | `ConnectionRateLimit` | 0 | 连接数/秒的令牌桶 |
-| `MaxInflightQoS1` | 64 | 每连接未确认的 QoS 1 PUBLISH 数（负值：不限） |
-| `MaxInflightQoS2` | 64 | 每连接每个方向的 QoS 2 交换数（负值：不限） |
+| `MaxInflightQoS1` | 64 | 每连接未确认的 QoS 1 PUBLISH 数，受客户端 Receive Maximum 限制（负值：不限） |
+| `MaxInflightQoS2` | 64 | 每连接每个方向的 QoS 2 交换数，受客户端 Receive Maximum 限制；入站方向同时压低 `ReceiveMaximum`（负值：不限） |
 | `MaxInflightQueueSize` | 256 | 每连接等待空闲 inflight 位置的 QoS 1/2 投递数 |
+| `ReceiveMaximum` | 64 | broker 自身的入站 receive maximum，在 CONNACK 通告并对入站 QoS 1/2 publish 执行（负值：不限，按协议默认 65535 通告） |
+| `MaxReadByteRate` / `MaxWriteByteRate` | 8 MiB/s / 16 MiB/s | 每连接每秒可读/可写的字节数（负值：不限） |
+| `MaxTotalReadByteRate` / `MaxTotalWriteByteRate` | 各 256 MiB/s | 所有连接合计的同一上限（负值：不限） |
+| `PortFallback` | 16 | 端口被占用时可继续尝试的端口数，超过后 `Start` 失败（负值：不回退） |
 | `MaxOutboundQueueSize` | 256 | 每连接写协程的出站队列长度（包数） |
 | `WriteTimeout` | 5 s | 单个数据包的写超时；超时即关闭卡住的连接 |
 | `QoSRetryInterval` | 5 s | 重传基准间隔，每次尝试翻倍 |
@@ -162,8 +182,8 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 取默认值，因为这四项正是防止单个慢速或沉默客户端占掉无界内存、卡住协程、或长期占用一个
 永远不完成 CONNECT 的连接槽的护栏。
 
-其余 MQTT 5 属性/语义（receive maximum、数据包上限）、跨重连的 QoS 2 状态与客户端库
-都在路线图中（见 [ROADMAP.md](ROADMAP.md)）。
+客户端库、与 mosquitto/paho 的互操作测试、基准与压测、v1.0 API 稳定化仍在路线图中
+（见 [ROADMAP.md](ROADMAP.md)）。
 
 ## Dispatcher、连接 context 与命名空间
 
@@ -470,6 +490,17 @@ DUP 标志与原始 packet id（参考实现从不设置 DUP——不复制该�
 PUBLISH → PUBREC → PUBREL → PUBCOMP，PUBREL 会重传直到收到 PUBCOMP。
 `MaxInflightQoS1` 限制连接的未确认 QoS 1 PUBLISH 数；`MaxInflightQoS2` 限制其每个方向的
 QoS 2 交换数（入站 QoS 2 PUBLISH 超出窗口时在 MQTT 5 上回复 PUBREC 0x97 Quota exceeded）。
+客户端在 CONNECT 中发送的 MQTT 5 Receive Maximum 会进一步压低出站窗口：每个 QoS 的有效窗口
+取配置值与客户端值的较小者，两个 QoS 共用该窗口，已收到 PUBREC 的 PUBLISH 不再占用它；
+broker 也在 CONNACK 中通告自己的 receive maximum 并对入站 publish 执行：超限的 QoS 1 既不
+投递也不确认（客户端稍后重传），QoS 2 则在交换开始前直接以 PUBREC 0x97 拒绝。
+
+**恢复。** 持久会话恢复时，上一次连接未完成的交换会用原始 packet id 重发——PUBACK/PUBREC
+缺失的 PUBLISH 带 DUP，已收到 PUBREC 的则重发 PUBREL——并排在离线队列之前，这正是 MQTT
+§4.4 的要求。该状态保存在 `SessionState.Inflight` 中，因此存储跨进程保留时它也随之保留
+（Redis 存储会完整往返）。入站方向上，客户端以 QoS 2 发布但尚未用 PUBREL 释放的 packet id
+同样被保存（`SessionState.InboundQoS2`）：重传的 PUBLISH 得到同样的 PUBREC，不会被二次投递。
+会话结束（Clean Start 或过期）时两半状态一并丢弃。
 
 **inflight 队列。** 会超出窗口的 QoS 1/2 投递按到达顺序进入该连接的 inflight 队列，并在
 更早消息的确认腾出位置后发送：慢速订阅者只花内存，不丢消息，发布方也不会被阻塞。队列有界
@@ -477,6 +508,16 @@ QoS 2 交换数（入站 QoS 2 PUBLISH 超出窗口时在 MQTT 5 上回复 PUBRE
 （`RecordDroppedMessage("inflight_overflow")`、`RecordOverflow("inflight")`）并以 Warn
 级别带 client id 记录日志——发布方收到的 PUBACK 已经代表 sink 接受了这条消息，丢失必须
 可见。队列属于连接，随连接结束，不会像离线队列那样写入会话。
+
+**字节速率整形。** `MaxReadByteRate`/`MaxWriteByteRate` 限制单个连接每秒可读/可写的字节数，
+`MaxTotalReadByteRate`/`MaxTotalWriteByteRate` 限制整个 broker，二者都是令牌桶，突发额度为
+一秒的流量（至少 16 KiB）。超出部分的处理策略是延迟：读在字节到达后等待、写在字节发出前
+等待，对端因此被 TCP 背压放慢，不丢包、不截断、不乱序——MQTT 流出现空洞即为损坏，而因
+“说太快”直接断连会丢掉会话与 inflight 窗口。真正约束无视背压的对端的是它随后错过的时限
+（写的 `WriteTimeout`、读的 keepalive 时限）。被节流的字节通过可选的 `ByteRateMetrics`
+（`RecordThrottledBytes("read"|"write", n)`）上报，等待本身计为
+`RecordOverflow("byte_rate_read"|"byte_rate_write")`。默认值（每连接读 8 MiB/s、写
+16 MiB/s，全局各 256 MiB/s）保证正常流量完全不受整形影响。
 
 **写协程。** 每个连接的所有数据包都由同一写协程按入队顺序发出：PUBLISH、PUBACK/PUBREC/
 PUBREL/PUBCOMP、SUBACK、PINGRESP。其队列有界（`MaxOutboundQueueSize`，默认 256 个包），
@@ -488,11 +529,10 @@ PUBREL/PUBCOMP、SUBACK、PINGRESP。其队列有界（`MaxOutboundQueueSize`，
 有界，因此单个连接最多占用 `MaxOutboundQueueSize` 个、每个不超过 `MaxPacketSize` 字节的
 数据包。两个协程与重传定时器都随连接结束，并由 `close` 等待；会话清扫器由 `Stop` 等待。
 
-有意保留的限制（上文均给出原因）：inflight 交换及其队列属于连接，因此重连会恢复离线队列
-但不会恢复上一次连接中未确认或已排队的投递；入站 QoS 2 交换在连接关闭时丢弃（与参考
-实现一致）；队列位于收到该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，
-因此其他节点上的 publish 不会在此处为离线会话排队（共享会话存储搬运的是状态，而不是这条
-路由）。
+有意保留的限制（上文均给出原因）：窗口之后的 inflight 队列属于连接，因此重连会重发已经
+写出的交换（来自已存储的会话），但不会重发只排进队列、从未发出的投递；离线队列位于收到
+该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，因此其他节点上的 publish 不会
+在此处为离线会话排队（共享会话存储搬运的是状态，而不是这条路由）。
 
 ## 接管、延迟 will 与保留消息过期
 
@@ -584,6 +624,11 @@ TCP/TLS/WebSocket/WSS 监听器由
 模式）。MQTT 线格式位于 `gnety/codec/mqtt`：每个数据包都用其类型化的 `Decoder`
 读取、用 `mqtt.Encode` 写出，因此 gmqx 拥有 broker
 状态机，而不拥有任何自己的数据包布局。
+
+监听端口已被占用时，`Start` 不会直接失败：它会继续尝试后续 `PortFallback` 个端口
+（默认 16，负值关闭），并保持配置的传输方式不变。每次尝试都是真实 bind——bind 本身就是
+探测，因此不存在先检查再绑定的竞态；最终地址会记录日志并由 `Addrs()` 报告，临时端口
+（`:0`）不会回退。
 
 ## 集群后端
 

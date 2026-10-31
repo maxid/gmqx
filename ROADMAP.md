@@ -21,8 +21,11 @@
 - [x] Takeover parity across nodes (connect-time kick in both connect modes, DISCONNECT 0x8E) and the `NotKickSeconds` anti-flap window
 - [x] Kick epochs: a kick names the node and the connect time of the connection that produced it, so a delayed kick cannot close a newer connection, and the anti-flap window applies on the receiving side too
 - [x] Redis-backed shared session store (`NewRedisSessionStore`, atomic take, per-key TTL from the session expiry, namespace-scoped keys) so a client that reconnects to another node resumes its session
-- [ ] Remaining MQTT 5 properties/semantics (receive maximum, packet limits)
-- [ ] QoS 2 state across a reconnect
+- [x] MQTT 5 Receive Maximum in both directions: the client's CONNECT value caps the outbound windows (shared by QoS 1 and QoS 2, queue instead of drop), and the broker's own receive maximum (default 64, advertised) is enforced on inbound publishes (QoS 1 left unacknowledged, QoS 2 refused with PUBREC 0x97)
+- [x] MQTT 5 client Maximum Packet Size: every packet is measured before it is written, and one that does not fit (PUBLISH, retained replay, control packet) is dropped with `max_packet_size_too_large` instead of being split or truncated
+- [x] QoS 2 state across a reconnect: inbound packet ids pending PUBREL and unconfirmed outbound exchanges are stored with the session (`SessionState.InboundQoS2`/`SessionState.Inflight`), resumed per §4.4, and dropped when the session ends
+- [x] Byte-rate shaping: per-connection and broker-wide read/write token buckets that delay the excess (bounded by the write/keep-alive deadlines), count throttled bytes, and leave normal traffic untouched at their defaults
+- [x] Listener port fallback (`PortFallback`, default 16) for TCP/TLS/WS/WSS: the bind is the probe, `Addrs()` reports the port that was really bound
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)
 - [x] Built-in TCP cluster backend (static seeds, cross-node publish/kick, reconnect)
 - [x] Cluster membership (handshake, heartbeats, eviction, duplicate collapse), event dedup, subscription-aware directed routing

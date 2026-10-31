@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/maxid/gnety"
@@ -46,6 +49,14 @@ type Broker struct {
 	// land on the same node. The table is bounded by maxSharedRotationEntries.
 	sharedMu       sync.Mutex
 	sharedRotation map[string]uint64
+
+	// readBytes and writeBytes are the broker-wide byte-rate buckets: every byte
+	// this process reads from a client connection or writes to one is charged to
+	// them, which is what makes MaxTotalReadByteRate/MaxTotalWriteByteRate a limit
+	// on the whole broker instead of on one connection. A disabled limit is a nil
+	// bucket (see byte_rate.go).
+	readBytes  *byteLimiter
+	writeBytes *byteLimiter
 
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
@@ -114,7 +125,15 @@ const (
 	defaultAuthTimeout             = 5 * time.Second
 	defaultMaxWillDelayInterval    = 5 * time.Minute
 	defaultNotKickSeconds          = 30
+	defaultReceiveMaximum          = 64
+	// defaultPortFallback is how many ports above the configured one a listener
+	// may try before Start fails.
+	defaultPortFallback = 16
 )
+
+// maxReceiveMaximum is the protocol default and the highest value the MQTT 5
+// Receive Maximum property can carry: an absent property means this window.
+const maxReceiveMaximum = 65535
 
 // New creates a Broker. Start must be called to listen.
 func New(cfg Config) (*Broker, error) {
@@ -191,6 +210,21 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.MaxInflightQueueSize <= 0 {
 		cfg.MaxInflightQueueSize = defaultMaxInflightQueueSize
 	}
+	if cfg.ReceiveMaximum == 0 {
+		cfg.ReceiveMaximum = defaultReceiveMaximum
+	}
+	if cfg.MaxReadByteRate == 0 {
+		cfg.MaxReadByteRate = defaultMaxReadByteRate
+	}
+	if cfg.MaxWriteByteRate == 0 {
+		cfg.MaxWriteByteRate = defaultMaxWriteByteRate
+	}
+	if cfg.MaxTotalReadByteRate == 0 {
+		cfg.MaxTotalReadByteRate = defaultMaxTotalReadByteRate
+	}
+	if cfg.MaxTotalWriteByteRate == 0 {
+		cfg.MaxTotalWriteByteRate = defaultMaxTotalWriteByteRate
+	}
 	if cfg.MaxOutboundQueueSize <= 0 {
 		cfg.MaxOutboundQueueSize = defaultMaxOutboundQueueSize
 	}
@@ -243,6 +277,11 @@ func New(cfg Config) (*Broker, error) {
 		done:      make(chan struct{}),
 		nodeID:    cfg.NodeID,
 	}
+	// The broker-wide half of the byte-rate shaping: one bucket each for every
+	// byte read from and written to every connection of this process. A disabled
+	// limit (negative) is a nil bucket, which the shaper skips.
+	b.readBytes = newByteLimiter(cfg.MaxTotalReadByteRate)
+	b.writeBytes = newByteLimiter(cfg.MaxTotalWriteByteRate)
 	b.presence, _ = cfg.ClusterBackend.(clientPresence)
 	b.sharedNodes, _ = cfg.ClusterBackend.(sharedDirectory)
 	b.dispatcher = newDispatcher(cfg.Dispatcher, b)
@@ -292,18 +331,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	var errs []error
 	var started []*gnety.Server
 	for _, spec := range specs {
-		srv, err := gnety.New(gnety.Config{
-			Network:        spec.network,
-			Addr:           spec.addr,
-			Path:           spec.path,
-			Subprotocol:    spec.subprotocol,
-			AllowAnyOrigin: spec.allowAnyOrigin,
-			TLS:            spec.tls,
-			RawHandler:     b.handleRaw,
-		})
-		if err == nil {
-			err = srv.Start(ctx)
-		}
+		srv, resolved, err := b.bindListener(ctx, spec)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("gmqx: %s listener: %w", spec.name, err))
 			for _, startedSrv := range started {
@@ -315,9 +343,9 @@ func (b *Broker) Start(ctx context.Context) error {
 		started = append(started, srv)
 		b.mu.Lock()
 		b.servers = append(b.servers, srv)
-		b.addrs[spec.name] = srv.Addr()
+		b.addrs[spec.name] = resolved
 		b.mu.Unlock()
-		b.log.Info("gmqx listener started", "transport", spec.name, "addr", srv.Addr())
+		b.log.Info("gmqx listener started", "transport", spec.name, "addr", resolved)
 	}
 	if len(started) == 0 {
 		_ = b.Stop(context.Background())
@@ -415,6 +443,102 @@ func (b *Broker) gnetyTLS() gnety.TLSConfig {
 	}
 }
 
+// bindListener creates and starts the gnety server of one listener spec. It
+// tries the configured address first and then the addresses Config.PortFallback
+// allows, in order, until one bind succeeds. The bind is the probe: there is no
+// check for a free port before binding, so two brokers starting at the same time
+// cannot both pick the same port and one of them lose a race it already won. The
+// transport (network, TLS, WebSocket path and subprotocol) is the spec's, only the
+// port changes.
+func (b *Broker) bindListener(ctx context.Context, spec listenerSpec) (*gnety.Server, string, error) {
+	addrs := fallbackAddrs(spec.addr, b.portFallback())
+	var lastErr error
+	for i, addr := range addrs {
+		srv, err := gnety.New(gnety.Config{
+			Network:        spec.network,
+			Addr:           addr,
+			Path:           spec.path,
+			Subprotocol:    spec.subprotocol,
+			AllowAnyOrigin: spec.allowAnyOrigin,
+			TLS:            spec.tls,
+			RawHandler:     b.handleRaw,
+		})
+		if err == nil {
+			err = srv.Start(ctx)
+		}
+		if err == nil {
+			if i > 0 {
+				b.log.Warn("gmqx listener port in use, bound the next free port",
+					"transport", spec.name, "requested", spec.addr, "addr", srv.Addr())
+			}
+			return srv, srv.Addr(), nil
+		}
+		lastErr = err
+		if !addrInUse(err) {
+			// A configuration error (a missing certificate, a bad address, an
+			// unsupported network) is not something the next port would fix.
+			return nil, addr, err
+		}
+	}
+	return nil, spec.addr, lastErr
+}
+
+// addrInUse reports whether err is the "address already in use" failure of a bind,
+// the only listener error a port fallback can fix. The syscall comparison covers
+// the Unix systems; the message check covers Windows, whose socket error
+// (WSAEADDRINUSE) does not compare equal to syscall.EADDRINUSE.
+func addrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "only one usage of each socket address")
+}
+
+// portFallback is how many ports above the configured one a listener may try:
+// Config.PortFallback, the documented default when it is zero, and none when it
+// is negative.
+func (b *Broker) portFallback() int {
+	if b.cfg.PortFallback < 0 {
+		return 0
+	}
+	if b.cfg.PortFallback == 0 {
+		return defaultPortFallback
+	}
+	return b.cfg.PortFallback
+}
+
+// fallbackAddrs returns addr followed by up to extra addresses whose port is
+// one, two, ... above it. An address without a usable port (an ephemeral bind on
+// port 0, a unix socket, a malformed address) has no fallback: the kernel already
+// picked a free port, or there is no port to advance.
+func fallbackAddrs(addr string, extra int) []string {
+	addrs := []string{addr}
+	if extra <= 0 {
+		return addrs
+	}
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addrs
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 {
+		return addrs
+	}
+	for i := 1; i <= extra; i++ {
+		next := port + i
+		if next > 65535 {
+			break
+		}
+		addrs = append(addrs, net.JoinHostPort(host, strconv.Itoa(next)))
+	}
+	return addrs
+}
+
 func (b *Broker) handleRaw(conn net.Conn) {
 	if b.limiter != nil && !b.limiter.allow() {
 		b.metrics.RecordDroppedMessage("connection_rate_limit")
@@ -473,6 +597,40 @@ func (b *Broker) connectTimeout() time.Duration {
 		return timeout
 	}
 	return defaultConnectTimeout
+}
+
+// receiveMaximum is the effective inbound receive maximum of this broker: how
+// many unacknowledged QoS 1/2 exchanges one client may have outstanding toward
+// it. It is also the value the MQTT 5 CONNACK advertises, which is why the two
+// inputs are folded into one number instead of being advertised and enforced
+// separately: Config.ReceiveMaximum is the receive maximum itself (default 64,
+// negative and therefore unlimited advertised as the protocol default 65535) and
+// Config.MaxInflightQoS2 has always bounded the inbound QoS 2 exchanges of a
+// connection, so the smaller of the two is what the broker really enforces.
+func (b *Broker) receiveMaximum() int {
+	limit := b.cfg.ReceiveMaximum
+	if limit == 0 {
+		limit = defaultReceiveMaximum
+	}
+	if limit < 0 || limit > maxReceiveMaximum {
+		limit = maxReceiveMaximum
+	}
+	if qos2 := b.cfg.MaxInflightQoS2; qos2 > 0 && qos2 < limit {
+		limit = qos2
+	}
+	return limit
+}
+
+// receiveMaxFull counts an inbound QoS 1/2 PUBLISH the broker refused to deliver
+// and acknowledge because its own receive maximum was full. The connection stays
+// open: the client is expected to retransmit the QoS 1 publish later, and a QoS 2
+// one was answered with PUBREC 0x97 and never started an exchange.
+func (b *Broker) receiveMaxFull(topic string) {
+	b.metrics.RecordDroppedMessage("receive_maximum_full")
+	b.metrics.RecordOverflow("receive_maximum")
+	if b.log != nil {
+		b.log.Debug("gmqx inbound receive maximum full", "topic", topic, "limit", b.receiveMaximum())
+	}
 }
 
 // willDelayLimit is the longest Will Delay Interval this broker honours, or 0
@@ -545,6 +703,10 @@ func (b *Broker) Stop(ctx context.Context) error {
 }
 
 func (b *Broker) serve(conn net.Conn) {
+	// Byte-rate shaping is applied by the transport wrapper, so every byte read
+	// from or written to this connection — the CONNECT phase, the packet codec
+	// and the shutdown DISCONNECT alike — passes one bucket (see byte_rate.go).
+	conn = b.shapeConn(conn)
 	c := newClient(b, conn)
 	// A safety net: close cancels the context as soon as the connection is gone,
 	// this covers a connection that failed before close was reached.
@@ -609,7 +771,17 @@ func (b *Broker) register(c *client) error {
 			if stored, ok := b.takeStoredSession(key); ok {
 				takeover = stored
 			} else {
-				takeover = &session{clientID: old.id, subs: copySubscriptions(old.subs), queue: old.queue}
+				// The old connection owns the state, so the replacement takes it over
+				// directly — the QoS 2 state of both directions included, exactly as a
+				// store would have carried it.
+				inboundQoS2, inflight := old.snapshotQoS2Locked()
+				takeover = &session{
+					clientID:    old.id,
+					subs:        copySubscriptions(old.subs),
+					queue:       old.queue,
+					inboundQoS2: inboundQoS2,
+					inflight:    inflight,
+				}
 				old.queue = nil
 			}
 		}
@@ -627,10 +799,12 @@ func (b *Broker) register(c *client) error {
 		if stored, ok := b.takeStoredSession(key); ok {
 			c.subs = stored.subs
 			c.queue = stored.queue
+			c.restoreQoS2State(stored)
 			c.sessionPresent = true
 		} else if takeover != nil {
 			c.subs = takeover.subs
 			c.queue = takeover.queue
+			c.restoreQoS2State(takeover)
 			c.sessionPresent = true
 		}
 	} else {

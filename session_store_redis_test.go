@@ -95,6 +95,14 @@ func TestRedisSessionStoreRoundTrip(t *testing.T) {
 			{Topic: "sensors/a/temp", Payload: []byte{0, 1, 2}, QoS: 1, Retain: true, Props: props},
 			{Topic: "plant/1", Payload: []byte("dry"), QoS: 0},
 		},
+		// The QoS 2 state of both directions is part of the stored session and must
+		// survive the Redis layout: the inbound packet ids still waiting for their
+		// PUBREL and the outbound exchanges with the stage they reached.
+		InboundQoS2: []uint16{7, 9},
+		Inflight: []SessionInflight{
+			{PacketID: 12, Topic: "plant/1", Payload: []byte("dry"), QoS: 1, Retain: true, Props: props, Stage: InflightAwaitPuback},
+			{PacketID: 13, Topic: "plant/2", Payload: []byte("wet"), QoS: 2, Stage: InflightAwaitPubcomp},
+		},
 		// A future deadline without a monotonic reading, which is what the store
 		// reconstructs: an equal instant that DeepEqual can compare.
 		ExpiresAt: time.Unix(time.Now().Unix()+3600, 42),

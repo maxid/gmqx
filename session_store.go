@@ -7,8 +7,10 @@ import (
 
 // SessionStore is the persistence seam of persistent-session state: what a
 // session keeps while no connection owns it, namely its subscriptions, the
-// messages published to it while it was offline, and the deadline its Session
-// Expiry Interval sets.
+// messages published to it while it was offline, the deadline its Session Expiry
+// Interval sets, and the QoS 2 state of both directions (the packet ids a client
+// published without releasing them, and the outbound exchanges it has not
+// confirmed).
 //
 // New installs MemorySessionStore, so a broker that does not configure a store
 // keeps the previous behavior. Config.SessionStore accepts another
@@ -101,6 +103,50 @@ type SessionState struct {
 	// not expire: that is the MQTT 3.1.1 case, where the protocol has no Session
 	// Expiry Interval, and it is what a deployment that never sets one keeps.
 	ExpiresAt time.Time
+	// InboundQoS2 are the packet ids the client published at QoS 2 whose PUBREL has
+	// not arrived yet. They are session state, not connection state: a publisher
+	// that reconnects to the same session and retransmits one of them gets the same
+	// PUBREC and no second delivery (MQTT §4.4). The set is bounded by the broker's
+	// receive maximum, and it is dropped with the session.
+	InboundQoS2 []uint16
+	// Inflight are the outbound QoS 1/2 exchanges the session has not confirmed.
+	// They are re-sent when the session resumes, with DUP set for a PUBLISH and as
+	// a PUBREL for a confirmed QoS 2 publish, under their original packet ids —
+	// which is what §4.4 requires of a server that resumes a session.
+	Inflight []SessionInflight
+}
+
+// InflightStage is where a stored outbound exchange stood when its connection
+// ended. The wire values are stable: a store persists them.
+type InflightStage byte
+
+const (
+	// InflightAwaitPuback is a QoS 1 PUBLISH whose PUBACK never arrived.
+	InflightAwaitPuback InflightStage = iota
+	// InflightAwaitPubrec is a QoS 2 PUBLISH whose PUBREC never arrived.
+	InflightAwaitPubrec
+	// InflightAwaitPubcomp is a QoS 2 PUBLISH that was confirmed with PUBREC whose
+	// PUBREL has not been answered with PUBCOMP yet.
+	InflightAwaitPubcomp
+)
+
+// SessionInflight is one outbound QoS 1/2 exchange a session owes its client, in
+// the form a SessionStore persists. It carries the packet id the exchange was
+// sent with, because a resumed session must resend it under the same id.
+type SessionInflight struct {
+	// PacketID is the packet identifier of the exchange, 1..65535.
+	PacketID uint16
+	// Topic and Payload are the publication being delivered.
+	Topic   string
+	Payload []byte
+	// QoS is 1 or 2, Retain the retain flag of the PUBLISH.
+	QoS    byte
+	Retain bool
+	// Props is the MQTT 5 PUBLISH property block without its length prefix, the
+	// same shape QueuedMessage.Props uses. It is nil for MQTT 3.1.1 traffic.
+	Props []byte
+	// Stage is where the exchange stood when the session was stored.
+	Stage InflightStage
 }
 
 // SessionSubscription is one stored subscription of a session.
@@ -205,6 +251,12 @@ func copySessionState(state SessionState) SessionState {
 	}
 	if len(state.Queue) > 0 {
 		out.Queue = append([]QueuedMessage(nil), state.Queue...)
+	}
+	if len(state.InboundQoS2) > 0 {
+		out.InboundQoS2 = append([]uint16(nil), state.InboundQoS2...)
+	}
+	if len(state.Inflight) > 0 {
+		out.Inflight = append([]SessionInflight(nil), state.Inflight...)
 	}
 	return out
 }

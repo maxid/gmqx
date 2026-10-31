@@ -248,6 +248,23 @@ func (s *RedisSessionStore) Save(key string, state SessionState) {
 			})
 		}
 	}
+	if len(state.InboundQoS2) > 0 {
+		record.InboundQoS2 = append([]uint16(nil), state.InboundQoS2...)
+	}
+	if len(state.Inflight) > 0 {
+		record.Inflight = make([]redisSessionInflight, 0, len(state.Inflight))
+		for _, m := range state.Inflight {
+			record.Inflight = append(record.Inflight, redisSessionInflight{
+				PacketID: m.PacketID,
+				Topic:    m.Topic,
+				Payload:  m.Payload,
+				QoS:      m.QoS,
+				Retain:   m.Retain,
+				Props:    m.Props,
+				Stage:    byte(m.Stage),
+			})
+		}
+	}
 	var ttl time.Duration
 	if !state.ExpiresAt.IsZero() {
 		ttl = time.Until(state.ExpiresAt)
@@ -393,6 +410,23 @@ func (s *RedisSessionStore) decode(key string, raw []byte) (SessionState, bool) 
 			})
 		}
 	}
+	if len(record.InboundQoS2) > 0 {
+		state.InboundQoS2 = append([]uint16(nil), record.InboundQoS2...)
+	}
+	if len(record.Inflight) > 0 {
+		state.Inflight = make([]SessionInflight, 0, len(record.Inflight))
+		for _, m := range record.Inflight {
+			state.Inflight = append(state.Inflight, SessionInflight{
+				PacketID: m.PacketID,
+				Topic:    m.Topic,
+				Payload:  m.Payload,
+				QoS:      m.QoS,
+				Retain:   m.Retain,
+				Props:    m.Props,
+				Stage:    InflightStage(m.Stage),
+			})
+		}
+	}
 	return state, true
 }
 
@@ -435,6 +469,13 @@ type redisSessionRecord struct {
 	ExpiresAt     int64                               `json:"expires,omitempty"`
 	Subscriptions map[string]redisSessionSubscription `json:"subs,omitempty"`
 	Queue         []redisSessionMessage               `json:"queue,omitempty"`
+	// InboundQoS2 are the packet ids the client published at QoS 2 whose PUBREL
+	// has not arrived yet, and Inflight the outbound exchanges the session never
+	// confirmed. Both are additive on the wire: a record written by a build that
+	// predates them decodes as "no QoS 2 state", which is exactly how that build
+	// behaved.
+	InboundQoS2 []uint16               `json:"in_qos2,omitempty"`
+	Inflight    []redisSessionInflight `json:"inflight,omitempty"`
 }
 
 // redisSessionSubscription is one stored subscription with its MQTT 5 options.
@@ -458,4 +499,18 @@ type redisSessionMessage struct {
 	QoS     byte   `json:"q,omitempty"`
 	Retain  bool   `json:"r,omitempty"`
 	Props   []byte `json:"pp,omitempty"`
+}
+
+// redisSessionInflight is one unconfirmed outbound QoS 1/2 exchange. It keeps the
+// packet id of the exchange (a resumed session must resend it under the same id)
+// and the stage it reached, which is the stable byte of InflightStage: await
+// PUBACK, await PUBREC or await PUBCOMP.
+type redisSessionInflight struct {
+	PacketID uint16 `json:"id"`
+	Topic    string `json:"t"`
+	Payload  []byte `json:"p,omitempty"`
+	QoS      byte   `json:"q,omitempty"`
+	Retain   bool   `json:"r,omitempty"`
+	Props    []byte `json:"pp,omitempty"`
+	Stage    byte   `json:"s,omitempty"`
 }

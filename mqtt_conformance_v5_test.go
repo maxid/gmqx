@@ -6,7 +6,10 @@ package gmqx
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,9 +173,12 @@ func test5ConnackProperties(t *testing.T) {
 	if p.AssignedClientID == "" {
 		t.Fatal("CONNACK does not assign a client id for an empty one")
 	}
-	// Absent Receive Maximum means 65535, the default flow-control window.
-	if p.ReceiveMaximum != 0 {
-		t.Fatalf("CONNACK receive maximum = %d, want the absent default", p.ReceiveMaximum)
+	// The CONNACK advertises the inbound receive maximum the broker really
+	// enforces, which defaults to defaultReceiveMaximum (and is lowered by a
+	// smaller MaxInflightQoS2). Advertising 65535 here — what an absent property
+	// would mean — would promise a window the broker does not allow.
+	if p.ReceiveMaximum != uint16(b.receiveMaximum()) || p.ReceiveMaximum == 0 {
+		t.Fatalf("CONNACK receive maximum = %d, want %d", p.ReceiveMaximum, b.receiveMaximum())
 	}
 	// Absent Maximum QoS means QoS 2.
 	if p.MaximumQoS != nil {
@@ -539,13 +545,107 @@ func test5SessionExpiry(t *testing.T) {
 }
 
 func test5ReceiveMaximum(t *testing.T) {
-	b := startBroker(t, Config{})
+	// The broker advertises the receive maximum it really enforces, and the
+	// default is its documented inbound window (64), lowered by MaxInflightQoS2
+	// when that is smaller.
+	b := startBroker(t, Config{ReceiveMaximum: 5})
 	_, ack := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-recvmax", clean: true})
-	if ack.Properties.ReceiveMaximum != 0 {
-		t.Fatalf("CONNACK receive maximum = %d; absent means the 65535 default", ack.Properties.ReceiveMaximum)
+	if ack.Properties.ReceiveMaximum != 5 {
+		t.Fatalf("CONNACK receive maximum = %d, want the configured 5", ack.Properties.ReceiveMaximum)
 	}
+	_, dack := mustConnect(t, startBroker(t, Config{}).Addr(),
+		confConnect{version: mqtt.Version5, clientID: "v5-recvmax-default", clean: true})
+	if dack.Properties.ReceiveMaximum != defaultReceiveMaximum {
+		t.Fatalf("default CONNACK receive maximum = %d, want %d", dack.Properties.ReceiveMaximum, defaultReceiveMaximum)
+	}
+
+	t.Run("zero_is_refused", func(t *testing.T) {
+		// A Receive Maximum of 0 is a Protocol Error (§3.1.2.11.3): the codec
+		// refuses the CONNECT and the broker closes the connection instead of
+		// honouring a window that would block every inbound publish. The frame is
+		// built by hand because the typed encoder omits a zero-valued property.
+		conn, err := net.Dial("tcp", b.Addr())
+		if err != nil {
+			t.Fatalf("dial %s: %v", b.Addr(), err)
+		}
+		raw := newConfClient(t, conn, mqtt.Version5, "")
+		raw.writeRaw(rawMQTT5Connect("v5-recvmax-zero", []byte{0x21, 0x00, 0x00}))
+		expectClosed(t, raw)
+	})
+
 	t.Run("flow_control", func(t *testing.T) {
-		t.Skip("receive-maximum flow control is not implemented: ROADMAP.md lists \"Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)\" as open")
+		// A client that asks for a Receive Maximum of 1 gets one unconfirmed QoS 1
+		// PUBLISH at a time: the second one waits in the broker's inflight queue
+		// until the PUBACK of the first frees the client's window (§3.3.4).
+		fb := startBroker(t, Config{})
+		sub, _ := mustConnect(t, fb.Addr(), confConnect{
+			version:  mqtt.Version5,
+			clientID: "v5-recvmax-sub",
+			clean:    true,
+			props:    mqtt.Properties{ReceiveMaximum: 1},
+		})
+		if codes := subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "recvmax/x", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		pub, _ := mustConnect(t, fb.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-recvmax-pub", clean: true})
+		pub.mustPublish(t, confPublish{topic: "recvmax/x", payload: "one", qos: 1, pid: 1})
+		pub.mustPublish(t, confPublish{topic: "recvmax/x", payload: "two", qos: 1, pid: 2})
+
+		first := expectPublish(t, sub)
+		if string(first.Payload) != "one" {
+			t.Fatalf("first delivery = %q, want \"one\"", first.Payload)
+		}
+		expectNoMessage(t, sub, 150*time.Millisecond)
+		sub.ack(first.PacketID)
+		second := expectPublish(t, sub)
+		if string(second.Payload) != "two" {
+			t.Fatalf("delivery after the PUBACK = %q, want \"two\"", second.Payload)
+		}
+		sub.ack(second.PacketID)
+	})
+
+	t.Run("inbound_window", func(t *testing.T) {
+		// The broker's own receive maximum bounds what a client may publish: over
+		// it a QoS 1 PUBLISH is neither delivered nor acknowledged (the client
+		// retransmits later) and a QoS 2 one is refused with PUBREC 0x97.
+		metrics := newDeliveryMetrics()
+		ib := startBroker(t, Config{ReceiveMaximum: 1, Metrics: metrics})
+		sub, _ := mustConnect(t, ib.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-recvmax-in-sub", clean: true})
+		if codes := subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "recvmax/in", QoS: 2}).ReasonCodes; len(codes) != 1 || codes[0] != 2 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		pub, pack := mustConnect(t, ib.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-recvmax-in-pub", clean: true})
+		if pack.Properties.ReceiveMaximum != 1 {
+			t.Fatalf("CONNACK receive maximum = %d, want 1", pack.Properties.ReceiveMaximum)
+		}
+
+		// One QoS 2 exchange occupies the only slot until its PUBREL.
+		pub.publish(confPublish{topic: "recvmax/in", payload: "one", qos: 2, pid: 10})
+		expectPubrec(t, pub, 10, 0)
+		if got := expectPublish(t, sub); string(got.Payload) != "one" {
+			t.Fatalf("first delivery = %q", got.Payload)
+		}
+
+		pub.publish(confPublish{topic: "recvmax/in", payload: "two", qos: 1, pid: 11})
+		expectNoMessage(t, pub, 150*time.Millisecond)
+		expectNoMessage(t, sub, 100*time.Millisecond)
+
+		pub.publish(confPublish{topic: "recvmax/in", payload: "three", qos: 2, pid: 12})
+		expectPubrec(t, pub, 12, ReasonQuotaExceeded)
+		expectNoMessage(t, sub, 100*time.Millisecond)
+		waitFor(t, "both over-limit publishes to be counted", func() bool {
+			return metrics.count("receive_maximum_full") == 2
+		})
+
+		// Releasing the QoS 2 exchange frees the window: the retransmitted QoS 1
+		// publish is accepted and delivered.
+		pub.write(&mqtt.Pubrel{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}, PacketID: 10})
+		expectPubcomp(t, pub, 10)
+		pub.publish(confPublish{topic: "recvmax/in", payload: "two", qos: 1, pid: 11, dup: true})
+		expectPuback(t, pub, 11, 0)
+		if got := expectPublish(t, sub); string(got.Payload) != "two" {
+			t.Fatalf("retransmitted delivery = %q, want \"two\"", got.Payload)
+		}
 	})
 }
 
@@ -558,8 +658,95 @@ func test5MaximumPacketSize(t *testing.T) {
 	c.publish(confPublish{topic: "big/topic", payload: string(make([]byte, 256)), qos: 0})
 	expectDisconnect(t, c, 0x95)
 
+	t.Run("zero_is_refused", func(t *testing.T) {
+		// A Maximum Packet Size of 0 is a Protocol Error (§3.1.2.11.4) and is
+		// refused like a zero Receive Maximum: the CONNECT is malformed and the
+		// connection is closed instead of accepting a limit no packet can meet.
+		conn, err := net.Dial("tcp", b.Addr())
+		if err != nil {
+			t.Fatalf("dial %s: %v", b.Addr(), err)
+		}
+		raw := newConfClient(t, conn, mqtt.Version5, "")
+		raw.writeRaw(rawMQTT5Connect("v5-maxpacket-zero", []byte{0x27, 0x00, 0x00, 0x00, 0x00}))
+		expectClosed(t, raw)
+	})
+
 	t.Run("client_limit", func(t *testing.T) {
-		t.Skip("a client Maximum Packet Size in CONNECT is not honoured: ROADMAP.md lists \"Full MQTT 5 properties/semantics (session expiry, receive maximum, packet limits)\" as open")
+		// The Maximum Packet Size of a CONNECT bounds every packet the broker
+		// writes to that client (§3.1.2.11.4). A packet that does not fit is
+		// dropped and counted — never split, never truncated — and the connection
+		// stays usable.
+		metrics := newDeliveryMetrics()
+		lb := startBroker(t, Config{Metrics: metrics})
+		const limit = 64
+		sub, sack := mustConnect(t, lb.Addr(), confConnect{
+			version:  mqtt.Version5,
+			clientID: "v5-maxpacket-sub",
+			clean:    true,
+			props:    mqtt.Properties{MaximumPacketSize: limit},
+		})
+		if sack.Properties.MaximumPacketSize == 0 {
+			t.Fatal("the broker stopped advertising its own maximum packet size")
+		}
+		if codes := subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "limit/x", QoS: 0}).ReasonCodes; len(codes) != 1 || codes[0] != 0 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		pub, _ := mustConnect(t, lb.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-maxpacket-pub", clean: true})
+
+		// An oversized PUBLISH is suppressed instead of written.
+		pub.publish(confPublish{topic: "limit/x", payload: strings.Repeat("x", 200), qos: 0})
+		expectNoMessage(t, sub, 200*time.Millisecond)
+		waitFor(t, "the oversized PUBLISH to be counted", func() bool {
+			return metrics.count("max_packet_size_too_large") == 1
+		})
+
+		// The connection is still usable: a message that fits arrives.
+		pub.publish(confPublish{topic: "limit/x", payload: "small", qos: 0})
+		if got := expectPublish(t, sub); string(got.Payload) != "small" {
+			t.Fatalf("delivery after the dropped one = %q, want \"small\"", got.Payload)
+		}
+
+		// A control packet that would exceed the limit is handled the same way: a
+		// SUBACK for this many filters does not fit in 64 bytes, so it is dropped
+		// and counted instead of being sent over the limit.
+		filters := make([]mqtt.Subscription, 0, 200)
+		for i := 0; i < 200; i++ {
+			filters = append(filters, mqtt.Subscription{Filter: fmt.Sprintf("limit/control/%03d", i), QoS: 0})
+		}
+		sub.write(&mqtt.Subscribe{
+			MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5},
+			PacketID:      2,
+			Subscriptions: filters,
+		})
+		expectNoMessage(t, sub, 200*time.Millisecond)
+		waitFor(t, "the oversized SUBACK to be counted", func() bool {
+			return metrics.count("max_packet_size_too_large") == 2
+		})
+		sub.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
+		readConf[*mqtt.Pingresp](t, sub)
+	})
+
+	t.Run("retained_replay", func(t *testing.T) {
+		// A retained replay is a delivery like any other: one that does not fit in
+		// the client's limit is dropped and counted, not truncated.
+		metrics := newDeliveryMetrics()
+		lb := startBroker(t, Config{Metrics: metrics})
+		pub, _ := mustConnect(t, lb.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-maxpacket-ret-pub", clean: true})
+		pub.mustPublish(t, confPublish{topic: "limit/ret", payload: strings.Repeat("r", 300), qos: 1, pid: 1, retain: true})
+
+		sub, _ := mustConnect(t, lb.Addr(), confConnect{
+			version:  mqtt.Version5,
+			clientID: "v5-maxpacket-ret-sub",
+			clean:    true,
+			props:    mqtt.Properties{MaximumPacketSize: 64},
+		})
+		if codes := subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "limit/ret", QoS: 0}).ReasonCodes; len(codes) != 1 || codes[0] != 0 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		expectNoMessage(t, sub, 200*time.Millisecond)
+		waitFor(t, "the oversized retained replay to be counted", func() bool {
+			return metrics.count("max_packet_size_too_large") == 1
+		})
 	})
 }
 
@@ -755,4 +942,16 @@ func TestConformanceAuthNotNegotiated(t *testing.T) {
 	c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-auth-rule", clean: true})
 	c.write(&mqtt.Auth{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}, ReasonCode: 0x18})
 	expectDisconnect(t, c, 0x82)
+}
+
+// rawMQTT5Connect builds an MQTT 5 CONNECT frame byte by byte, with the property
+// block given verbatim, so a case can send a property the typed encoder refuses to
+// produce (a zero Receive Maximum or Maximum Packet Size, for example).
+func rawMQTT5Connect(clientID string, props []byte) []byte {
+	body := []byte{0x00, 0x04, 'M', 'Q', 'T', 'T', mqtt.Version5, 0x02, 0x00, 0x00}
+	body = append(body, mqtt.AppendRemainingLength(nil, len(props))...)
+	body = append(body, props...)
+	body = appendString(body, clientID)
+	frame := appendRemainingLength([]byte{mqtt.TypeConnect << 4}, len(body))
+	return append(frame, body...)
 }

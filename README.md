@@ -29,7 +29,31 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   per connection, capped exponential backoff) and inflight windows backed by a
   bounded per-connection queue that delivers FIFO as slots free, instead of
   blocking or dropping. An inbound QoS 2 handshake suppresses duplicates and is
-  held to `MaxInflightQoS2` with PUBREC 0x97.
+  held to the broker's receive maximum (`ReceiveMaximum`, lowered by
+  `MaxInflightQoS2`) with PUBREC 0x97.
+- MQTT 5 Receive Maximum in both directions: the value a client sends in CONNECT
+  caps the broker's outbound windows (the effective window is the smaller of
+  `MaxInflightQoS1/2` and the client's value, and both QoS levels share it), and
+  the broker advertises and enforces its own receive maximum on inbound publishes
+  (a QoS 1 publish over it is left unacknowledged, a QoS 2 one is refused with
+  PUBREC 0x97).
+- MQTT 5 client Maximum Packet Size: every packet the broker writes is measured
+  against it, and one that does not fit — a PUBLISH, a retained replay or a control
+  packet — is dropped and counted (`max_packet_size_too_large`) instead of being
+  split, truncated or sent over the limit.
+- QoS 2 state across a reconnect: the inbound packet ids a publisher has not
+  released with PUBREL and the outbound exchanges the broker has not confirmed are
+  part of the stored session (`SessionState.InboundQoS2`/`SessionState.Inflight`),
+  so a resumed connection suppresses a retransmitted message and re-sends the
+  packets it still owes with their original packet ids (DUP for a PUBLISH, a
+  PUBREL for a confirmed QoS 2 publish).
+- Byte-rate shaping: per-connection and broker-wide read/write limits
+  (`MaxReadByteRate`, `MaxWriteByteRate`, `MaxTotalReadByteRate`,
+  `MaxTotalWriteByteRate`) that delay the excess instead of dropping it, with the
+  throttled bytes counted through `ByteRateMetrics`
+- Listener port fallback: a busy port makes `Start` try the next
+  `PortFallback` ports (default 16) instead of failing, binding each for real and
+  reporting the one it got in `Addrs()`
 - One writer goroutine per connection with a bounded outbound queue and a write
   deadline per packet (`MaxOutboundQueueSize`, `WriteTimeout`), so a peer that
   stops reading cannot hold the publisher, a will publish or the cluster receive
@@ -167,9 +191,13 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `MaxTopicSubscriptions` | 0 | per-session subscription limit |
 | `MaxRetainMessages` | 0 | retained message count limit |
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
-| `MaxInflightQoS1` | 64 | unconfirmed QoS 1 PUBLISHes per connection (negative: unlimited) |
-| `MaxInflightQoS2` | 64 | QoS 2 exchanges per connection and direction (negative: unlimited) |
+| `MaxInflightQoS1` | 64 | unconfirmed QoS 1 PUBLISHes per connection, capped by the client's Receive Maximum (negative: unlimited) |
+| `MaxInflightQoS2` | 64 | QoS 2 exchanges per connection and direction, capped by the client's Receive Maximum; the inbound half lowers `ReceiveMaximum` (negative: unlimited) |
 | `MaxInflightQueueSize` | 256 | QoS 1/2 deliveries per connection waiting for a free inflight slot |
+| `ReceiveMaximum` | 64 | the broker's own inbound receive maximum, advertised in CONNACK and enforced on inbound QoS 1/2 publishes (negative: unlimited, advertised as 65535) |
+| `MaxReadByteRate` / `MaxWriteByteRate` | 8 MiB/s / 16 MiB/s | bytes per second one connection may read / be written (negative: unlimited) |
+| `MaxTotalReadByteRate` / `MaxTotalWriteByteRate` | 256 MiB/s each | the same across all connections (negative: unlimited) |
+| `PortFallback` | 16 | ports above a busy one a listener may try before `Start` fails (negative: no fallback) |
 | `MaxOutboundQueueSize` | 256 | packets queued for a connection's writer goroutine |
 | `WriteTimeout` | 5 s | write deadline of one packet; a wedged socket is closed |
 | `QoSRetryInterval` | 5 s | base retransmission interval, doubled per attempt |
@@ -194,10 +222,12 @@ retransmission (`QoSMaxRetries`) or no sweeper (`SessionSweepInterval`).
 `ConnectTimeout` have no unlimited setting: a non-positive value selects the
 default, because those four are the guards that keep one slow or silent client
 from costing the broker unbounded memory, a stalled goroutine or a connection slot
-that never completes its CONNECT.
+that never completes its CONNECT. `ReceiveMaximum` selects 64 when it is zero and
+65535 (the protocol default) when it is negative; the byte-rate limits are
+disabled by a negative value.
 
-Remaining MQTT 5 properties/semantics (receive maximum, packet limits), QoS 2 state
-across a reconnect and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+The client library, an interoperability run against mosquitto/paho, benchmarks and
+the v1.0 API stabilization are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
 ## Dispatcher, connection context and namespaces
 
@@ -608,7 +638,23 @@ DUP — not copied). QoS 2 runs PUBLISH → PUBREC → PUBREL → PUBCOMP, and t
 is retried until the PUBCOMP arrives. `MaxInflightQoS1` bounds the unconfirmed
 QoS 1 PUBLISHes of a connection; `MaxInflightQoS2` bounds its QoS 2 exchanges in
 each direction (an inbound QoS 2 PUBLISH over the window is answered with PUBREC
-0x97 Quota exceeded on MQTT 5).
+0x97 Quota exceeded on MQTT 5). The MQTT 5 Receive Maximum a client sends in its
+CONNECT caps the outbound windows further — the effective window of each QoS is
+the smaller of the configured one and the client's value, both QoS levels share
+it, and a PUBLISH answered with PUBREC no longer occupies it — and the broker
+advertises its own receive maximum in the CONNACK and applies it to inbound
+publishes: over it, a QoS 1 publish is neither delivered nor acknowledged (the
+client retransmits later) and a QoS 2 one is refused before the exchange starts.
+
+**Resume.** When a persistent session resumes, the exchanges it left unconfirmed
+are re-sent under their original packet ids — a PUBLISH with DUP while its PUBACK
+or PUBREC is missing, a PUBREL once PUBREC arrived — ahead of the offline queue,
+which is what MQTT §4.4 requires. The state lives in `SessionState.Inflight`, so
+it survives a process restart when the store does (the Redis store round-trips it).
+Inbound, the packet ids a client published at QoS 2 and never released with PUBREL
+are kept the same way (`SessionState.InboundQoS2`): a retransmitted PUBLISH gets
+the same PUBREC and is not delivered twice. A session that ends (Clean Start, or an
+expiry) takes both halves with it.
 
 **Inflight queue.** A QoS 1/2 delivery that would exceed its window waits in the
 connection's inflight queue, in arrival order, and is sent when the
@@ -637,15 +683,29 @@ holds at most `MaxOutboundQueueSize` packets of at most `MaxPacketSize` bytes.
 Both goroutines and the retransmission timer end with the connection and are
 joined by `close`; the session sweeper is waited for by `Stop`.
 
-Deliberate limitations, all documented above with their reason: an inflight
-exchange and the inflight queue behind it are per connection, so a reconnect
-resumes the offline queue but not the unconfirmed or queued deliveries of the
-previous connection; an inbound QoS 2 exchange is dropped when the connection
-closes (as in the reference); the queue is local to the node that received the
-publication, and the subscription summary a cluster peer advertises covers live
-sessions only, so a publication on another node does not queue for an offline
-session here (a shared session store moves the state between nodes, not this
-routing).
+**Byte-rate shaping.** `MaxReadByteRate`/`MaxWriteByteRate` bound the bytes one
+connection may move per second and `MaxTotalReadByteRate`/`MaxTotalWriteByteRate`
+bound the whole broker; both are token buckets with a burst of one second of
+traffic (at least 16 KiB). The policy of the excess is delay: a read waits after
+its bytes arrived and a write before its bytes leave, so the peer is slowed down by
+TCP backpressure and nothing is dropped, truncated or reordered — a hole in an MQTT
+stream would be corruption, and closing the connection for speaking too fast would
+throw away the session and its inflight windows. What bounds a peer that ignores
+the backpressure is the deadline it then misses (`WriteTimeout` for a write, the
+keep-alive deadline for a read). Throttled bytes are reported through the optional
+`ByteRateMetrics` interface (`RecordThrottledBytes("read"|"write", n)`) and the
+wait is counted as `RecordOverflow("byte_rate_read"|"byte_rate_write")`. The
+defaults (8 MiB/s read and 16 MiB/s write per connection, 256 MiB/s each in total)
+leave ordinary traffic unshaped.
+
+Deliberate limitations, all documented above with their reason: the inflight
+queue *behind* the window is per connection, so a reconnect re-sends the exchanges
+that were already written (from the stored session) but not the deliveries that
+were only queued and never sent; the offline queue is local to the node that
+received the publication, and the subscription summary a cluster peer advertises
+covers live sessions only, so a publication on another node does not queue for an
+offline session here (a shared session store moves the state between nodes, not
+this routing).
 
 ## Takeover, delayed wills and retained expiry
 
@@ -771,6 +831,12 @@ TCP/TLS/WebSocket/WSS listeners are provided by the
 mode). The MQTT wire format lives in `gnety/codec/mqtt`: every packet is read
 with its typed `Decoder` and written with `mqtt.Encode`, so gmqx owns the broker
 state machine and no packet layout of its own.
+
+A listener whose configured port is already in use does not fail `Start`: it tries
+the next `PortFallback` ports (default 16, negative disables it) and keeps the
+transport it was configured with. Each attempt really binds the next port — the
+bind is the probe, so there is no check-then-bind race — the resolved address is
+logged and reported by `Addrs()`, and an ephemeral bind (`:0`) never falls back.
 
 ## Cluster backend
 

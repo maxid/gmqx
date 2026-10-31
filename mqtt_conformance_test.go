@@ -897,7 +897,76 @@ func test311PublishQoS2(t *testing.T) {
 	expectPubcomp(t, pub, 21)
 
 	t.Run("state_across_reconnect", func(t *testing.T) {
-		t.Skip("QoS 2 state does not survive a reconnect: ROADMAP.md lists \"Full QoS 2 state machine and inflight limits\" as open")
+		// The inbound QoS 2 state is session state (§4.4): a publisher that
+		// reconnects to its persistent session and retransmits the PUBLISH it never
+		// released is acknowledged again and NOT delivered a second time.
+		rb := startBroker(t, Config{})
+		rsub, _ := mustConnect(t, rb.Addr(), confConnect{clientID: "q2-reconnect-sub", clean: true})
+		if codes := subscribe(t, rsub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "q2/reconnect", QoS: 2}).ReasonCodes; len(codes) != 1 || codes[0] != 2 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		pub, ack := mustConnect(t, rb.Addr(), confConnect{clientID: "q2-reconnect-pub", clean: false})
+		if ack.SessionPresent {
+			t.Fatal("a new session reports Session Present")
+		}
+		pub.publish(confPublish{topic: "q2/reconnect", payload: "exactly-once", qos: 2, pid: 21})
+		expectPubrec(t, pub, 21, 0)
+		if got := expectPublish(t, rsub); string(got.Payload) != "exactly-once" {
+			t.Fatalf("QoS 2 delivery = %q", got.Payload)
+		}
+
+		// Drop the connection without PUBREL: the exchange is unfinished and the
+		// session is what keeps it.
+		_ = pub.conn.Close()
+		waitDisconnected(t, rb, "q2-reconnect-pub")
+		stored, ok := rb.store.Load("q2-reconnect-pub")
+		if !ok || len(stored.InboundQoS2) != 1 || stored.InboundQoS2[0] != 21 {
+			t.Fatalf("stored inbound QoS 2 state = %+v (ok=%v), want packet id 21", stored.InboundQoS2, ok)
+		}
+
+		again, ack := mustConnect(t, rb.Addr(), confConnect{clientID: "q2-reconnect-pub", clean: false})
+		if !ack.SessionPresent {
+			t.Fatal("the publisher's session did not resume")
+		}
+		again.publish(confPublish{topic: "q2/reconnect", payload: "exactly-once", qos: 2, pid: 21, dup: true})
+		expectPubrec(t, again, 21, 0)
+		expectNoMessage(t, rsub, 150*time.Millisecond)
+
+		again.write(&mqtt.Pubrel{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}, PacketID: 21})
+		expectPubcomp(t, again, 21)
+
+		// The packet id is released again, so a new PUBLISH using it is a new
+		// message.
+		again.publish(confPublish{topic: "q2/reconnect", payload: "second", qos: 2, pid: 21})
+		expectPubrec(t, again, 21, 0)
+		if got := expectPublish(t, rsub); string(got.Payload) != "second" {
+			t.Fatalf("delivery after PUBCOMP = %q, want \"second\"", got.Payload)
+		}
+		again.write(&mqtt.Pubrel{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}, PacketID: 21})
+		expectPubcomp(t, again, 21)
+		expectNoMessage(t, rsub, 100*time.Millisecond)
+		again.disconnect()
+		waitDisconnected(t, rb, "q2-reconnect-pub")
+
+		// A clean connection ends the session, and the QoS 2 state with it: the
+		// same packet id is a new message for the next session.
+		clean, _ := mustConnect(t, rb.Addr(), confConnect{clientID: "q2-reconnect-pub", clean: true})
+		clean.publish(confPublish{topic: "q2/reconnect", payload: "after-end", qos: 2, pid: 22})
+		expectPubrec(t, clean, 22, 0)
+		if got := expectPublish(t, rsub); string(got.Payload) != "after-end" {
+			t.Fatalf("clean-session delivery = %q", got.Payload)
+		}
+		clean.disconnect()
+		waitDisconnected(t, rb, "q2-reconnect-pub")
+		if stored, ok := rb.store.Load("q2-reconnect-pub"); ok {
+			t.Fatalf("a session that ended left state behind: %+v", stored)
+		}
+		fresh, _ := mustConnect(t, rb.Addr(), confConnect{clientID: "q2-reconnect-pub", clean: true})
+		fresh.publish(confPublish{topic: "q2/reconnect", payload: "after-end", qos: 2, pid: 22})
+		expectPubrec(t, fresh, 22, 0)
+		if got := expectPublish(t, rsub); string(got.Payload) != "after-end" {
+			t.Fatalf("a retransmission after the session ended was not delivered as a new message: %q", got.Payload)
+		}
 	})
 }
 

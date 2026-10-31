@@ -5,6 +5,56 @@
 
 ## [Unreleased]
 
+- **MQTT 5 flow control in both directions, QoS 2 state across a reconnect,
+  byte-rate shaping and listener port fallback.**
+
+  *Receive Maximum (both directions).* The Receive Maximum a client sends in
+  CONNECT now caps the broker's outbound windows: the effective window of each QoS
+  is `min(MaxInflightQoS1/2, ReceiveMaximum)`, the two QoS levels share the client's
+  window (a PUBLISH confirmed with PUBREC no longer occupies it), and a delivery
+  that cannot enter the window waits in the existing inflight queue
+  (`MaxInflightQueueSize`) instead of being dropped. The broker's own receive
+  maximum is `Config.ReceiveMaximum` (default 64, lowered by `MaxInflightQoS2` when
+  that is smaller), it is advertised in the CONNACK and enforced on inbound
+  publishes: a QoS 1 publish over it is neither delivered nor acknowledged (the
+  client retransmits later) and a QoS 2 one is answered with PUBREC 0x97 and never
+  starts an exchange. Drops are counted `receive_maximum_full` /
+  `RecordOverflow("receive_maximum")`; the previous `inflight_qos2_full` /
+  `inflight_qos2` names are gone.
+
+  *Client Maximum Packet Size.* The CONNECT Maximum Packet Size is stored per
+  connection and every packet is measured against it before it is written. A
+  packet that does not fit is dropped and counted (`max_packet_size_too_large`) —
+  a PUBLISH, a retained replay and a control packet such as a SUBACK take the same
+  path — and the connection stays usable. The broker's own inbound limit
+  (`MaxPacketSize`) is unchanged and still advertised.
+
+  *QoS 2 across a reconnect.* The inbound packet ids a client published at QoS 2
+  and has not released with PUBREL, and the outbound exchanges a session has not
+  confirmed, are now part of the stored session (`SessionState.InboundQoS2`,
+  `SessionState.Inflight` with `SessionInflight`/`InflightStage`). A resumed session
+  suppresses a retransmitted inbound PUBLISH and re-sends the packets it still owes
+  under their original packet ids — DUP for a PUBLISH, a PUBREL for a confirmed QoS
+  2 publish — ahead of the offline queue, as §4.4 requires. A session that ends
+  (Clean Start or expiry) drops both halves. The Redis store round-trips the new
+  fields; records written by an older build decode as "no QoS 2 state".
+
+  *Byte-rate shaping.* `MaxReadByteRate`, `MaxWriteByteRate`,
+  `MaxTotalReadByteRate` and `MaxTotalWriteByteRate` (defaults 8 MiB/s and 16 MiB/s
+  per connection, 256 MiB/s each in total; negative disables) are token buckets with
+  a one-second burst (at least 16 KiB). The excess is delayed, not dropped and not
+  truncated: a read waits after its bytes arrived and a write before its bytes
+  leave, so a burst is slowed by TCP backpressure and the session survives a
+  disconnect would have thrown away. Throttled bytes are reported through the new
+  optional `ByteRateMetrics` interface and counted as
+  `RecordOverflow("byte_rate_read"/"byte_rate_write")`.
+
+  *Port fallback.* `Config.PortFallback` (default 16, negative disables) makes a
+  listener whose port is already in use try the next ports instead of failing
+  `Start`, for TCP, TLS, WS and WSS alike. Every attempt binds the next port for
+  real (no check-then-bind race), the resolved address is logged and reported by
+  `Addrs()`, and an ephemeral `:0` bind never falls back.
+
 - **A gossip cluster backend is the default; `Config.Cluster.Enabled` now does
   something without an explicit backend.**
 

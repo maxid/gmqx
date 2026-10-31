@@ -88,6 +88,17 @@ type Config struct {
 	WebsocketPath       string // WebSocket path, default /mqtt
 	TLS                 TLSConfig
 	MaxPacketSize       int
+	// PortFallback is how many addresses above the configured port a listener
+	// may try when the port it was given is already in use (default 16; a
+	// negative value disables the fallback, so a busy port fails Start). Each
+	// attempt binds the next port for real — the bind is the probe, so there is
+	// no check-then-bind race with another process — and the first success wins;
+	// the transport (TCP, TLS, WS, WSS) is kept, only the port changes. The
+	// resolved address is logged and reported by Addrs(), which is what lets a
+	// supervisor discover the port the broker actually bound. Port 0 (an
+	// ephemeral bind, the usual test configuration) never falls back, because the
+	// kernel already picked a free port.
+	PortFallback int
 
 	// Protocol semantics
 	ConnectMode ConnectMode
@@ -173,6 +184,17 @@ type Config struct {
 	// and it is sent, in arrival order, as soon as a slot frees (see
 	// MaxInflightQueueSize). An inbound QoS 2 PUBLISH over the window is answered
 	// with PUBREC 0x97 (Quota exceeded) on MQTT 5.
+	//
+	// The MQTT 5 Receive Maximum a *client* sends in its CONNECT caps both windows
+	// of that connection: the effective outbound window is
+	// min(configured, Receive Maximum) for each QoS, and the two QoS levels share
+	// the client's window, so the number of QoS 1/2 PUBLISHes the broker has sent
+	// and that are still unconfirmed by PUBACK or PUBREC never exceeds it (a
+	// PUBLISH answered with PUBREC is confirmed and does not count; the PUBREL that
+	// follows it is not a PUBLISH). A delivery that cannot enter the window waits
+	// in the queue described by MaxInflightQueueSize, exactly like one that finds
+	// the configured window full. The absent property means the protocol default
+	// 65535.
 	MaxInflightQoS1 int
 	MaxInflightQoS2 int
 	// MaxInflightQueueSize bounds the QoS 1/2 deliveries one connection may have
@@ -185,6 +207,52 @@ type Config struct {
 	// Metrics.RecordOverflow("inflight")) and logged at Warn level with the client
 	// id. A non-positive value selects the default; there is no unlimited setting.
 	MaxInflightQueueSize int
+	// ReceiveMaximum is the broker's own MQTT 5 receive maximum: how many
+	// unacknowledged QoS 1/2 exchanges one client may have outstanding toward the
+	// broker, and the value the CONNACK advertises. Default 64; a negative value
+	// means unlimited, advertised as the protocol default 65535. This is the same
+	// direction as, and independent of, the Receive Maximum the *client* sends in
+	// its CONNECT, which caps the broker's outbound windows below.
+	//
+	// The effective inbound window is the smaller of this value and
+	// MaxInflightQoS2 (when that one is not negative), because MaxInflightQoS2
+	// already bounds the inbound QoS 2 exchanges of a connection; the CONNACK
+	// advertises the effective value, so the broker never announces a window it
+	// does not enforce. An inbound QoS 1 PUBLISH that finds the window full is
+	// neither delivered nor acknowledged (MQTT 3.1.1 has no negative PUBACK, and
+	// the client retransmits later); an inbound QoS 2 PUBLISH is answered with
+	// PUBREC 0x97 (Quota exceeded) and its exchange never starts. Both drops are
+	// counted with Metrics.RecordDroppedMessage("receive_maximum_full") and
+	// Metrics.RecordOverflow("receive_maximum").
+	ReceiveMaximum int
+	// MaxReadByteRate and MaxWriteByteRate bound the bytes per second one
+	// connection may read from its peer and be written to, and
+	// MaxTotalReadByteRate/MaxTotalWriteByteRate bound the same across all
+	// connections of the broker. They are token buckets with a burst of one
+	// second of traffic (at least 16 KiB): the defaults (read 8 MiB/s per
+	// connection, write 16 MiB/s, 256 MiB/s each in total) leave ordinary MQTT
+	// traffic untouched. Zero selects the default and a negative value disables
+	// the limit.
+	//
+	// The policy of the excess is delay, never disconnect and never truncation:
+	// the reader or writer waits until the bucket can pay for the bytes, so the
+	// peer is slowed down by TCP backpressure and every byte is still delivered.
+	// A broker that dropped or truncated the excess would corrupt the MQTT stream
+	// (a control packet cannot be split) and a disconnect would turn a burst into
+	// a reconnect storm; delaying keeps the session, the inflight windows and the
+	// packet ids exactly as they were. The bytes a wait accounted for are reported
+	// through the optional ByteRateMetrics extension of MetricsManager
+	// (RecordThrottledBytes("read"|"write", n)) and counted as
+	// Metrics.RecordOverflow("byte_rate_read"|"byte_rate_write"). A wait that
+	// cannot fit in the packet's write deadline is reported as the deadline
+	// itself (WriteTimeout remains the bound on how long one packet may take), and
+	// on the read side the keep-alive deadline of the next read applies, so a
+	// sustained over-rate peer is eventually closed by the deadlines it cannot
+	// meet, not by the shaper.
+	MaxReadByteRate       int
+	MaxWriteByteRate      int
+	MaxTotalReadByteRate  int
+	MaxTotalWriteByteRate int
 	// MaxOutboundQueueSize bounds the writer queue of one connection (default 256
 	// packets). Every packet of a live connection — PUBLISH, PUBACK, PUBREC,
 	// PUBREL, PUBCOMP, SUBACK, PINGRESP — is appended to it and written by the
@@ -227,7 +295,9 @@ type Config struct {
 	SessionSweepInterval time.Duration
 
 	// SessionStore is where persistent-session state lives while no connection
-	// owns it (subscriptions, queued messages, expiry deadline). Nil installs
+	// owns it (subscriptions, queued messages, expiry deadline, the inbound QoS 2
+	// packet ids a client has not released and the outbound exchanges it has not
+	// confirmed). Nil installs
 	// MemorySessionStore, which is exactly the broker's behavior before the seam
 	// existed and stays the default. A deployment can supply another
 	// implementation; this package ships two, the node-local MemorySessionStore and

@@ -224,7 +224,7 @@ func TestInboundQoS2WindowAnswersQuotaExceeded(t *testing.T) {
 
 	c.publish(confPublish{topic: "in/2", payload: "two", qos: 2, pid: 2})
 	expectPubrec(t, c, 2, ReasonQuotaExceeded)
-	waitFor(t, "the inbound window drop to be counted", func() bool { return metrics.count("inflight_qos2_full") == 1 })
+	waitFor(t, "the inbound window drop to be counted", func() bool { return metrics.count("receive_maximum_full") == 1 })
 
 	// Completing the first exchange frees the window for a new one.
 	c.write(&mqtt.Pubrel{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}, PacketID: 1})

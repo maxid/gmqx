@@ -135,6 +135,21 @@ type client struct {
 	// which is byte-identical for everything except CONNECT.
 	version byte
 
+	// receiveMaximum is the MQTT 5 Receive Maximum the client asked for in its
+	// CONNECT, with the protocol default 65535 standing in for the absent
+	// property (the codec refuses an explicit zero as a malformed CONNECT, which
+	// is the Protocol Error the specification asks for). It caps how many QoS 1/2
+	// PUBLISHes this connection may have unconfirmed by PUBACK or PUBREC at once
+	// (see windowFullLocked). Written by the handshake before the connection is
+	// registered and read under c.mu afterwards.
+	receiveMaximum uint16
+	// maxPacketSize is the Maximum Packet Size the client asked for in its
+	// CONNECT, 0 when it did not ask for a limit: no packet larger than this is
+	// ever encoded onto the wire for this connection (see enqueue). Written by the
+	// handshake before the connection is registered and never changed afterwards,
+	// so the send paths may read it without a lock.
+	maxPacketSize uint32
+
 	// authMethod is the MQTT 5 enhanced-authentication method the CONNECT
 	// negotiated, "" when the connection authenticated any other way. It is written
 	// by the handshake before the connection is registered and never changes: a
@@ -263,9 +278,74 @@ func (c *client) readMessage() (mqtt.Message, error) {
 // connection is closed, and neither may wait behind a queued delivery. Every
 // other packet goes through enqueue.
 func (c *client) writeMessage(m mqtt.Message) error {
+	if err := c.checkPacketSize(m); err != nil {
+		return err
+	}
+	return c.writeMessageUnchecked(m)
+}
+
+// writeMessageUnchecked writes a packet whose size was already checked: the writer
+// goroutine checks once, when the packet enters the queue (enqueue), and must not
+// encode it a second time just to measure it again.
+func (c *client) writeMessageUnchecked(m mqtt.Message) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return c.writeLocked(m)
+}
+
+// errPacketTooLarge reports a packet the client's CONNECT Maximum Packet Size
+// does not allow the broker to write. It is not a transport failure: the packet is
+// dropped (and counted) while the connection stays usable.
+var errPacketTooLarge = errors.New("gmqx: packet exceeds the client maximum packet size")
+
+// countingWriter counts the bytes handed to it and discards them, which is how
+// encodedPacketSize measures a packet without keeping it.
+type countingWriter int
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	*w += countingWriter(len(p))
+	return len(p), nil
+}
+
+// encodedPacketSize is the number of bytes m occupies on the wire, fixed header
+// and remaining-length field included: the size the MQTT 5 Maximum Packet Size of
+// a client applies to.
+func encodedPacketSize(m mqtt.Message) (int, error) {
+	var n countingWriter
+	if err := mqtt.Encode(&n, m); err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// checkPacketSize refuses a packet larger than the Maximum Packet Size the client
+// announced in its CONNECT. The packet is dropped instead of being written: MQTT
+// has no way to split or truncate a control packet, so a broker that sent it would
+// be violating the limit the client asked for, and one that cut it would corrupt
+// the stream. Every refused packet is counted
+// (Metrics.RecordDroppedMessage("max_packet_size_too_large")) and logged with the
+// connection and the packet type, so a client whose limit is too small for what it
+// subscribed to is visible instead of silently starved. A client that announced no
+// limit (the common case) pays nothing: the size is only computed when a limit
+// exists.
+func (c *client) checkPacketSize(m mqtt.Message) error {
+	limit := c.maxPacketSize
+	if limit == 0 || m == nil {
+		return nil
+	}
+	size, err := encodedPacketSize(m)
+	if err != nil {
+		// The encoder will report the real problem when the packet is written.
+		return nil
+	}
+	if uint32(size) <= limit {
+		return nil
+	}
+	c.broker.metrics.RecordDroppedMessage("max_packet_size_too_large")
+	c.warn("gmqx dropped a packet over the client maximum packet size",
+		"client", c.id, "connection", string(c.connID), "packet", m.Type(),
+		"size", size, "limit", limit, "reason", "max_packet_size_too_large")
+	return errPacketTooLarge
 }
 
 // writeLocked writes one packet with the connection's write deadline applied.
@@ -354,7 +434,7 @@ func (c *client) writeLoop() {
 				// packet, so the rest of the queue is not written.
 				return
 			}
-			if err := c.writeMessage(p.msg); err != nil {
+			if err := c.writeMessageUnchecked(p.msg); err != nil {
 				c.writeFailed(err)
 				return
 			}
@@ -422,8 +502,16 @@ func (c *client) enqueue(p outboundPacket) error {
 	if c.writeClosed.Load() {
 		return errClientClosed
 	}
+	// A packet the client's Maximum Packet Size forbids is refused before it is
+	// queued: no queue slot is spent on something that can never be written, and a
+	// dropped acknowledgement or SUBACK is reported instead of violating the limit.
+	if err := c.checkPacketSize(p.msg); err != nil {
+		return err
+	}
 	if !c.writerActive.Load() {
-		return c.writeMessage(p.msg)
+		// The size was checked above; the handshake path writes synchronously so the
+		// CONNACK is on the wire before anything queued behind it.
+		return c.writeMessageUnchecked(p.msg)
 	}
 	select {
 	case c.outq <- p:
@@ -628,6 +716,18 @@ func (c *client) handshake() error {
 	c.info = info
 	c.keepAlive = time.Duration(info.KeepAlive) * time.Second
 	c.username = info.Username
+	// The two MQTT 5 flow-control properties of the CONNECT are the connection's
+	// for its whole life: Receive Maximum caps the broker's outbound windows and
+	// Maximum Packet Size bounds every packet the broker writes to it. An absent
+	// property is the zero value; Receive Maximum means 65535 then, the protocol
+	// default, while Maximum Packet Size means "no limit". An explicit zero is
+	// already refused by the codec, which is the Protocol Error (0x82) the
+	// specification prescribes.
+	c.receiveMaximum = connect.Properties.ReceiveMaximum
+	if c.receiveMaximum == 0 {
+		c.receiveMaximum = maxReceiveMaximum
+	}
+	c.maxPacketSize = connect.Properties.MaximumPacketSize
 	if connect.Will != nil {
 		will := *connect.Will
 		will.Payload = append([]byte(nil), connect.Will.Payload...)
@@ -660,9 +760,12 @@ func (c *client) handshake() error {
 	// goroutine that drains the packet queue in order, one retransmission timer
 	// for QoS 1/2 confirmations, and the queue the session collected while it was
 	// offline drained FIFO right behind the CONNACK. The writer starts after the
-	// CONNACK, so nothing can be written ahead of it.
+	// CONNACK, so nothing can be written ahead of it. A resumed session re-sends
+	// the QoS 1/2 exchanges it left unconfirmed before its offline queue drains, so
+	// the client sees the packets it already knew about first (§4.4).
 	c.startWriter()
 	c.startRetransmitter()
+	c.resumeInflight()
 	c.drainOfflineQueue()
 	return nil
 }
@@ -843,16 +946,32 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 			return
 		}
 		if full {
-			// The inbound QoS 2 window is full. MQTT 5 names the reason with PUBREC
-			// 0x97 and the exchange never starts, so the message is not delivered and
-			// the packet id is not remembered; MQTT 3.1.1 has no reason code, so the
-			// PUBLISH is left unacknowledged and the client retries (the same rule
-			// the broker applies to a publish it cannot accept).
-			c.broker.metrics.RecordDroppedMessage("inflight_qos2_full")
-			c.broker.metrics.RecordOverflow("inflight_qos2")
+			// The inbound window — the broker's own Receive Maximum — is full. MQTT 5
+			// names the reason with PUBREC 0x97 and the exchange never starts, so the
+			// message is not delivered and the packet id is not remembered; MQTT 3.1.1
+			// has no reason code, so the PUBLISH is left unacknowledged and the client
+			// retries (the same rule the broker applies to a publish it cannot accept).
+			c.broker.receiveMaxFull(topic)
 			if c.version == mqtt.Version5 {
 				_ = c.writePublishAck(2, m.PacketID, ReasonQuotaExceeded)
 			}
+			return
+		}
+	} else if m.QoS == 1 {
+		// QoS 1 has no handshake to hold a slot open: the broker acknowledges a
+		// publish as soon as it is accepted, so the only way the inbound window can
+		// be full for a QoS 1 PUBLISH is that the client is still waiting for the
+		// PUBREL of enough QoS 2 publishes. In that case the publish is neither
+		// delivered nor acknowledged — a PUBACK would claim it was accepted — and the
+		// client retransmits it later (§4.4), which is exactly the behaviour the
+		// broker already has for a publish it cannot accept. MQTT 5 deliberately
+		// does not get a negative PUBACK here: the task of the window is to make the
+		// client slow down, and a PUBACK means "done".
+		c.mu.Lock()
+		full := c.inboundWindowFullLocked()
+		c.mu.Unlock()
+		if full {
+			c.broker.receiveMaxFull(topic)
 			return
 		}
 	}
@@ -983,7 +1102,8 @@ func (c *client) writeConnack(code byte, assignedClientID string) error {
 		ack.SessionPresent = c.sessionPresent
 	}
 	if c.version == mqtt.Version5 && code == 0 {
-		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize), c.authMethod, c.authData)
+		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize),
+			uint16(c.broker.receiveMaximum()), c.authMethod, c.authData)
 	}
 	return c.writeMessage(ack)
 }

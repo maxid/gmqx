@@ -32,12 +32,17 @@ package gmqx
 //
 // The reference broker of this family retries every unacked PUBLISH but never
 // sets DUP and has no window at all; both are defects this implementation does
-// not copy. What is deliberately not carried over either: an inbound QoS 2
-// exchange does not survive the connection (the state is per connection, and the
-// reference drops it too — see ROADMAP.md).
+// not copy. Inbound QoS 2 state does survive the connection when the session does:
+// the packet ids a client published at QoS 2 and has not released with PUBREL are
+// part of the stored session (see SessionState.InboundQoS2), so a publisher that
+// reconnects and retransmits gets the same acknowledgement and no second delivery.
+// Outbound exchanges survive the same way (SessionState.Inflight): the packets a
+// session still owes its client are re-sent on resume, with DUP set for a PUBLISH
+// and as a PUBREL for a confirmed QoS 2 publish, exactly as MQTT §4.4 requires.
 
 import (
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
@@ -137,6 +142,17 @@ func (c *client) inflightLimit(qos byte) int {
 	return c.broker.cfg.MaxInflightQoS1
 }
 
+// clientReceiveMaximum is the MQTT 5 Receive Maximum of this connection: how many
+// QoS 1/2 PUBLISHes may be outstanding toward the client at once. The absent
+// property means the protocol default 65535, which the handshake already folded
+// into the field.
+func (c *client) clientReceiveMaximum() int {
+	if c.receiveMaximum == 0 {
+		return maxReceiveMaximum
+	}
+	return int(c.receiveMaximum)
+}
+
 // inflightQueueLimit is how many deliveries of this connection may wait for a
 // free inflight slot. It is always bounded: a non-positive configuration (or a
 // broker built without the Config defaulting) selects the documented default.
@@ -147,26 +163,52 @@ func (c *client) inflightQueueLimit() int {
 	return defaultMaxInflightQueueSize
 }
 
-// windowFullLocked reports whether an outbound exchange of qos would exceed its
-// window. The caller holds c.mu.
+// windowFullLocked reports whether an outbound PUBLISH of qos would exceed a
+// window of this connection: the configured per-QoS window (MaxInflightQoS1/2)
+// or the Receive Maximum the client asked for in its CONNECT (§3.3.4), whichever
+// is hit first. The Receive Maximum counts the QoS 1 and QoS 2 PUBLISHes together
+// and only while neither their PUBACK nor their PUBREC has arrived — once PUBREC
+// is in, the PUBLISH is confirmed and the PUBREL that follows is a separate
+// exchange, so an awaitPubcomp entry does not occupy the client's window. The
+// caller holds c.mu.
 func (c *client) windowFullLocked(qos byte) bool {
-	limit := c.inflightLimit(qos)
-	if limit <= 0 {
-		return false
-	}
-	count := 0
-	for _, m := range c.inflight {
-		if m.qos == qos {
-			count++
+	if limit := c.inflightLimit(qos); limit > 0 {
+		count := 0
+		for _, m := range c.inflight {
+			if m.qos == qos {
+				count++
+			}
+		}
+		if count >= limit {
+			return true
 		}
 	}
-	return count >= limit
+	return c.receiveMaximumFullLocked()
 }
 
-// inboundWindowFullLocked reports whether another inbound QoS 2 exchange would
-// exceed Config.MaxInflightQoS2. The caller holds c.mu.
+// receiveMaximumFullLocked reports whether another QoS 1/2 PUBLISH would exceed
+// the Receive Maximum the client announced. The caller holds c.mu.
+func (c *client) receiveMaximumFullLocked() bool {
+	limit := c.clientReceiveMaximum()
+	if limit >= maxReceiveMaximum {
+		return false
+	}
+	unconfirmed := 0
+	for _, m := range c.inflight {
+		if m.state != awaitPubcomp {
+			unconfirmed++
+		}
+	}
+	return unconfirmed >= limit
+}
+
+// inboundWindowFullLocked reports whether another inbound QoS 1/2 exchange would
+// exceed the broker's receive maximum (see Broker.receiveMaximum). The inbound
+// QoS 2 exchanges still waiting for their PUBREL are the ones that occupy the
+// window; a QoS 1 publish is acknowledged as soon as it is accepted, so it never
+// holds a slot. The caller holds c.mu.
 func (c *client) inboundWindowFullLocked() bool {
-	limit := c.broker.cfg.MaxInflightQoS2
+	limit := c.broker.receiveMaximum()
 	return limit > 0 && len(c.inboundQoS2) >= limit
 }
 
@@ -247,18 +289,9 @@ func (c *client) nextRetransmitDelay() (time.Duration, bool) {
 // ends, which is what keeps a late confirmation from being mistaken for the
 // confirmation of a newer message.
 func (c *client) retransmitDue() {
-	type resend struct {
-		topic    string
-		payload  []byte
-		props    mqtt.Properties
-		packetID uint16
-		qos      byte
-		state    inflightState
-		retain   bool
-	}
 	now := time.Now()
 	maxRetries := c.broker.cfg.QoSMaxRetries
-	var batch []resend
+	var batch []inflightResend
 	exhausted := 0
 
 	c.mu.Lock()
@@ -278,7 +311,7 @@ func (c *client) retransmitDue() {
 			exhausted++
 			continue
 		}
-		batch = append(batch, resend{
+		batch = append(batch, inflightResend{
 			topic:    m.topic,
 			payload:  m.payload,
 			props:    m.props,
@@ -294,22 +327,102 @@ func (c *client) retransmitDue() {
 	for i := 0; i < exhausted; i++ {
 		c.broker.metrics.RecordDroppedMessage("retry_exhausted")
 	}
+	c.resendInflight(batch)
+}
+
+// inflightResend is one snapshot of an exchange that has to be written again: the
+// message, its original packet id and the stage it reached. A snapshot is taken
+// under c.mu and written outside it, so a slow socket never holds the lock that the
+// acknowledgements of the connection need.
+type inflightResend struct {
+	topic    string
+	payload  []byte
+	props    mqtt.Properties
+	packetID uint16
+	qos      byte
+	state    inflightState
+	retain   bool
+}
+
+// resendInflight writes the snapshot of a retransmission or of a resumed session: a
+// PUBLISH with DUP set and its original packet id while it is unconfirmed, a PUBREL
+// once PUBREC arrived.
+//
+// A packet the client's Maximum Packet Size forbids can never be delivered, so the
+// exchange is given up instead of being retried forever: the packet id is released
+// (the drop itself was counted by enqueue) and the queue behind the window moves on.
+func (c *client) resendInflight(batch []inflightResend) {
 	for _, r := range batch {
+		var err error
 		if r.state == awaitPubcomp {
-			_ = c.send(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: r.packetID})
-			continue
+			err = c.send(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: r.packetID})
+		} else {
+			err = c.sendPublishFrame(&mqtt.Publish{
+				MessageHeader: c.header(),
+				Topic:         r.topic,
+				Payload:       r.payload,
+				QoS:           r.qos,
+				PacketID:      r.packetID,
+				Retain:        r.retain,
+				Dup:           true,
+				Properties:    r.props,
+			})
 		}
-		_ = c.sendPublishFrame(&mqtt.Publish{
-			MessageHeader: c.header(),
-			Topic:         r.topic,
-			Payload:       r.payload,
-			QoS:           r.qos,
-			PacketID:      r.packetID,
-			Retain:        r.retain,
-			Dup:           true,
-			Properties:    r.props,
+		if errors.Is(err, errPacketTooLarge) {
+			c.mu.Lock()
+			// The state check keeps a PUBREC that arrived in between from dropping
+			// an exchange that is confirmed but not complete yet.
+			if entry, ok := c.inflight[r.packetID]; ok && entry.state == r.state {
+				delete(c.inflight, r.packetID)
+				c.drainPendingLocked()
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
+// resumeInflight re-sends the exchanges a resumed session left unconfirmed: every
+// QoS 1/2 PUBLISH whose PUBACK or PUBREC never arrived goes out again with DUP set
+// and its original packet id, and every confirmed QoS 2 publish whose PUBCOMP never
+// arrived goes out as its PUBREL again. MQTT §4.4 requires exactly this — "both the
+// Client and Server MUST resend any unacknowledged PUBLISH packets (where QoS > 0)
+// and PUBREL packets using their original Packet Identifiers" — and it is the only
+// way a delivery the broker already acknowledged to its publisher survives a
+// reconnect without being lost or duplicated.
+//
+// It runs after the CONNACK (startWriter has opened the queue) and before the
+// offline queue drains, so the packets the client was already sent keep their
+// place ahead of messages it has never seen. Entries are sent in packet-id order
+// instead of map order, so a resumed session is reproducible.
+//
+// A client that reconnects with a smaller Receive Maximum than the exchanges it
+// left unconfirmed still gets all of them: they were sent under the previous
+// connection and §4.4 requires the retransmission under the original packet ids.
+// The new value applies to new deliveries, which wait in the inflight queue, not
+// to the completion of an exchange that is already in flight.
+func (c *client) resumeInflight() {
+	c.mu.Lock()
+	ids := make([]uint16, 0, len(c.inflight))
+	for id := range c.inflight {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	batch := make([]inflightResend, 0, len(ids))
+	for _, id := range ids {
+		m := c.inflight[id]
+		batch = append(batch, inflightResend{
+			topic:    m.topic,
+			payload:  m.payload,
+			props:    m.props,
+			packetID: id,
+			qos:      m.qos,
+			state:    m.state,
+			retain:   m.retain,
 		})
 	}
+	c.mu.Unlock()
+
+	c.resendInflight(batch)
 }
 
 // writePublish sends one PUBLISH to this connection. For QoS 1 and 2 it registers
@@ -520,6 +633,12 @@ func (c *client) drainOfflineQueue() {
 			}
 		}
 		if err := c.writePublish(msg.topic, msg.payload, qos, msg.retain, msg.props); err != nil {
+			if errors.Is(err, errPacketTooLarge) {
+				// The client's Maximum Packet Size forbids this stored message. It was
+				// counted by enqueue and is skipped, so one oversize message cannot wedge
+				// the session's queue forever.
+				continue
+			}
 			c.mu.Lock()
 			c.queue = append([]queuedMessage{msg}, c.queue...)
 			c.mu.Unlock()

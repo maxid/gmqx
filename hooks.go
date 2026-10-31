@@ -314,7 +314,8 @@ type EventSink interface {
 // delivery carried more Subscription Identifiers than the documented cap, or a
 // subscription stored more), "cluster_namespace", "inflight_overflow" (a QoS 1/2 delivery found
 // the connection's inflight window and the queue behind it both full, so it was
-// dropped), "inflight_qos2_full" (an inbound QoS 2 PUBLISH over the window),
+// dropped), "receive_maximum_full" (an inbound QoS 1/2 PUBLISH over the broker's own
+// receive maximum: it was neither delivered nor acknowledged),
 // "retry_exhausted" (an outbound exchange used up its retransmissions),
 // "outbound_queue_full" (a QoS 0 PUBLISH was dropped because the connection's
 // writer queue was full), "slow_consumer" (a packet that must not be dropped — a
@@ -339,10 +340,12 @@ type EventSink interface {
 // RecordQueueDepth("offline", n) reports the messages currently queued for
 // offline sessions across the broker; RecordOverflow reports a limit that was hit
 // without losing a message ("connections", "inflight" — a delivery was dropped
-// as well, see "inflight_overflow" —, "inflight_qos2", "outbound_queue",
+// as well, see "inflight_overflow" —, "receive_maximum", "outbound_queue",
 // "will_delay" — a Will Delay Interval was clamped to Config.MaxWillDelayInterval
-// — and "packet_ids" — a delivery degraded to QoS 0 because no packet id was
-// free).
+// —, "packet_ids" — a delivery degraded to QoS 0 because no packet id was free —
+// and "byte_rate_read"/"byte_rate_write" — a byte-rate limit delayed a transfer;
+// the throttled byte count itself is reported through the optional
+// ByteRateMetrics interface).
 type MetricsManager interface {
 	IncrementConnections()
 	DecrementConnections()

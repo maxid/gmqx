@@ -126,9 +126,14 @@ func TestOfflineQueueOrderAcrossReconnects(t *testing.T) {
 		t.Fatal("the session was not resumed")
 	}
 	for _, want := range []string{"first", "second"} {
-		if got := expectPublish(t, sub); string(got.Payload) != want {
+		got := expectPublish(t, sub)
+		if string(got.Payload) != want {
 			t.Fatalf("drained delivery = %q, want %q", got.Payload, want)
 		}
+		// A QoS 1 delivery is only over once the client confirms it: an unconfirmed
+		// one is part of the session (§4.4) and would be re-sent on the next
+		// reconnect ahead of the queue this test is about.
+		sub.ack(got.PacketID)
 	}
 	expectNoMessage(t, sub, 50*time.Millisecond)
 	sub.disconnect()
@@ -141,9 +146,11 @@ func TestOfflineQueueOrderAcrossReconnects(t *testing.T) {
 		t.Fatal("the session was not resumed a second time")
 	}
 	for _, want := range []string{"third", "fourth"} {
-		if got := expectPublish(t, sub2); string(got.Payload) != want {
+		got := expectPublish(t, sub2)
+		if string(got.Payload) != want {
 			t.Fatalf("second drain delivery = %q, want %q", got.Payload, want)
 		}
+		sub2.ack(got.PacketID)
 	}
 	expectNoMessage(t, sub2, 50*time.Millisecond)
 }
