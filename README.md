@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # gmqx
 
 A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
