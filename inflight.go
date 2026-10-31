@@ -163,6 +163,52 @@ func (c *client) inflightQueueLimit() int {
 	return defaultMaxInflightQueueSize
 }
 
+// addInflightLocked registers an outbound exchange and keeps the window counters
+// in step with the map. The caller holds c.mu.
+func (c *client) addInflightLocked(id uint16, m *inflightMessage) {
+	c.inflight[id] = m
+	switch m.qos {
+	case 1:
+		c.inflightQoS1++
+	case 2:
+		c.inflightQoS2++
+	}
+	if m.state != awaitPubcomp {
+		c.inflightUnconfirmed++
+	}
+}
+
+// deleteInflightLocked removes an outbound exchange and keeps the window counters
+// in step. It reports whether the entry was there. The caller holds c.mu.
+func (c *client) deleteInflightLocked(id uint16) bool {
+	m, ok := c.inflight[id]
+	if !ok {
+		return false
+	}
+	delete(c.inflight, id)
+	switch m.qos {
+	case 1:
+		c.inflightQoS1--
+	case 2:
+		c.inflightQoS2--
+	}
+	if m.state != awaitPubcomp {
+		c.inflightUnconfirmed--
+	}
+	return true
+}
+
+// confirmInflightLocked marks a QoS 2 exchange as confirmed by its PUBREC: the
+// PUBREL that follows is a separate exchange and no longer occupies the client's
+// Receive Maximum. The caller holds c.mu.
+func (c *client) confirmInflightLocked(m *inflightMessage) {
+	if m.state == awaitPubcomp {
+		return
+	}
+	m.state = awaitPubcomp
+	c.inflightUnconfirmed--
+}
+
 // windowFullLocked reports whether an outbound PUBLISH of qos would exceed a
 // window of this connection: the configured per-QoS window (MaxInflightQoS1/2)
 // or the Receive Maximum the client asked for in its CONNECT (§3.3.4), whichever
@@ -171,15 +217,17 @@ func (c *client) inflightQueueLimit() int {
 // is in, the PUBLISH is confirmed and the PUBREL that follows is a separate
 // exchange, so an awaitPubcomp entry does not occupy the client's window. The
 // caller holds c.mu.
+//
+// Both answers come from the counters addInflightLocked/deleteInflightLocked
+// maintain, not from a scan of the inflight table: this runs once per delivery,
+// under the connection lock every publisher writing to the connection shares.
 func (c *client) windowFullLocked(qos byte) bool {
 	if limit := c.inflightLimit(qos); limit > 0 {
-		count := 0
-		for _, m := range c.inflight {
-			if m.qos == qos {
-				count++
+		if qos == 2 {
+			if c.inflightQoS2 >= limit {
+				return true
 			}
-		}
-		if count >= limit {
+		} else if c.inflightQoS1 >= limit {
 			return true
 		}
 	}
@@ -190,16 +238,7 @@ func (c *client) windowFullLocked(qos byte) bool {
 // the Receive Maximum the client announced. The caller holds c.mu.
 func (c *client) receiveMaximumFullLocked() bool {
 	limit := c.clientReceiveMaximum()
-	if limit >= maxReceiveMaximum {
-		return false
-	}
-	unconfirmed := 0
-	for _, m := range c.inflight {
-		if m.state != awaitPubcomp {
-			unconfirmed++
-		}
-	}
-	return unconfirmed >= limit
+	return limit < maxReceiveMaximum && c.inflightUnconfirmed >= limit
 }
 
 // inboundWindowFullLocked reports whether another inbound QoS 1/2 exchange would
@@ -232,34 +271,64 @@ func (c *client) startRetransmitter() {
 // due and re-arms itself. It returns when the connection ends: the context is
 // cancelled by close, so a closed connection leaves neither a goroutine nor a
 // timer behind.
+//
+// One timer is reused for the whole life of the connection, and it is only reset
+// when the earliest deadline actually moves: a delivery whose due time is later
+// than the armed one does not wake or rearm the loop (see writePublishLocked).
+// Waking the loop per delivery cost a goroutine wakeup, a scan of the whole
+// inflight table and a fresh time.Timer, all under the connection lock the
+// delivery path contends on.
 func (c *client) retransmitLoop() {
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	var armed time.Time
+	stopTimer := func() {
+		if timer == nil || timerC == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerC = nil
+		armed = time.Time{}
+	}
 	for {
-		wait, ok := c.nextRetransmitDelay()
-		var timer *time.Timer
-		var timerC <-chan time.Time
-		if ok {
-			timer = time.NewTimer(wait)
+		deadline, ok := c.nextRetransmitDeadline()
+		if !ok {
+			stopTimer()
+		} else if timer == nil {
+			timer = time.NewTimer(time.Until(deadline))
 			timerC = timer.C
+			armed = deadline
+		} else if !armed.Equal(deadline) {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(time.Until(deadline))
+			timerC = timer.C
+			armed = deadline
 		}
 		select {
 		case <-timerC:
 			c.retransmitDue()
 		case <-c.retryWake:
 		case <-c.connCtx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
+			stopTimer()
 			return
-		}
-		if timer != nil {
-			timer.Stop()
 		}
 	}
 }
 
-// nextRetransmitDelay is how long the timer may sleep before the earliest
-// scheduled retransmission of the table.
-func (c *client) nextRetransmitDelay() (time.Duration, bool) {
+// nextRetransmitDeadline is the earliest scheduled retransmission of the table,
+// and whether there is one. It records the answer in retryAt, which is what lets
+// a new exchange decide whether the sleeping loop has to be woken.
+func (c *client) nextRetransmitDeadline() (time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var earliest time.Time
@@ -272,13 +341,11 @@ func (c *client) nextRetransmitDelay() (time.Duration, bool) {
 		}
 	}
 	if earliest.IsZero() {
-		return 0, false
+		c.retryAt = time.Time{}
+		return time.Time{}, false
 	}
-	wait := time.Until(earliest)
-	if wait < 0 {
-		wait = 0
-	}
-	return wait, true
+	c.retryAt = earliest
+	return earliest, true
 }
 
 // retransmitDue sends every retransmission that is due. A PUBLISH is resent with
@@ -373,7 +440,7 @@ func (c *client) resendInflight(batch []inflightResend) {
 			// The state check keeps a PUBREC that arrived in between from dropping
 			// an exchange that is confirmed but not complete yet.
 			if entry, ok := c.inflight[r.packetID]; ok && entry.state == r.state {
-				delete(c.inflight, r.packetID)
+				c.deleteInflightLocked(r.packetID)
 				c.drainPendingLocked()
 			}
 			c.mu.Unlock()
@@ -467,7 +534,7 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 			if c.broker.cfg.QoSMaxRetries >= 0 {
 				registered.due = time.Now().Add(c.broker.cfg.QoSRetryInterval)
 			}
-			c.inflight[id] = registered
+			c.addInflightLocked(id, registered)
 		}
 	}
 
@@ -482,11 +549,15 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 	})
 	if err != nil {
 		if registered != nil && c.inflight[packetID] == registered {
-			delete(c.inflight, packetID)
+			c.deleteInflightLocked(packetID)
 		}
 		return err
 	}
-	if registered != nil {
+	if registered != nil && (c.retryAt.IsZero() || registered.due.Before(c.retryAt)) {
+		// This exchange is due before the deadline the retransmission loop is
+		// sleeping for (or there is no deadline at all), so the loop has to be
+		// woken. A delivery whose due time is later than the armed one does not
+		// wake it: the loop is already scheduled to look at the table earlier.
 		c.wakeRetransmitter()
 	}
 	return nil
@@ -554,7 +625,7 @@ func (c *client) drainPendingLocked() {
 func (c *client) handlePuback(m *mqtt.Puback) {
 	c.mu.Lock()
 	if entry, ok := c.inflight[m.PacketID]; ok && entry.state == awaitPuback {
-		delete(c.inflight, m.PacketID)
+		c.deleteInflightLocked(m.PacketID)
 		c.drainPendingLocked()
 	}
 	c.mu.Unlock()
@@ -572,12 +643,12 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 		return
 	}
 	if m.ReasonCode >= 0x80 {
-		delete(c.inflight, m.PacketID)
+		c.deleteInflightLocked(m.PacketID)
 		c.drainPendingLocked()
 		c.mu.Unlock()
 		return
 	}
-	entry.state = awaitPubcomp
+	c.confirmInflightLocked(entry)
 	if c.broker.cfg.QoSMaxRetries >= 0 {
 		entry.attempts = 0
 		entry.due = time.Now().Add(c.broker.cfg.QoSRetryInterval)
@@ -586,7 +657,7 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 	}
 	c.mu.Unlock()
 
-	_ = c.send(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: m.PacketID})
+	_ = c.enqueueAck(outboundPubrel, m.PacketID)
 	c.wakeRetransmitter()
 }
 
@@ -595,7 +666,7 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 func (c *client) handlePubcomp(m *mqtt.Pubcomp) {
 	c.mu.Lock()
 	if entry, ok := c.inflight[m.PacketID]; ok && entry.state == awaitPubcomp {
-		delete(c.inflight, m.PacketID)
+		c.deleteInflightLocked(m.PacketID)
 		c.drainPendingLocked()
 	}
 	c.mu.Unlock()

@@ -117,7 +117,22 @@ type client struct {
 	// inflight holds the outbound QoS 1/2 exchanges this connection has not
 	// confirmed yet, keyed by packet id; retryWake asks retransmitLoop to
 	// recompute its deadline. Both belong to the connection and die with it.
-	inflight  map[uint16]*inflightMessage
+	//
+	// inflightQoS1, inflightQoS2 and inflightUnconfirmed are the counts the window
+	// checks need. They are maintained together with the map, under c.mu, so that
+	// answering "is the window full?" is O(1): a scan of the table on every
+	// delivery is what a saturated QoS 1/2 delivery path spent its lock on. A
+	// QoS 2 entry stops being unconfirmed when its PUBREC arrives (it is then a
+	// PUBREL exchange and no longer occupies the client's Receive Maximum), which
+	// is the one state transition the counters follow.
+	inflight            map[uint16]*inflightMessage
+	inflightQoS1        int
+	inflightQoS2        int
+	inflightUnconfirmed int
+	// retryAt is the deadline retransmitLoop is currently sleeping for, zero when
+	// no deadline is armed. It is maintained under c.mu and is what lets a new
+	// delivery skip the wakeup when its retransmission cannot be the earliest.
+	retryAt   time.Time
 	retryWake chan struct{}
 	// pending is where an outbound QoS 1/2 delivery waits when the inflight window
 	// of its QoS is full: arrival order, drained by the acknowledgement that frees
@@ -348,6 +363,18 @@ func (c *client) checkPacketSize(m mqtt.Message) error {
 	return errPacketTooLarge
 }
 
+// writeAckSync writes one acknowledgement frame directly, for the window before
+// the writer goroutine exists (see enqueue).
+func (c *client) writeAckSync(kind uint8, pid uint16) error {
+	var frame [ackFrameLen]byte
+	buf := appendAck(frame[:0], kind, pid)
+	_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout()))
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_, err := c.conn.Write(buf)
+	return err
+}
+
 // writeLocked writes one packet with the connection's write deadline applied.
 // The caller holds wmu, which is what keeps the writer goroutine and a
 // synchronous write from interleaving on the socket.
@@ -372,14 +399,37 @@ func (c *client) writeTimeout() time.Duration {
 // the only packets a full queue may discard: QoS 0 PUBLISHes, which the protocol
 // already allows to be lost.
 //
+// The PUBACK family with a default reason code and no properties — which is every
+// acknowledgement this broker sends unless an MQTT 5 client is being told about a
+// failure — is carried as its type and packet id instead of a typed message. Its
+// wire form is four bytes, so the packet costs no allocation at all, and the
+// writer builds it directly (see appendAck). Anything else sets kind to
+// outboundMessage and travels as msg.
+//
 // Trade-off of the queue model: the queue is bounded in packets and not in
 // bytes, so one connection can hold at most MaxOutboundQueueSize packets (each
 // of which MaxPacketSize bounds) — the memory of a slow consumer is capped
 // without a byte-accounting pass on every send.
 type outboundPacket struct {
 	msg       mqtt.Message
+	packetID  uint16
+	kind      uint8
 	droppable bool
 }
+
+// Kinds of outboundPacket. outboundMessage means msg holds the packet; the other
+// four are the acknowledgement family with a zero reason code and no properties.
+const (
+	outboundMessage uint8 = iota
+	outboundPuback
+	outboundPubrec
+	outboundPubrel
+	outboundPubcomp
+)
+
+// ackFrameLen is the wire size of an acknowledgement with no reason code and no
+// properties: fixed header, remaining length 2, packet id.
+const ackFrameLen = 4
 
 // startWriter starts the connection's single writer goroutine. It is called once,
 // from the handshake, right after the CONNACK: from here on every packet of this
@@ -416,30 +466,142 @@ func (c *client) stopWriter() {
 	}
 }
 
-// writeLoop is the writer goroutine: it writes the queued packets one at a time,
-// each under Config.WriteTimeout, and ends with the connection. A write that
-// fails (a closed socket, an expired write deadline, a peer that reset the
-// connection) ends the connection: close then runs on the read goroutine, which
-// is what publishes the will and unregisters the session.
+// writeBatchMax is the largest number of packets one write of the writer
+// goroutine carries, and writeBatchBytes the largest frame buffer it fills. Both
+// only bound the memory and the time one batch may hold; a normal queue has far
+// fewer packets waiting, so a batch is usually the whole backlog.
+//
+// writeBatchInitial is the buffer a connection starts with. It grows (up to the
+// bound) only on a connection that actually has bursts, so a mostly idle device
+// connection does not pay for a large buffer it never fills.
+const (
+	writeBatchMax     = 64
+	writeBatchBytes   = 64 << 10
+	writeBatchInitial = 4 << 10
+)
+
+// writeLoop is the writer goroutine: it writes the queued packets, in queue
+// order, and ends with the connection. The packets that are already waiting when
+// the goroutine wakes are encoded into one buffer and handed to the socket with
+// one write, under Config.WriteTimeout: a PUBACK and the deliveries queued behind
+// it cost one write instead of one each, and the order is still exactly the order
+// they were queued in.
+//
+// A write that fails (a closed socket, an expired write deadline, a peer that
+// reset the connection) ends the connection: close then runs on the read
+// goroutine, which is what publishes the will and unregisters the session.
 func (c *client) writeLoop() {
 	defer close(c.writerDone)
+	batch := writeBatch{}
+	batch.frame.buf = make([]byte, 0, writeBatchInitial)
 	for {
 		select {
 		case <-c.writerStop:
 			return
 		case p := <-c.outq:
-			if c.writeClosed.Load() {
-				// The connection is closing (or was displaced): a server
-				// DISCONNECT may already be on the wire and it has to be the last
-				// packet, so the rest of the queue is not written.
-				return
-			}
-			if err := c.writeMessageUnchecked(p.msg); err != nil {
-				c.writeFailed(err)
+			if !c.appendOutbound(&batch, p) {
 				return
 			}
 		}
+		// Drain what is already queued, without waiting: the packets that arrived
+		// while the writer was waking up travel with this one.
+		for batch.packets < writeBatchMax && batch.frame.Len() < writeBatchBytes {
+			var next outboundPacket
+			var ok bool
+			select {
+			case <-c.writerStop:
+				return
+			case next, ok = <-c.outq:
+			default:
+			}
+			if !ok {
+				break
+			}
+			if !c.appendOutbound(&batch, next) {
+				return
+			}
+		}
+		if err := c.flushBatch(&batch); err != nil {
+			c.writeFailed(err)
+			return
+		}
 	}
+}
+
+// writeBatch is the reusable frame buffer of the writer goroutine: the encoded
+// bytes of the packets of one write, and how many packets they came from. It is
+// only touched by the writer goroutine, and the buffer is allocated once per
+// connection, not per packet.
+type writeBatch struct {
+	frame   appendBuffer
+	packets int
+}
+
+// appendBuffer is an io.Writer that appends to a byte slice. It is the writer
+// side of mqtt.Encode in the write loop: the packet is encoded into the batch
+// instead of straight onto the socket, so the packets that are already queued
+// travel with one write. The buffer lives in the writeBatch, so passing its
+// address to the encoder allocates nothing per packet.
+type appendBuffer struct {
+	buf []byte
+}
+
+func (b *appendBuffer) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+// Len is the number of encoded bytes waiting in the batch.
+func (b *appendBuffer) Len() int { return len(b.buf) }
+
+// Bytes is the encoded batch.
+func (b *appendBuffer) Bytes() []byte { return b.buf }
+
+// Reset empties the batch and keeps its capacity for the next one.
+func (b *appendBuffer) Reset() { b.buf = b.buf[:0] }
+
+// appendOutbound encodes one packet into the batch and reports whether the
+// writer may continue. It refuses to work once writeClosed is set: the connection
+// is closing (or was displaced), a server DISCONNECT may already be on the wire
+// and it has to be the last packet, so the rest of the queue is not written.
+func (c *client) appendOutbound(batch *writeBatch, p outboundPacket) bool {
+	if c.writeClosed.Load() {
+		return false
+	}
+	if p.kind != outboundMessage {
+		batch.frame.buf = appendAck(batch.frame.buf, p.kind, p.packetID)
+		batch.packets++
+		return true
+	}
+	_ = mqtt.Encode(&batch.frame, p.msg)
+	batch.packets++
+	return true
+}
+
+// appendAck appends one acknowledgement frame: fixed header, remaining length 2,
+// packet id. The PUBREL fixed header carries its mandatory 0x02 flags.
+func appendAck(dst []byte, kind uint8, pid uint16) []byte {
+	header := ackType(kind) << 4
+	if kind == outboundPubrel {
+		header |= 0x02
+	}
+	return append(dst, header, 2, byte(pid>>8), byte(pid))
+}
+
+// flushBatch writes the encoded batch with one socket write, under the
+// connection's write deadline and wmu, and resets the batch for the next one.
+func (c *client) flushBatch(batch *writeBatch) error {
+	if batch.frame.Len() == 0 {
+		return nil
+	}
+	pending := batch.frame.Bytes()
+	batch.frame.Reset()
+	batch.packets = 0
+	_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout()))
+	c.wmu.Lock()
+	_, err := c.conn.Write(pending)
+	c.wmu.Unlock()
+	return err
 }
 
 // writeFailed ends a connection whose socket write failed. It never calls close:
@@ -511,6 +673,9 @@ func (c *client) enqueue(p outboundPacket) error {
 	if !c.writerActive.Load() {
 		// The size was checked above; the handshake path writes synchronously so the
 		// CONNACK is on the wire before anything queued behind it.
+		if p.kind != outboundMessage {
+			return c.writeAckSync(p.kind, p.packetID)
+		}
 		return c.writeMessageUnchecked(p.msg)
 	}
 	select {
@@ -531,6 +696,37 @@ func (c *client) enqueue(p outboundPacket) error {
 // PINGRESP, a SUBACK, a retransmission. A full queue disconnects the connection.
 func (c *client) send(m mqtt.Message) error {
 	return c.enqueue(outboundPacket{msg: m})
+}
+
+// enqueueAck queues one acknowledgement of the PUBACK family with a default
+// reason code and no properties. It is the hot acknowledgement path (one per
+// inbound QoS 1 publish and two per inbound QoS 2 publish) and it allocates
+// nothing: the writer encodes the four-byte frame from the packet id.
+func (c *client) enqueueAck(kind uint8, pid uint16) error {
+	if limit := c.maxPacketSize; limit != 0 && limit < ackFrameLen {
+		// The client's Maximum Packet Size forbids even an acknowledgement. The
+		// packet is dropped and counted, exactly like every other oversize packet
+		// (see checkPacketSize); the connection stays usable.
+		c.broker.metrics.RecordDroppedMessage("max_packet_size_too_large")
+		c.warn("gmqx dropped a packet over the client maximum packet size",
+			"client", c.id, "connection", string(c.connID), "packet", ackType(kind),
+			"size", ackFrameLen, "limit", limit, "reason", "max_packet_size_too_large")
+		return errPacketTooLarge
+	}
+	return c.enqueue(outboundPacket{kind: kind, packetID: pid})
+}
+
+// ackType is the mqtt control packet type of an outboundPacket kind.
+func ackType(kind uint8) byte {
+	switch kind {
+	case outboundPuback:
+		return mqtt.TypePuback
+	case outboundPubrec:
+		return mqtt.TypePubrec
+	case outboundPubrel:
+		return mqtt.TypePubrel
+	}
+	return mqtt.TypePubcomp
 }
 
 // sendPublishFrame queues one PUBLISH. A QoS 0 PUBLISH is the one packet a full
@@ -885,7 +1081,7 @@ func (c *client) handlePubrel(m *mqtt.Pubrel) {
 	c.mu.Lock()
 	delete(c.inboundQoS2, m.PacketID)
 	c.mu.Unlock()
-	_ = c.send(&mqtt.Pubcomp{MessageHeader: c.header(), PacketID: m.PacketID})
+	_ = c.enqueueAck(outboundPubcomp, m.PacketID)
 }
 
 func (c *client) handlePublish(m *mqtt.Publish) {
@@ -1266,6 +1462,14 @@ func (c *client) ackPublish(qos byte, pid uint16, res PublishResult) {
 // writePublishAck writes the PUBACK of a QoS 1 publish or the PUBREC of a QoS 2
 // one. The reason code is only encoded on MQTT 5.
 func (c *client) writePublishAck(qos byte, pid uint16, reason byte) error {
+	if reason == 0 {
+		// The acknowledgement every accepted publish gets: four bytes, no typed
+		// packet and no allocation (see enqueueAck).
+		if qos == 2 {
+			return c.enqueueAck(outboundPubrec, pid)
+		}
+		return c.enqueueAck(outboundPuback, pid)
+	}
 	if qos == 2 {
 		return c.send(&mqtt.Pubrec{MessageHeader: c.header(), PacketID: pid, ReasonCode: reason})
 	}

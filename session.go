@@ -234,7 +234,7 @@ func (c *client) restoreQoS2State(s *session) {
 		if c.broker.cfg.QoSMaxRetries >= 0 {
 			m.due = now.Add(retry)
 		}
-		c.inflight[m.packetID] = m
+		c.addInflightLocked(m.packetID, m)
 	}
 }
 

@@ -1358,9 +1358,9 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, pub Publication) error
 	if d == nil || d.broker == nil {
 		return errors.New("gmqx: default dispatcher is not bound to a broker")
 	}
-	for _, target := range d.broker.LocalTargets(pub) {
+	d.broker.eachLocalTarget(pub, func(target LocalTarget) {
 		_ = d.broker.SendLocal(ctx, target, pub)
-	}
+	})
 	return d.broker.SpreadPublication(ctx, pub)
 }
 
@@ -1386,6 +1386,17 @@ func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
 		return nil
 	}
 	return b.index.targets(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain)
+}
+
+// eachLocalTarget is LocalTargets without the slice: it hands each matching
+// session to fn, in the order the index collected them, after the index lock has
+// been released. The built-in dispatcher uses it, so a publication does not
+// allocate a target slice of its own.
+func (b *Broker) eachLocalTarget(pub Publication, fn func(LocalTarget)) {
+	if pub.Namespace != b.namespace {
+		return
+	}
+	b.index.eachTarget(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain, fn)
 }
 
 // SendLocal is the write half of the routing seam: it writes pub to one target

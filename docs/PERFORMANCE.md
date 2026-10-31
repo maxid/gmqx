@@ -25,6 +25,12 @@ guarantee.
 
 ## Methodology
 
+The sequential benchmarks below measure one publish→deliver round trip at a
+time; a broker's sustained rate under many concurrent connections is a different
+measurement and lives in its own harness. See
+[Concurrent throughput](#concurrent-throughput-200-connections) for the
+200-connection number, its design and its before/after results.
+
 Every benchmark in `bench_test.go` runs the real `gmqx.Broker` over real TCP:
 the benchmark starts its own broker on `127.0.0.1:0`, dials it with a small MQTT
 3.1.1 wire client written on `gnety/codec/mqtt`, and measures publications end to
@@ -74,7 +80,10 @@ One run of:
 go test -run '^$' -bench . -benchtime=2s ./...
 ```
 
-Results (real output, reformatted into a table):
+Results (real output, reformatted into a table). These are the baseline this
+document started from; the throughput work below re-measured four of them (see
+the sequential before/after table in
+[What changed](#what-changed-and-what-each-change-was-worth)):
 
 | Benchmark | ns/op | B/op | allocs/op | Derived rate |
 |---|---:|---:|---:|---:|
@@ -129,31 +138,277 @@ difference is called real.
   design trade-off of `subscriptionIndex` (see `routing_index.go`), and it is
   why deployments with many wildcard filters should be sized by wildcard-filter
   count, not by subscription count.
-- **The per-publication allocation is ~1 KB at QoS 0 and ~2.3 KB at QoS 1.**
+- **The per-publication allocation is under 1 KB at QoS 0 and ~1.7 KB at QoS 1.**
   Profiles (`go test -bench ... -memprofile`) attribute the QoS 0 allocations to
   the wire codec's decode (`gnety/codec/mqtt.decodePublish` allocates the payload
-  and topic strings per packet), the broker's outbound publish construction
-  (`(*client).writePublishLocked`), and one `LocalTarget` slice per publish
-  (`subscriptionIndex.targets`). None of them grows with the subscription count.
-- **QoS 1/2 deliveries allocate one timer each.** The broker connection's
-  `(*client).retransmitLoop` creates a new `time.Timer` every time it is woken
-  for an inflight message, and every live QoS 1/2 delivery wakes it. In the QoS 1 benchmark that shows up as roughly
-  10 % of allocated bytes and one object per delivery. It is worth a dedicated
-  look if QoS 1 delivery volume becomes the bottleneck, because a reused or
-  deadline-queue timer would remove it.
+  and topic strings per packet) and the broker's outbound publish construction
+  (`(*client).writePublishLocked`). The per-publish `LocalTarget` slice of the
+  built-in dispatcher was removed by the throughput work (the public
+  `Broker.LocalTargets` still returns a slice). None of the remaining ones grows
+  with the subscription count.
+- **QoS 1/2 deliveries no longer allocate a timer each.** The connection's
+  `(*client).retransmitLoop` now owns one timer for the life of the connection
+  and is woken only when the earliest retransmission deadline moves; before the
+  throughput work it created a `time.Timer`, rescanned the whole inflight table
+  and woke the loop for every delivery. The sequential QoS 1 benchmark dropped
+  from 2,344 B/op and 19 allocs/op to 1,667 B/op and 13 allocs/op.
 - **QoS 1 costs ~5× a QoS 0 publication.** A QoS 1 publish waits for the PUBACK,
   which the broker hands to the publishing connection's writer goroutine (a
   channel handoff and a goroutine wakeup), not a direct socket write. That
-  handoff, not the routing, is the difference between ~5.9 µs one-way and
-  ~32 µs round trip.
+  handoff, not the routing, is the difference between one-way and round-trip
+  time; coalescing the writer's queue (see below) lowered the round trip but did
+  not remove the handoff.
 - **Fanout scales with the delivery count, not with the publisher.** Per-delivery
-  cost stays at ~2.4–3.0 µs from 10 to 100 subscribers; the publisher's own cost
-  is negligible next to it.
+  cost is ~1.6–1.8 µs from 10 to 100 subscribers after the writer coalescing
+  (it was ~2.4–3.0 µs); the publisher's own cost is negligible next to it.
 - **A retained replay is linear in the retained-store size.** Each join costs
   ~7.6 ms for 1000 retained topics (~7.6 µs per replayed message, including the
   connect, the SUBSCRIBE and the QoS 1 acknowledgements). The broker scans its
   whole retained map on every subscription (`sendRetained`), so both the scan and
   the deliveries grow with the number of retained topics.
+
+## Concurrent throughput (200 connections)
+
+`BenchmarkPublishQoS1` is one publish→deliver round trip at a time, so it reports
+a latency — not the message rate a broker sustains when hundreds of connections
+publish at once. `throughput_test.go` measures that rate. It reproduces the shape
+the reference implementation of this broker family reports (200 publisher
+connections, a fixed 5 s window, a per-second interval throughput in msg/s), so
+the two numbers can be compared, and it adds what that figure does not report:
+the delivered rate and the p50/p99 delivery latency.
+
+### The harness
+
+`TestThroughput` is gated by `GMQX_THROUGHPUT=1`; without it the test skips and
+the normal suite is untouched.
+
+- **Topology.** One broker per case on `127.0.0.1:0`. 200 publisher connections
+  (`GMQX_THROUGHPUT_CLIENTS`), each its own TCP connection, publishing to its own
+  topic `bench/throughput/p<shard>/<publisher>`. 4 subscriber connections
+  (`GMQX_THROUGHPUT_SUBS`); subscriber *s* subscribes to
+  `bench/throughput/p<s>/#`, so the publishers are sharded across the subscribers
+  and every publication is delivered to exactly one of them — no fanout
+  amplification between the published and delivered counts.
+- **Load.** The publishers run flat out for the window (5 s,
+  `GMQX_THROUGHPUT_DURATION`) with no per-message round trip in the loop. At
+  QoS 1/2 each publisher also keeps a bounded pipeline of unconfirmed
+  publications (256, `GMQX_THROUGHPUT_UNACKED`), released per PUBACK/PUBCOMP, so
+  the send rate is not request/response bound.
+- **Closed loop.** A publication enters the harness only when an earlier one was
+  delivered or dropped (a shared pacer, sized to each subscriber's inflight
+  window plus 4096 publications of slack; `GMQX_THROUGHPUT_INFLIGHT` overrides
+  it). Without it, a QoS 0 case fills the kernel's socket buffers —
+  on this machine the write eventually fails with "no buffer space available" —
+  and a QoS 1/2 case buries the broker's bounded inflight queue and measures how
+  fast it drops messages. The closed loop keeps the publisher queue in the
+  publisher, and the per-second samples show the warmup instead of hiding it in
+  an average.
+- **Payload and latency.** Payloads are 64 B and 1 KiB
+  (`GMQX_THROUGHPUT_PAYLOAD`). The first 8 bytes are a per-publisher sequence
+  number, the next 8 the sender's wall clock in Unix nanoseconds; the subscriber
+  computes the delivery latency from that stamp, so p50/p99 cover the whole
+  publish→deliver path inside one process (the same clock).
+- **What is counted.** `published/s` is what the publishers finished writing,
+  `acked/s` the PUBACKs (QoS 1) or PUBCOMPs (QoS 2) they received, `accepted/s`
+  what the broker routed, and `delivered/s` what the subscribers received. The
+  headline deltas are taken between the first and the last sample of the window,
+  so nothing a publisher still holds when the window closes is counted.
+- **Client.** The harness reuses the wire client of `bench_test.go` rather than
+  the `client` package: the client package's delivery goroutine and reconnect
+  machinery would sit in front of the broker at 200 connections. The publisher
+  hot loop writes pre-framed PUBLISHes in batches straight to the socket.
+- **Harness configuration.** Byte-rate shaping is disabled, the outbound inflight
+  window and its queue are widened (256 / 8192) and the write-behind queue is
+  4096 packets, so the number is the broker's throughput and not one of its
+  documented flow-control defaults. Drops are still counted and printed, and
+  every other limit keeps its default.
+
+Run it (from `libs/gmqx`):
+
+```sh
+# Full matrix: QoS 0/1/2 × 64 B / 1 KiB, 200 connections, 5 s each (~35 s).
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v .
+
+# One case (the one profiled below).
+GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
+    go test -run TestThroughput -cpuprofile /tmp/cpu.out \
+    -memprofile /tmp/mem.out .
+go tool pprof -top /tmp/cpu.out
+```
+
+### Result
+
+Same machine as the rest of this document, same command, 200 publisher
+connections, 4 subscriber connections, 5 s window. "Before" is the broker at the
+start of this measurement (the code the sequential baseline above was taken on);
+"after" is the same broker with the changes listed below.
+
+| QoS | payload | | published/s | acked/s | delivered/s | p50 | p99 | drops |
+|---:|---:|---|---:|---:|---:|---:|---:|---|
+| 0 | 64 B | before | 545,441 | — | 350,296 | 40.9 ms | 102.1 ms | 1,040,017 |
+| 0 | 64 B | after | 1,391,076 | — | 1,382,662 | 6.8 ms | 59.1 ms | 45,767 |
+| 0 | 1 KiB | before | 486,631 | — | 343,195 | 46.0 ms | 85.6 ms | 739,026 |
+| 0 | 1 KiB | after | 986,969 | — | 983,664 | 9.9 ms | 87.6 ms | none |
+| 1 | 64 B | before | 145,798 | 145,700 | 140,650 | 115.5 ms | 280.6 ms | 9,067 |
+| 1 | 64 B | after | 627,855 | 627,728 | 617,757 | 24.2 ms | 73.8 ms | 40,358 |
+| 1 | 1 KiB | before | 137,999 | 137,780 | 132,678 | 122.3 ms | 305.6 ms | 10,284 |
+| 1 | 1 KiB | after | 477,730 | 477,476 | 471,028 | 35.0 ms | 94.5 ms | 17,520 |
+| 2 | 64 B | before | 74,792 | 74,376 | 71,126 | 234.3 ms | 479.2 ms | 1,130 |
+| 2 | 64 B | after | 175,380 | 175,126 | 168,885 | 87.4 ms | 242.0 ms | 15,687 |
+| 2 | 1 KiB | before | 71,278 | 71,175 | 67,796 | 230.9 ms | 444.6 ms | none |
+| 2 | 1 KiB | after | 136,881 | 136,707 | 133,032 | 109.7 ms | 329.0 ms | 1,995 |
+
+Run-to-run variance on this machine is real at this load: repeated QoS 0 / 64 B
+runs delivered 350k, 358k and 392k msg/s before, and 1.38M, 1.57M, 1.61M, 1.63M,
+1.70M and 1.76M after; QoS 1 / 64 B delivered 139k, 141k and 143k before, and
+582k, 597k, 618k, 685k, 733k and 749k after. The medians of those runs are
+~358k → ~1.63M msg/s at QoS 0 (≈4.5×) and ~141k → ~617k msg/s at QoS 1 (≈4.4×);
+QoS 2 improved ≈2×. The delivered rate at QoS 1/2 is the *sustained end-to-end*
+rate: the publisher's PUBACK bounds the pipeline, the subscriber's inflight
+window bounds the delivery, and the small `inflight_overflow` count is the
+broker's documented overflow policy for a delivery that finds the bounded queue
+full.
+
+The per-second curve of the profiled case (QoS 1, 64 B, after), which is what the
+harness prints, shows the window is steady rather than a burst:
+
+```
+case qos=1 payload=64B clients=200 subscribers=4 window=5s
+  t         published/s      acked/s   accepted/s  delivered/s
+  t+1.0s         738171       737119       737429       718531
+  t+2.0s         679143       678907       679377       666380
+  t+3.0s         684331       685498       684760       678784
+  t+4.0s         684430       683944       684185       682466
+  t+5.0s         684369       683964       684381       680042
+  total          694090       693887       694027       685241   (p50=21740µs p99=75108µs n=3444572)
+```
+
+### Profile: what the 200-connection load costs
+
+CPU profile of the QoS 1 / 64 B case, same load. Percentages are of the profile's
+total samples (5.7–6.6 cores busy on a 10-core machine — the harness shares the
+process, so its share is included).
+
+Before (the code the sequential baseline was taken on):
+
+| Cost | Share |
+|---|---:|
+| one `write(2)` per packet in the per-connection writer goroutine | 52 % |
+| read + codec decode of the inbound PUBLISH (payload/topic allocation) | 27 % |
+| routing: the per-publish target slice and the wildcard scan | 4.3 % |
+| `windowFullLocked`: a full scan of the inflight map on every delivery | 4.3 % |
+| allocation and GC (`mallocgc`, `scanObject`, `sweep`) | ~8 % |
+
+Allocations were 2.97 GB over the window (594 MB/s), attributed to the codec's
+`decodePublish` (33 %), the typed PUBACK (27 %), the routing target slice and
+merge map (12 %), the pending-delivery slice (10 %) and the codec's body buffer
+(9 %).
+
+After:
+
+| Cost | Share |
+|---|---:|
+| read syscalls and the codec decode | 45 % read, 34 % of it inside the broker's `readMessage`/`Decode` |
+| write syscalls | 37 % total, 17 % in the broker's writer (`flushBatch`), the rest in the harness |
+| the broker's publish → route → deliver path | ~10 % |
+| allocation and GC | ~6 % |
+
+The writer now carries **12.4 packets per write** (measured over the window), so
+the write syscall count is an order of magnitude below one per packet.
+Allocations are still 13.3 GB per 5 s window, but the window delivered 5× more
+messages: per delivered message they are roughly unchanged (~4 KB), dominated by
+the codec's ~400-byte `mqtt.Properties` value embedded in every packet struct and
+by the pending/inflight tables copying it.
+
+**Remaining top costs** (in order):
+
+1. **The inbound read path.** Every publisher frame costs a `read(2)`-backed
+   `bufio` fill plus the codec's decode, which allocates the payload and the
+   topic per packet. This is now the largest single cost and the next lever: a
+   broker-side decoder that reads a PUBLISH body into a reusable buffer would
+   remove the codec's per-packet allocations.
+2. **Allocation of the delivery tables.** A pending or inflight delivery copies
+   the codec's `mqtt.Properties` value (~400 B) even though MQTT 3.1.1 traffic
+   never carries one. A pointer-sized property block cut the bytes by ~45 % but
+   did not move the rate outside the noise band, so it was reverted (see below);
+   pooling `mqtt.Publish`/`inflightMessage` is the remaining option.
+3. **The subscriber connection's mutex.** At 200 publishers over 4 subscribers,
+   `sendPublish` spends most of its wall time waiting on one connection's lock:
+   the mutex profile attributes 116 s of delay over a 3 s window to it. More
+   subscriber shards or fewer publishers per shard scale better; a lock-free
+   per-connection delivery queue is the structural fix.
+4. **QoS 1/2 delivery window.** Per subscriber connection the delivered rate is
+   window / acknowledgement round trip. The harness configures a 256-deep window;
+   at 200 publishers this is the bound, and the ~1 % `inflight_overflow` drops
+   are its documented overflow.
+
+### What changed, and what each change was worth
+
+Each change kept `go test -race ./...` green and the documented semantics
+(bounded queues, no dropped QoS 1/2 message, FIFO ordering, one writer goroutine
+per connection).
+
+| Change | Measured effect |
+|---|---|
+| **Coalesced writes.** The writer goroutine drains the packets already queued and writes them with one `write(2)`, up to 64 packets / 64 KiB, under the same write deadline and in the same queue order. | QoS 0 delivered 247k → 1.37M msg/s (5.5×); QoS 1 acknowledged 486k → 639k (+31 %), measured with the harness of that step. |
+| **O(1) inflight window.** `windowFullLocked`/`receiveMaximumFullLocked` read counters maintained with the inflight map instead of scanning the map on every delivery — the scan ran under the connection lock 200 publishers share. | QoS 1 acknowledged 639k → 1.59M msg/s (+148 %); delivered 22k → 80k (3.6×), same harness. |
+| **Compact acknowledgements.** A PUBACK/PUBREC/PUBREL/PUBCOMP with a zero reason code and no properties travels as its packet id: the writer builds the four-byte frame, no typed packet and no allocation. | The PUBACK path was 2.52 GB (27 %) of the window's allocations before and is ~0 after; no throughput change outside the noise band once the window scan was gone. |
+| **Reused retransmission timer.** One timer per connection, reset only when the earliest retransmission deadline moves; a delivery no longer wakes the loop, scans the whole inflight table and allocates a `time.Timer`. | No throughput change outside the noise band (79.7k → 80k delivered in the harness of that step), but it removes one timer allocation and one whole-table scan per delivery, both under the connection lock. |
+| **No routing allocation.** The built-in dispatcher collects targets into a stack array instead of a new slice per publish, and a topic that matches exactly one wildcard filter skips the per-session merge map. The targets are still collected under the index read lock and delivered after it is released (a delivery can close a connection and unregister its session, which takes that lock for writing). | Routing's share of CPU fell 4.3 % → 0.7 %; its allocation 1.15 GB → 0.1 % of the profile. `BenchmarkLocalTargets` is unchanged (the public `LocalTargets` still returns a slice, one allocation); `BenchmarkFanout/subscribers=100` went 345 µs → 203 µs (41 %) from the coalesced writes. |
+
+The sequential benchmarks changed in allocations, which are reproducible, while
+their `ns/op` stayed inside the run-to-run noise this machine shows (the same
+documented 30 % band, up to 2× for fanout). Two paired before/after runs of
+`go test -run '^$' -bench 'PublishQoS|Fanout' -benchtime=2s` gave:
+
+| Benchmark | before | after |
+|---|---|---|
+| `BenchmarkPublishQoS0` | 1,024 B/op, 9–10 allocs/op | 928 B/op, 8–9 allocs/op |
+| `BenchmarkPublishQoS1` | 2,344 B/op, 19 allocs/op | 1,667 B/op, 13 allocs/op |
+| `BenchmarkClientPublishQoS1` | 3,800 B/op, 28 allocs/op | 3,121 B/op, 22 allocs/op |
+| `BenchmarkFanout/subscribers=10` | 59.5 µs and 20.7 µs | 32.3 µs and 18.0 µs |
+| `BenchmarkFanout/subscribers=100` | 345.3 µs and 265.2 µs | 203.3 µs and 121.3 µs |
+
+The fanout case improved in every pair (the coalesced writes are one write per
+subscriber batch instead of one per delivery); the single-publisher cases moved
+by less than the noise, and `BenchmarkClientPublishQoS1` — one request/response
+round trip — is flat. The concurrent harness is where the changes are visible:
+200 connections publish continuously, so a per-packet write or a per-delivery
+map scan is paid millions of times per second instead of once per `ns/op`.
+
+Tried, measured and reverted or rejected:
+
+- **Pointer-sized property block in the pending queue.** The pending table's
+  allocations (5.7 GB over the window) are dominated by copying the codec's
+  ~400-byte `mqtt.Properties` value into every queued delivery; making it a
+  pointer removed that copy. The delivered rate moved only inside the ±10 %
+  run-to-run noise, so it was reverted rather than kept as extra complexity.
+- **Direct write of tiny control packets from the reader goroutine.** Measured
+  packets-per-write after coalescing is 12.4, so a direct PUBACK write would turn
+  one write per 12 acknowledgements into one write per acknowledgement (an order
+  of magnitude more syscalls) and would break the documented single-writer FIFO
+  order. Not adopted.
+- **`jumbo` batches / larger write batch.** No additional effect beyond the
+  64-packet / 64 KiB bound already in place; the average batch is 12.4 packets.
+- **More subscriber shards.** 8 and 50 subscriber connections on the same 200
+  publishers do not raise the delivered total (the machine is syscall- and
+  lock-bound); 4 is kept as the default and matches the sharded topic space.
+
+One defect was found by the harness while doing this and fixed before the
+numbers above: the batch drain loop treated a compact acknowledgement (whose
+`msg` field is nil) as "queue empty" and silently dropped it, which showed up as
+a QoS 1 publisher pipeline that filled up and stalled.
+
+### Limits of the concurrent numbers
+
+The same limits as the rest of this document apply, plus two specific to this
+harness: the load generator and the broker share this process's CPUs (the
+reference figure is measured the same way), and the number depends on the
+subscriber shard count and on the harness's widened flow-control windows, both
+documented above. It is a single-machine, loopback, one-process capacity reading
+— comparable to the reference's figure for the same reason (200 concurrent
+publisher connections, a fixed sampling window, msg/s) and comparable across
+versions of this broker for the same harness — not a deployment guarantee.
 
 ## Soak test
 
@@ -242,6 +497,14 @@ go test -run '^$' -bench . -benchtime=2s ./...
 # A single case, with a CPU profile.
 go test -run '^$' -bench 'BenchmarkPublishQoS1$' -benchtime=2s \
     -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out .
+go tool pprof -top /tmp/cpu.out
+
+# The concurrent throughput matrix (200 connections, 5 s per case).
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v .
+
+# One throughput case with CPU and heap profiles.
+GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
+    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out .
 go tool pprof -top /tmp/cpu.out
 
 # The soak test (10 s by default).

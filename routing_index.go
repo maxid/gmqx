@@ -230,16 +230,53 @@ func (idx *subscriptionIndex) session(key string) (*indexedSession, bool) {
 	return s, ok
 }
 
-// targets returns one LocalTarget per local session matching topic, with the
-// publication's QoS capped by the highest matching subscription QoS and the retain
-// flag set only for a retained publication delivered to a subscription with
-// retain-as-published. A no-local subscription is skipped when the publication was
-// produced by the same connection; a session that also matches through another
-// filter is still a target.
-//
-// Shared subscriptions are not part of this answer: they are groups, and one
-// publication goes to exactly one member of each, which sharedTarget decides.
+// targets returns one LocalTarget per local session matching topic. It is the
+// slice form of the answer, for callers that need to keep or count the targets
+// (the Broker.LocalTargets seam); the broker's own dispatcher uses eachTarget so
+// a publication does not allocate a slice.
 func (idx *subscriptionIndex) targets(topic string, from ConnectionID, pubQoS byte, pubRetain bool) []LocalTarget {
+	return idx.collectTargets(topic, from, pubQoS, pubRetain, nil)
+}
+
+// eachTarget hands every session whose subscriptions match topic to fn, with the
+// per-session QoS cap and retain flag already applied and no-local subscriptions
+// of the publishing connection excluded.
+//
+// The targets are collected under the index lock and then handed to fn with the
+// lock released: fn delivers a publication, and a delivery can close a
+// connection, which unregisters its session and takes the index for writing — a
+// callback under the lock would deadlock against exactly that teardown.
+//
+// The common case of a handful of matching sessions is collected into a stack
+// array, so the broker's own dispatcher does not allocate a target slice per
+// publication.
+func (idx *subscriptionIndex) eachTarget(topic string, from ConnectionID, pubQoS byte, pubRetain bool, fn func(LocalTarget)) {
+	var local [4]LocalTarget
+	targets := idx.collectTargets(topic, from, pubQoS, pubRetain, local[:0])
+	for i := range targets {
+		fn(targets[i])
+	}
+}
+
+// collectTargets appends the sessions whose subscriptions match topic to dst and
+// returns the result. The caller owns dst and may pass a stack array; only a
+// match set larger than its capacity allocates.
+//
+// One LocalTarget per local session matching topic: its QoS is capped by the
+// highest matching subscription QoS and its retain flag is set only for a
+// retained publication delivered to a subscription with retain-as-published. A
+// no-local subscription is skipped when the publication was produced by the same
+// connection; a session that also matches through another filter is still a
+// target. Shared subscriptions are not part of this answer: they are groups, and
+// one publication goes to exactly one member of each, which sharedTarget decides.
+//
+// The fast path — a literal topic and no wildcard filter in the index — is one
+// map lookup plus one target per session. When wildcard filters exist they are
+// matched one by one; a topic that matches exactly one of them (the normal case
+// for a wildcard space that is sharded per subscriber, which is how the
+// throughput harness of this repository publishes) is delivered without the
+// merge map a multi-filter match needs.
+func (idx *subscriptionIndex) collectTargets(topic string, from ConnectionID, pubQoS byte, pubRetain bool, dst []LocalTarget) []LocalTarget {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
@@ -248,23 +285,29 @@ func (idx *subscriptionIndex) targets(topic string, from ConnectionID, pubQoS by
 	if len(idx.wildcard) == 0 {
 		// Fast path: a literal filter is the only way to match a literal topic, so
 		// every session in the bucket appears exactly once.
-		if len(exact) == 0 {
-			return nil
-		}
-		targets := make([]LocalTarget, 0, len(exact))
-		for _, rs := range exact {
-			if from != "" && rs.sub.noLocal && rs.session.connID == from {
-				continue
-			}
-			if target, ok := rs.session.localTarget(now, pubQoS, pubRetain, rs.sub.qos, rs.sub.retainAsPublished, rs.sub.subscriptionIDs); ok {
-				targets = append(targets, target)
-			}
-		}
-		return targets
+		return idx.appendEntries(dst, now, exact, from, pubQoS, pubRetain)
 	}
 
-	// General path: a session can be reached through the exact filter and through
-	// any number of wildcard filters, so the matches are merged per session.
+	// Which buckets match at all. A session can be reached through the exact
+	// filter and through any number of wildcard filters, so more than one matching
+	// bucket has to be merged per session; the common single-bucket case does not.
+	var local [2]map[string]*routedSubscription
+	matches := local[:0]
+	if len(exact) > 0 {
+		matches = append(matches, exact)
+	}
+	for filter, entries := range idx.wildcard {
+		if matchTopic(filter, topic) {
+			matches = append(matches, entries)
+		}
+	}
+	if len(matches) == 0 {
+		return dst
+	}
+	if len(matches) == 1 {
+		return idx.appendEntries(dst, now, matches[0], from, pubQoS, pubRetain)
+	}
+
 	type match struct {
 		session *indexedSession
 		qos     byte
@@ -272,7 +315,7 @@ func (idx *subscriptionIndex) targets(topic string, from ConnectionID, pubQoS by
 		ids     []uint32
 	}
 	matched := make(map[string]*match, len(exact)+4)
-	merge := func(entries map[string]*routedSubscription) {
+	for _, entries := range matches {
 		for _, rs := range entries {
 			// A stored session has no connection, so no-local cannot name one and
 			// never excludes an offline target; a publication without an origin
@@ -294,22 +337,26 @@ func (idx *subscriptionIndex) targets(topic string, from ConnectionID, pubQoS by
 			m.ids = mergeSubscriptionIDs(m.ids, rs.sub.subscriptionIDs)
 		}
 	}
-	merge(exact)
-	for filter, entries := range idx.wildcard {
-		if matchTopic(filter, topic) {
-			merge(entries)
-		}
-	}
-	if len(matched) == 0 {
-		return nil
-	}
-	targets := make([]LocalTarget, 0, len(matched))
 	for _, m := range matched {
 		if target, ok := m.session.localTarget(now, pubQoS, pubRetain, m.qos, m.rap, m.ids); ok {
-			targets = append(targets, target)
+			dst = append(dst, target)
 		}
 	}
-	return targets
+	return dst
+}
+
+// appendEntries appends one bucket of the index, whose sessions all match the
+// same topic, to dst. The caller holds idx.mu for reading.
+func (idx *subscriptionIndex) appendEntries(dst []LocalTarget, now time.Time, entries map[string]*routedSubscription, from ConnectionID, pubQoS byte, pubRetain bool) []LocalTarget {
+	for _, rs := range entries {
+		if from != "" && rs.sub.noLocal && rs.session.connID == from {
+			continue
+		}
+		if target, ok := rs.session.localTarget(now, pubQoS, pubRetain, rs.sub.qos, rs.sub.retainAsPublished, rs.sub.subscriptionIDs); ok {
+			dst = append(dst, target)
+		}
+	}
+	return dst
 }
 
 // sharedGroups returns the keys of the live shared subscription groups whose
