@@ -9,9 +9,12 @@ type ConnectInfo struct {
 	Password     []byte
 	KeepAlive    uint16
 	CleanSession bool
-	WillTopic    string
-	WillPayload  []byte
-	RemoteAddr   string
+	// SessionExpiry is the MQTT 5 Session Expiry Interval in seconds. It is
+	// zero for MQTT 3.1.1 and for MQTT 5 clients that omit the property.
+	SessionExpiry uint32
+	WillTopic     string
+	WillPayload   []byte
+	RemoteAddr    string
 }
 
 // AuthManager validates a connecting client.

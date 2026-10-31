@@ -5,6 +5,42 @@
 
 ## [Unreleased]
 
+- **Protocol conformance fixes (MQTT 3.1.1 / 5).** A wire-level conformance suite
+  (`TestConformance`, `mqtt_conformance_test.go` and
+  `mqtt_conformance_v5_test.go`) walks the MQTT 3.1.1 and MQTT 5 feature matrix
+  against a real in-process broker. It exposed the following defects, fixed
+  here; the cases that hit a documented limitation skip with a reason instead.
+
+  *Persistent sessions.* A CONNECT with Clean Session (MQTT 5: Clean Start)
+  cleared now restores the stored subscriptions and answers Session Present; a
+  clean CONNECT discards the stored session. MQTT 5 sessions are stored when the
+  CONNECT carries a non-zero Session Expiry Interval. Timed expiry is still open
+  (see ROADMAP.md).
+
+  *Will fidelity.* A will is published with its configured QoS, RETAIN flag and
+  its PUBLISH-valid properties instead of QoS 0 without either flag. An invalid
+  will topic rejects the CONNECT (CONNACK 0x90 on MQTT 5, close on 3.1.1), and
+  an MQTT 5 DISCONNECT with reason 0x04 publishes the will.
+
+  *Subscription QoS is a maximum.* A delivery uses
+  `min(publication QoS, highest matching subscription QoS)`, so a QoS 1
+  publication no longer reaches a QoS 0 subscription as QoS 1.
+
+  *QoS 2 duplicate suppression.* A retransmitted QoS 2 PUBLISH (same packet id,
+  DUP set) is answered with PUBREC again but delivered once; PUBREL frees the
+  packet id for reuse.
+
+  *Topic rules.* A PUBLISH topic name must be non-empty and free of wildcards;
+  invalid topic filters are rejected (SUBACK 0x8F on MQTT 5, connection close on
+  3.1.1); and a leading `#`/`+` no longer matches reserved `$` topics.
+
+  *MQTT 5 error reporting.* Protocol errors now end the connection with a
+  DISCONNECT carrying the matching reason code: 0x81 malformed packet, 0x82
+  protocol error (empty topic without an alias), 0x90 topic name invalid, 0x94
+  topic alias invalid and 0x95 packet too large. MQTT 3.1.1 closes instead, as
+  it has no server DISCONNECT.
+
+
 - **Cluster: retained replication and node id ownership.** Two defects in the
   shared cluster path are fixed.
 

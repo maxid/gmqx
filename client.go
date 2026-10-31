@@ -32,19 +32,22 @@ type client struct {
 	r      *bufio.Reader
 	wmu    sync.Mutex
 
-	mu           sync.Mutex
-	id           string
-	info         ConnectInfo
-	subs         map[string]subscription
-	keepAlive    time.Duration
-	closed       bool
-	closeErr     error
-	will         *retainedMessage
-	username     string
-	registered   bool
-	lost         bool
-	topicAliases map[uint16]string
-	outPID       uint16
+	mu             sync.Mutex
+	id             string
+	info           ConnectInfo
+	subs           map[string]subscription
+	keepAlive      time.Duration
+	closed         bool
+	closeErr       error
+	will           *mqtt.Will
+	username       string
+	registered     bool
+	lost           bool
+	superseded     bool
+	sessionPresent bool
+	inboundQoS2    map[uint16]struct{}
+	topicAliases   map[uint16]string
+	outPID         uint16
 
 	// version is the protocol level of the connection: mqtt.Version311 or
 	// mqtt.Version5. MQTT 3.1 clients decode and encode with the 3.1.1 layout,
@@ -59,10 +62,30 @@ func newClient(b *Broker, conn net.Conn) *client {
 		conn:         conn,
 		r:            bufio.NewReaderSize(conn, 4096),
 		subs:         make(map[string]subscription),
+		inboundQoS2:  make(map[uint16]struct{}),
 		topicAliases: make(map[uint16]string),
 		version:      mqtt.Version311,
 	}
 }
+
+// persistentSession reports whether the session state survives the connection.
+// MQTT 3.1.1 keys it off Clean Session; MQTT 5 keys it off Clean Start plus a
+// non-zero Session Expiry Interval (the absent property means 0, so the session
+// ends with the connection).
+func (c *client) persistentSession() bool {
+	if c.info.CleanSession {
+		return false
+	}
+	if c.version == mqtt.Version5 {
+		return c.info.SessionExpiry > 0
+	}
+	return true
+}
+
+// resumesSession reports whether a CONNECT asks to resume existing state. A
+// zero Session Expiry Interval does not prevent resuming: it only means the
+// session ends again when this connection closes.
+func (c *client) resumesSession() bool { return !c.info.CleanSession }
 
 // header is the protocol level every packet this client sends carries.
 func (c *client) header() mqtt.MessageHeader {
@@ -144,11 +167,12 @@ func connectError(err error) error {
 // connectInfo maps a decoded CONNECT onto the public ConnectInfo the SPI sees.
 func connectInfo(m *mqtt.Connect) ConnectInfo {
 	info := ConnectInfo{
-		ClientID:     string(m.ClientID),
-		Username:     string(m.Username),
-		Password:     m.Password,
-		KeepAlive:    m.KeepAlive,
-		CleanSession: m.CleanSession,
+		ClientID:      string(m.ClientID),
+		Username:      string(m.Username),
+		Password:      m.Password,
+		KeepAlive:     m.KeepAlive,
+		CleanSession:  m.CleanSession,
+		SessionExpiry: m.Properties.SessionExpiryInterval,
 	}
 	if m.Will != nil {
 		info.WillTopic = m.Will.Topic
@@ -182,13 +206,24 @@ func (c *client) handshake() error {
 		_ = c.writeConnack(connackClientIDInvalid(c.version), "")
 		return fmt.Errorf("%w: MQTT 3.1 client id exceeds 23 characters", ErrMalformedPacket)
 	}
+	if connect.Will != nil && !validTopic(connect.Will.Topic) {
+		// A will topic is a topic name: no wildcards and not empty. MQTT 5 can
+		// name the reason; MQTT 3.1.1 has no return code for it, so the
+		// malformed CONNECT just closes the connection.
+		if c.version == mqtt.Version5 {
+			_ = c.writeConnack(connackTopicNameInvalid(c.version), "")
+		}
+		return fmt.Errorf("%w: invalid will topic %q", ErrMalformedPacket, connect.Will.Topic)
+	}
 	c.mu.Lock()
 	c.id = info.ClientID
 	c.info = info
 	c.keepAlive = time.Duration(info.KeepAlive) * time.Second
 	c.username = info.Username
-	if info.WillTopic != "" {
-		c.will = &retainedMessage{topic: info.WillTopic, payload: info.WillPayload}
+	if connect.Will != nil {
+		will := *connect.Will
+		will.Payload = append([]byte(nil), connect.Will.Payload...)
+		c.will = &will
 	}
 	c.mu.Unlock()
 	if err := c.broker.register(c); err != nil {
@@ -223,6 +258,7 @@ func (c *client) loop() {
 			c.mu.Lock()
 			c.lost = true
 			c.mu.Unlock()
+			c.failProtocol(err)
 			c.close(true)
 			return
 		}
@@ -241,11 +277,16 @@ func (c *client) loop() {
 				c.broker.cfg.Sink.OnPing(context.Background(), c.id)
 			}
 		case *mqtt.Disconnect:
+			// A DISCONNECT with reason code 0x04 asks the server to publish the
+			// will even though the disconnect itself is orderly.
+			withWill := c.version == mqtt.Version5 && m.ReasonCode == 0x04
 			c.mu.Lock()
-			c.will = nil
+			if !withWill {
+				c.will = nil
+			}
 			c.lost = false
 			c.mu.Unlock()
-			c.close(false)
+			c.close(withWill)
 			return
 		default:
 			c.broker.log.Debug("gmqx ignoring packet type", "type", msg.Type())
@@ -253,9 +294,44 @@ func (c *client) loop() {
 	}
 }
 
+// failProtocol tells an MQTT 5 client why the connection is being closed. An
+// MQTT 3.1.1 client cannot be told: the protocol has no server DISCONNECT, so
+// the connection is simply closed. Transport errors (a closed connection or an
+// expired keep-alive deadline) are not protocol errors and stay silent.
+func (c *client) failProtocol(err error) {
+	if c.version != mqtt.Version5 {
+		return
+	}
+	if !errors.Is(err, mqtt.ErrMalformedPacket) {
+		return
+	}
+	reason := byte(0x81) // Malformed Packet
+	if wire.KindOf(err) == wire.KindTooLarge {
+		reason = 0x95 // Packet too large
+	}
+	c.sendDisconnect(reason)
+}
+
+// protocolError answers an MQTT 5 protocol violation with a DISCONNECT and ends
+// the connection. MQTT 3.1.1 closes the connection without a packet.
+func (c *client) protocolError(reason byte) {
+	if c.version == mqtt.Version5 {
+		c.sendDisconnect(reason)
+	}
+	c.close(true)
+}
+
+func (c *client) sendDisconnect(reason byte) {
+	_ = c.writeMessage(&mqtt.Disconnect{MessageHeader: c.header(), ReasonCode: reason})
+}
+
 // handlePubrel releases an inbound QoS 2 publish: the client waits for the
-// PUBCOMP before it reuses the packet id.
+// PUBCOMP before it reuses the packet id. Completing the flow forgets the packet
+// id, so the next PUBLISH that reuses it is delivered as a new message.
 func (c *client) handlePubrel(m *mqtt.Pubrel) {
+	c.mu.Lock()
+	delete(c.inboundQoS2, m.PacketID)
+	c.mu.Unlock()
 	_ = c.writeMessage(&mqtt.Pubcomp{MessageHeader: c.header(), PacketID: m.PacketID})
 }
 
@@ -269,12 +345,19 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 	props.SubscriptionIdentifiers = nil
 	var wireProps []byte
 	if c.version == mqtt.Version5 {
+		if alias > topicAliasMaximum {
+			// The alias is above the Topic Alias Maximum this broker advertised.
+			c.protocolError(0x94)
+			return
+		}
 		if topic == "" {
 			if alias == 0 {
+				c.protocolError(0x82) // empty topic and no alias to resolve
 				return
 			}
 			resolved, ok := c.topicAliases[alias]
 			if !ok {
+				c.protocolError(0x82) // alias that was never created
 				return
 			}
 			topic = resolved
@@ -283,11 +366,26 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 		}
 		var err error
 		if wireProps, err = encodePropertyBlock(props); err != nil {
+			c.protocolError(0x81)
 			return
 		}
 	}
 	if !validTopic(topic) {
+		// Empty or wildcard topic name in a PUBLISH is a protocol violation.
+		c.protocolError(0x90)
 		return
+	}
+	if m.QoS == 2 {
+		// A retransmitted QoS 2 PUBLISH while the first one is still pending
+		// (publisher waiting for PUBREL) must be acknowledged again but not
+		// delivered again.
+		c.mu.Lock()
+		_, pending := c.inboundQoS2[m.PacketID]
+		c.mu.Unlock()
+		if pending {
+			_ = c.writePublishAck(2, m.PacketID, 0)
+			return
+		}
 	}
 	res := c.broker.publish(c, PublishEvent{
 		ConnectionID: c.connID,
@@ -300,7 +398,14 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 		Properties:   wireProps,
 	}, props)
 	switch m.QoS {
-	case 1, 2:
+	case 1:
+		c.ackPublish(m.QoS, m.PacketID, res)
+	case 2:
+		if res.Accepted() {
+			c.mu.Lock()
+			c.inboundQoS2[m.PacketID] = struct{}{}
+			c.mu.Unlock()
+		}
 		c.ackPublish(m.QoS, m.PacketID, res)
 	}
 }
@@ -309,15 +414,24 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 	codes := make([]byte, 0, len(m.Subscriptions))
 	existed := make([]bool, 0, len(m.Subscriptions))
 	for _, req := range m.Subscriptions {
+		if !validFilter(req.Filter) {
+			// MQTT 3.1.1 has no per-filter rejection code for a malformed
+			// filter, so the protocol violation closes the connection. MQTT 5
+			// answers it with Topic Filter invalid and keeps the session.
+			if c.version != mqtt.Version5 {
+				c.protocolError(0)
+				return
+			}
+			codes = append(codes, 0x8f)
+			existed = append(existed, false)
+			continue
+		}
 		code, had := c.broker.subscribe(c, req.Filter, subscription{
 			qos:               req.QoS,
 			noLocal:           req.NoLocal,
 			retainAsPublished: req.RetainAsPublished,
 			retainHandling:    req.RetainHandling,
 		})
-		if c.version == mqtt.Version5 && code == 0x80 {
-			code = 0x87
-		}
 		codes = append(codes, code)
 		existed = append(existed, had)
 	}
@@ -327,7 +441,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 		ReasonCodes:   codes,
 	})
 	for i, req := range m.Subscriptions {
-		if codes[i] == 0x80 || codes[i] == 0x87 {
+		if codes[i] > 2 { // 0, 1 and 2 are the granted QoS values
 			continue
 		}
 		if req.RetainHandling == 2 || (req.RetainHandling == 1 && existed[i]) {
@@ -357,6 +471,10 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 	if qos > 0 {
 		c.mu.Lock()
 		c.outPID++
+		if c.outPID == 0 {
+			// Packet id 0 is not a valid identifier.
+			c.outPID = 1
+		}
 		pid = c.outPID
 		c.mu.Unlock()
 	}
@@ -373,6 +491,9 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 
 func (c *client) writeConnack(code byte, assignedClientID string) error {
 	ack := &mqtt.Connack{MessageHeader: c.header(), ReasonCode: code}
+	if code == 0 {
+		ack.SessionPresent = c.sessionPresent
+	}
 	if c.version == mqtt.Version5 && code == 0 {
 		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize))
 	}
@@ -393,7 +514,34 @@ func (c *client) close(withWill bool) {
 	c.mu.Unlock()
 	_ = c.conn.Close()
 	if will != nil && c.broker != nil {
-		_ = c.broker.publish(c, PublishEvent{Topic: will.topic, Payload: will.payload}, mqtt.Properties{})
+		props := willPublishProperties(will.Properties)
+		wireProps, err := encodePropertyBlock(props)
+		if err != nil {
+			// A will whose properties do not belong on a PUBLISH is published
+			// without them rather than not at all.
+			props, wireProps = mqtt.Properties{}, nil
+		}
+		_ = c.broker.publish(c, PublishEvent{
+			Topic:      will.Topic,
+			Payload:    will.Payload,
+			QoS:        will.QoS,
+			Retain:     will.Retain,
+			Properties: wireProps,
+		}, props)
+	}
+}
+
+// willPublishProperties maps the will property block onto the PUBLISH properties
+// the will message carries when it is published. Will Delay Interval is not a
+// PUBLISH property: gmqx publishes the will as soon as the connection ends.
+func willPublishProperties(p mqtt.Properties) mqtt.Properties {
+	return mqtt.Properties{
+		PayloadFormat:         p.PayloadFormat,
+		MessageExpiryInterval: p.MessageExpiryInterval,
+		ContentType:           p.ContentType,
+		ResponseTopic:         p.ResponseTopic,
+		CorrelationData:       p.CorrelationData,
+		UserProperties:        p.UserProperties,
 	}
 }
 
@@ -402,6 +550,13 @@ func connackNotAuthorized(version byte) byte {
 		return 0x87
 	}
 	return 5
+}
+
+func connackTopicNameInvalid(version byte) byte {
+	if version == mqtt.Version5 {
+		return 0x90
+	}
+	return 2
 }
 
 func connackClientIDInvalid(version byte) byte {

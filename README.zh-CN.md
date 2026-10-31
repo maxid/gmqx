@@ -12,10 +12,15 @@
 
 - TCP、TLS、WebSocket 与 WSS 上的 MQTT 3.1、3.1.1 及基础 MQTT 5
 - CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、PING、DISCONNECT
+- 持久会话（Clean Session / Clean Start、Session Present）；持久会话的订阅在断连后保留，
+  clean 连接丢弃它们
 - MQTT 5：CONNACK 能力属性、Topic Alias、User Property 转发、
-  订阅选项（no-local / retain-as-published / retain-handling）、原因码
-- QoS 0/1 基本流程与 QoS 2 握手
-- 保留消息、通配符订阅（`+`/`#`）、遗嘱消息、keepalive
+  订阅选项（no-local / retain-as-published / retain-handling）、原因码，
+  以及协议错误时的 DISCONNECT
+- QoS 0/1 流程（按订阅 QoS 降级）与抑制入站重复的 QoS 2 握手（broker 侧重传与
+  inflight 限制仍在路线图上）
+- 保留消息、通配符订阅（`+`/`#`）、带 QoS/retain/属性的遗嘱消息、keepalive
+- 线级 MQTT 3.1.1/5 一致性测试套件（`TestConformance`）
 - 可插拔钩子：`AuthManager`、`AclManager`、`EventSink`（生命周期/消息）、
   `MetricsManager`、`Interceptor`
 - 连接模式：`UNIQUE` / `KICK`（client id 接管）

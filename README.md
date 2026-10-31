@@ -12,10 +12,18 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
 - MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
+- Persistent sessions (Clean Session / Clean Start, Session Present); the
+  subscriptions of a persistent session survive a disconnect and a clean
+  connection discards them
 - MQTT 5: CONNACK capability properties, Topic Alias, User Property forwarding,
-  subscription options (no-local / retain-as-published / retain-handling), reason codes
-- QoS 0/1 basic flows and QoS 2 handshake
-- Retained messages, wildcard subscriptions (`+`/`#`), will messages, keepalive
+  subscription options (no-local / retain-as-published / retain-handling), reason
+  codes and DISCONNECT on protocol errors
+- QoS 0/1 flows with per-subscription QoS capping and a QoS 2 handshake that
+  suppresses inbound duplicates (broker-side retransmission and inflight limits
+  are still on the roadmap)
+- Retained messages, wildcard subscriptions (`+`/`#`), will messages with their
+  QoS, retain flag and properties, keepalive
+- Wire-level MQTT 3.1.1/5 conformance suite (`TestConformance`)
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
   `MetricsManager`, `Interceptor`
 - Connect modes: `UNIQUE` / `KICK` (client id takeover)

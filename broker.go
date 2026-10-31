@@ -30,6 +30,7 @@ type Broker struct {
 
 	mu       sync.RWMutex
 	clients  map[string]*client
+	sessions map[string]*session
 	retained map[string]retainedMessage
 	servers  []*gnety.Server
 	addrs    map[string]string
@@ -43,6 +44,25 @@ type retainedMessage struct {
 	payload []byte
 	qos     byte
 	props   mqtt.Properties
+}
+
+// session is the state a persistent session keeps while no connection owns it:
+// the subscriptions the client asked the server to remember. A reconnecting
+// client with the clean-session (MQTT 5: clean start) flag cleared resumes it and
+// the CONNACK reports Session Present.
+type session struct {
+	subs map[string]subscription
+}
+
+func copySubscriptions(subs map[string]subscription) map[string]subscription {
+	if len(subs) == 0 {
+		return nil
+	}
+	out := make(map[string]subscription, len(subs))
+	for filter, sub := range subs {
+		out[filter] = sub
+	}
+	return out
 }
 
 // New creates a Broker. Start must be called to listen.
@@ -87,6 +107,7 @@ func New(cfg Config) (*Broker, error) {
 		log:      logger,
 		metrics:  cfg.Metrics,
 		clients:  make(map[string]*client),
+		sessions: make(map[string]*session),
 		retained: make(map[string]retainedMessage),
 		addrs:    make(map[string]string),
 		done:     make(chan struct{}),
@@ -341,15 +362,32 @@ func (b *Broker) serve(conn net.Conn) {
 }
 
 // register enforces connect mode and connection limits, then records the
-// session and calls the dispatcher.
+// session and calls the dispatcher. A persistent session (clean session / clean
+// start cleared) is restored here: the stored subscriptions become the new
+// connection's subscriptions and the CONNACK that follows reports Session
+// Present. A clean connection discards any stored session.
 func (b *Broker) register(c *client) error {
 	b.mu.Lock()
+	var takeover map[string]subscription
 	if old, ok := b.clients[c.id]; ok && old != c {
 		if b.cfg.ConnectMode == ConnectModeUnique {
 			b.mu.Unlock()
 			return ErrClientIDInUse
 		}
 		delete(b.clients, c.id)
+		// In KICK mode the replacement takes the old session over. The old
+		// connection must neither save that state again nor erase the new
+		// session when its own serve goroutine unwinds.
+		old.mu.Lock()
+		old.superseded = true
+		if old.persistentSession() {
+			if stored, ok := b.sessions[c.id]; ok {
+				takeover = copySubscriptions(stored.subs)
+			} else {
+				takeover = copySubscriptions(old.subs)
+			}
+		}
+		old.mu.Unlock()
 		b.mu.Unlock()
 		old.close(false)
 		b.mu.Lock()
@@ -358,10 +396,26 @@ func (b *Broker) register(c *client) error {
 		b.mu.Unlock()
 		return ErrMaxConnections
 	}
+
+	if c.resumesSession() {
+		if stored, ok := b.sessions[c.id]; ok {
+			c.subs = copySubscriptions(stored.subs)
+			c.sessionPresent = true
+		} else if takeover != nil {
+			c.subs = takeover
+			c.sessionPresent = true
+		}
+	} else {
+		delete(b.sessions, c.id)
+	}
+
 	b.clients[c.id] = c
 	c.registered = true
 	n := len(b.clients)
 	b.mu.Unlock()
+	if len(c.subs) > 0 {
+		b.subscriptionsChanged()
+	}
 
 	// KICK mode: tell peer nodes to drop any session with the same client id.
 	// This makes client-id takeover work across nodes, not just locally.
@@ -387,11 +441,17 @@ func (b *Broker) unregister(c *client) {
 		delete(b.clients, c.id)
 	}
 	n := len(b.clients)
-	b.mu.Unlock()
-
 	c.mu.Lock()
 	hadSubscriptions := len(c.subs) > 0
+	if !c.superseded {
+		if c.persistentSession() {
+			b.sessions[c.id] = &session{subs: copySubscriptions(c.subs)}
+		} else {
+			delete(b.sessions, c.id)
+		}
+	}
 	c.mu.Unlock()
+	b.mu.Unlock()
 
 	b.metrics.DecrementConnections()
 	b.metrics.IncrementDisconnectEvents()
@@ -412,14 +472,14 @@ func (b *Broker) unregister(c *client) {
 func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bool) {
 	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
 		b.metrics.RecordDroppedMessage("acl_subscribe")
-		return 0x80, false
+		return subscribeFailure(c.version, 0x87), false
 	}
 	c.mu.Lock()
 	_, exists := c.subs[filter]
 	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions && !exists {
 		c.mu.Unlock()
 		b.metrics.RecordDroppedMessage("max_subscriptions")
-		return 0x80, exists
+		return subscribeFailure(c.version, 0x97), exists
 	}
 	c.subs[filter] = sub
 	c.mu.Unlock()
@@ -428,6 +488,16 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 		b.subscriptionsChanged()
 	}
 	return sub.qos, exists
+}
+
+// subscribeFailure maps a subscription refusal onto the protocol level: MQTT 5
+// names the reason (0x87 not authorized, 0x97 quota exceeded), while MQTT 3.1.1
+// has the single 0x80 failure code.
+func subscribeFailure(version, reason byte) byte {
+	if version == mqtt.Version5 {
+		return reason
+	}
+	return 0x80
 }
 
 func (b *Broker) unsubscribe(c *client, filter string) {
@@ -579,6 +649,7 @@ func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *clie
 	b.mu.RLock()
 	type target struct {
 		client *client
+		qos    byte
 		rap    bool
 	}
 	targets := make([]target, 0)
@@ -586,6 +657,7 @@ func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *clie
 		c.mu.Lock()
 		found := false
 		rap := false
+		var maxQoS byte
 		for filter, sub := range c.subs {
 			if !matchTopic(filter, topic) {
 				continue
@@ -594,13 +666,18 @@ func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *clie
 				continue
 			}
 			found = true
+			if sub.qos > maxQoS {
+				maxQoS = sub.qos
+			}
 			if sub.retainAsPublished {
 				rap = true
 			}
 		}
 		c.mu.Unlock()
 		if found {
-			targets = append(targets, target{client: c, rap: rap})
+			// The subscription's QoS is a maximum: a QoS 1 publication on a QoS 0
+			// subscription must go out as QoS 0.
+			targets = append(targets, target{client: c, qos: minQoS(qos, maxQoS), rap: rap})
 		}
 	}
 	b.mu.RUnlock()
@@ -610,7 +687,7 @@ func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *clie
 		if t.rap && retain {
 			ret = true
 		}
-		_ = t.client.sendPublish(topic, payload, qos, ret, outProps)
+		_ = t.client.sendPublish(topic, payload, t.qos, ret, outProps)
 	}
 	return len(targets)
 }
