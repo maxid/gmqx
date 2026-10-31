@@ -30,6 +30,12 @@ type ClusterMessage struct {
 	QoS      byte
 	Retain   bool
 	Props    []byte
+	// Namespace is the isolation scope the event belongs to: the broker stamps
+	// Config.Namespace on every event it produces and a backend drops an event
+	// whose namespace is not its own, so two namespaces sharing one cluster never
+	// apply each other's publishes, retained state or kicks. The empty string is
+	// the default namespace, which keeps the pre-namespace wire behaviour.
+	Namespace string
 
 	// Origin is the node id of the node that first produced the event. An empty
 	// Origin means "produced locally": the built-in TCP cluster fills it in
@@ -88,6 +94,15 @@ type MemberView interface {
 // publish to it (availability over precision).
 type subscriptionProvider interface {
 	subscriptionFilters() []string
+}
+
+// namespaceScoped is implemented by cluster backends that scope their traffic to
+// one broker namespace. The broker calls setNamespace with its Config.Namespace
+// before Cluster.Start, so the broker's namespace is authoritative for a backend
+// attached to it. A backend that does not implement it is not scoped by the
+// broker: it still receives ClusterMessage.Namespace and may filter on it.
+type namespaceScoped interface {
+	setNamespace(namespace string)
 }
 
 // subscriptionChangeNotifier is implemented by cluster backends that want to

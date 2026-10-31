@@ -1,6 +1,7 @@
 package gmqx
 
 import (
+	"context"
 	"log/slog"
 	"time"
 )
@@ -57,7 +58,14 @@ type Config struct {
 	// Protocol semantics
 	ConnectMode    ConnectMode
 	NotKickSeconds int
-	Namespace      string
+	// Namespace is the isolation scope of this broker: its session table,
+	// subscription matching, retained store and advertised subscription summaries
+	// only ever hold and match entries of this namespace. A publication produced
+	// in another namespace is never delivered to a session here, locally or
+	// through a cluster backend. The empty string is the default namespace and is
+	// the zero value, so a deployment that does not set it behaves exactly as it
+	// did before namespaces existed.
+	Namespace string
 
 	// Limits (0 = unlimited)
 	MaxConnections        int
@@ -76,7 +84,19 @@ type Config struct {
 	PublishCallbackTimeout time.Duration
 	Metrics                MetricsManager
 	Interceptors           []Interceptor
-	Cluster                ClusterConfig
+	// Dispatcher decides where an accepted publication goes. Nil selects
+	// DefaultDispatcher, which preserves the broker's built-in behavior: deliver
+	// to the local matching sessions and spread to the cluster backend.
+	Dispatcher Dispatcher
+	// ConnContext, when set, enriches the per-connection context at CONNECT. It is
+	// called once for every CONNECT the broker parses, before authentication, with
+	// the context that is cancelled when the connection ends plus the ConnectInfo
+	// read from the packet (an empty ClientID means the server will assign one
+	// afterwards). The returned context becomes the parent of every hook call for
+	// that connection, so values and deadlines put here reach the auth, ACL, sink,
+	// interceptor and dispatcher calls. Returning nil keeps the context passed in.
+	ConnContext func(ctx context.Context, info ConnectInfo) context.Context
+	Cluster     ClusterConfig
 	// ClusterBackend enables cross-node routing (optional).
 	ClusterBackend Cluster
 	// NodeID identifies this broker in the cluster (default random).

@@ -5,6 +5,39 @@
 
 ## [Unreleased]
 
+- **Dispatcher SPI, connection context and namespace isolation.** Three
+  portability gaps from the reference broker of this family are closed with Go
+  equivalents; every existing deployment keeps its behavior because the zero
+  values select the previous path.
+
+  *Dispatcher.* `Config.Dispatcher` (`Dispatcher`, `Publication`) is now the
+  single decision point for accepted publications. The previous hardcoded path
+  is `DefaultDispatcher` (local matching sessions plus the cluster spread), so a
+  nil dispatcher changes nothing; a custom dispatcher can suppress delivery or
+  route through the new read-only broker seam (`LocalTargets`, `SendLocal`,
+  `SpreadPublication`) instead of re-implementing topic matching. Retained state
+  is still written by the broker before routing.
+
+  *Connection context.* Every hook now receives the connection-scoped context
+  instead of `context.Background()`: it carries `ConnInfo`
+  (`ContextWithConn`/`ConnFromContext`), is enriched once at CONNECT by the new
+  `Config.ConnContext`, is reused for the whole connection and is cancelled when
+  the connection closes. The disconnect hooks observe the cancelled context,
+  which still carries the ConnInfo of the connection that ended.
+
+  *Namespaces.* `Config.Namespace` (already present) now partitions the session
+  table, subscription matching, the retained store and the advertised
+  subscription summaries. `ClusterMessage` carries the namespace, and both
+  built-in backends drop a remote event or summary of another namespace. The
+  empty namespace is the default and keeps the previous behavior, including the
+  Redis key layout.
+
+  Behavior notes: a cluster spread failure is now logged as
+  `gmqx dispatch failed` (the error is returned by the dispatcher), and a remote
+  publication is deliberately not handed to the dispatcher again — it was
+  already routed by its origin, and re-dispatching it would put it back on the
+  cluster.
+
 - **Protocol conformance fixes (MQTT 3.1.1 / 5).** A wire-level conformance suite
   (`TestConformance`, `mqtt_conformance_test.go` and
   `mqtt_conformance_v5_test.go`) walks the MQTT 3.1.1 and MQTT 5 feature matrix

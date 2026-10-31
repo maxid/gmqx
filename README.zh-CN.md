@@ -23,6 +23,15 @@
 - 线级 MQTT 3.1.1/5 一致性测试套件（`TestConformance`）
 - 可插拔钩子：`AuthManager`、`AclManager`、`EventSink`（生命周期/消息）、
   `MetricsManager`、`Interceptor`
+- 可插拔路由：`Dispatcher` 接收每个被接受 publish 的 `Publication` 并决定去向；
+  未配置时保持内置的本地投递 + 集群传播行为（`DefaultDispatcher`）；broker 提供只读接缝
+  （`LocalTargets`、`SendLocal`、`SpreadPublication`），dispatcher 无需自行重写 topic 匹配
+- 每个钩子都收到连接作用域的 context：通过 `ContextWithConn`/`ConnFromContext`
+  读取 `ConnInfo`（client id、connection id、namespace、远端地址、协议级别）；
+  context 在 CONNECT 时由 `Config.ConnContext` 增强一次，并在连接结束时取消
+- 命名空间隔离：`Config.Namespace` 划分会话表、订阅匹配、保留状态以及集群订阅摘要/事件，
+  一个命名空间的 publish 永远不会到达另一命名空间的会话；默认空命名空间
+  保持单命名空间部署的行为不变
 - 连接模式：`UNIQUE` / `KICK`（client id 接管）
 - 限制：最大连接数、最大订阅数、最大保留消息数、
   连接速率限制
@@ -91,8 +100,41 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `MaxRetainMessages` | 0 | 保留消息数量限制 |
 | `ConnectionRateLimit` | 0 | 连接数/秒的令牌桶 |
 | `Auth` / `ACL` / `Sink` / `Metrics` | 全部放行 / 空实现 | 可插拔 SPI |
+| `Namespace` | `""`（默认） | 会话、保留状态与集群流量的隔离作用域 |
+| `Dispatcher` | `DefaultDispatcher` | 路由 SPI：默认本地投递 + 集群传播 |
+| `ConnContext` | nil | 在 CONNECT 时增强每连接 context |
 
 完整的 MQTT 5 属性/语义、完整的 QoS 2 以及客户端库都在路线图中（见 [ROADMAP.md](ROADMAP.md)）。
+
+## Dispatcher、连接 context 与命名空间
+
+`Config.Dispatcher` 是被接受 publish 去向的唯一决策点。broker 先完成鉴权、拦截器与 sink；
+保留状态在路由之前写入，因此 dispatcher 决定的是实时消息的去向，而不是保留什么。
+`DefaultDispatcher`（nil 默认）投递给本地匹配会话并传播到集群后端。自定义 dispatcher
+通过 broker 的只读接缝路由，而不是自行实现 topic 匹配：
+
+```go
+type myDispatcher struct{ broker *gmqx.Broker }
+
+func (d *myDispatcher) Bind(b *gmqx.Broker) { d.broker = b }
+
+func (d *myDispatcher) Dispatch(ctx context.Context, pub gmqx.Publication) error {
+    for _, target := range d.broker.LocalTargets(pub) {
+        _ = d.broker.SendLocal(ctx, target, pub)
+    }
+    return d.broker.SpreadPublication(ctx, pub)
+}
+```
+
+每个钩子都收到连接作用域的 context。Go 没有 thread-local 状态，因此连接身份通过
+context value 传递：`gmqx.ConnFromContext` 返回该钩子所属连接的 `gmqx.ConnInfo`。
+context 在连接被接受时创建，在 CONNECT 时由 `Config.ConnContext` 增强一次
+（写入其中的值/截止时间会传达到该连接的每个钩子），整个交换过程复用同一个 context，
+并在连接结束时取消。
+
+`Config.Namespace` 是 broker 的隔离作用域。会话、订阅匹配、保留存储与对外通告的订阅摘要
+都按它划分，两个内置集群后端会丢弃属于其他命名空间的远端事件。空字符串是默认命名空间
+（零值），因此未设置它的部署行为完全不变，包括文档化的 Redis 键布局。
 
 ## 传输分层
 

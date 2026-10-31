@@ -107,12 +107,17 @@ type TCPClusterConfig struct {
 	MaxSummaryFilters int
 
 	// Metrics, when set, receives RecordDroppedMessage for events the cluster
-	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward"). Without
-	// it the drops are only counted internally.
+	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward",
+	// "cluster_namespace"). Without it the drops are only counted internally.
 	Metrics MetricsManager
 	// Logger receives membership decisions such as link rejection and eviction
 	// (default slog.Default()).
 	Logger *slog.Logger
+	// Namespace scopes the traffic of this backend: an event or subscription
+	// summary of another namespace is dropped. When the backend is passed to a
+	// Broker, the broker's Config.Namespace is authoritative and overrides this
+	// value at Start. The empty string is the default namespace.
+	Namespace string
 }
 
 // clusterFrame is the internal wire envelope. Events, membership and routing
@@ -126,6 +131,7 @@ type clusterFrame struct {
 	Incarnation string            `json:"inc,omitempty"`
 	View        []clusterPeerWire `json:"view,omitempty"`
 	Filters     []string          `json:"filters,omitempty"`
+	Namespace   string            `json:"ns,omitempty"`
 	Seq         uint64            `json:"seq,omitempty"`
 	Event       *ClusterMessage   `json:"event,omitempty"`
 }
@@ -141,11 +147,12 @@ type clusterPeerWire struct {
 // gnety's length-prefixed TCP transport.
 func NewTCPCluster(cfg TCPClusterConfig) Cluster {
 	return &tcpCluster{
-		cfg:     cfg,
-		links:   map[*clusterLink]struct{}{},
-		members: map[string]*clusterMember{},
-		seeds:   map[string]string{},
-		local:   newSummarySet(),
+		cfg:       cfg,
+		namespace: cfg.Namespace,
+		links:     map[*clusterLink]struct{}{},
+		members:   map[string]*clusterMember{},
+		seeds:     map[string]string{},
+		local:     newSummarySet(),
 	}
 }
 
@@ -188,6 +195,7 @@ type tcpCluster struct {
 	cfg         TCPClusterConfig
 	log         *slog.Logger
 	nodeID      string
+	namespace   string
 	incarnation string
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -215,6 +223,11 @@ type tcpCluster struct {
 
 	wg sync.WaitGroup
 }
+
+// setNamespace implements namespaceScoped: the broker's Config.Namespace is
+// authoritative for a backend attached to a broker. It must run before Start;
+// the broker calls it that way.
+func (c *tcpCluster) setNamespace(namespace string) { c.namespace = namespace }
 
 // Start implements Cluster. It listens on the configured address, exchanges a
 // handshake on every link and starts the heartbeat, summary refresh and dial
@@ -346,6 +359,16 @@ func (c *tcpCluster) Spread(_ context.Context, msg ClusterMessage) error {
 	if msg.Origin != "" && msg.Origin != c.nodeID {
 		// Received events are never forwarded.
 		c.recordDrop("cluster_forward", "refusing to forward a received event")
+		return nil
+	}
+	// A locally produced event belongs to this node's namespace. An empty value
+	// is stamped, exactly as Origin is; an explicit value of another namespace
+	// cannot be produced here and is dropped instead of leaking into a scope this
+	// node does not serve.
+	if msg.Namespace == "" {
+		msg.Namespace = c.namespace
+	} else if msg.Namespace != c.namespace {
+		c.recordDrop("cluster_namespace", "locally produced event for another namespace")
 		return nil
 	}
 	msg.Origin = c.nodeID
@@ -570,8 +593,15 @@ func (c *tcpCluster) winsLocked(m *clusterMember, l *clusterLink) bool {
 	return false
 }
 
-// handleSummary records the subscription summary a peer advertised.
+// handleSummary records the subscription summary a peer advertised. A summary
+// of another namespace is ignored: directed routing only trusts filters that
+// belong to the same scope, so the peer is treated as unknown and still receives
+// every publish, which it then drops on the receive path.
 func (c *tcpCluster) handleSummary(l *clusterLink, f clusterFrame) {
+	if f.Namespace != c.namespace {
+		c.recordDrop("cluster_namespace", "subscription summary for another namespace")
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	m := c.members[l.nodeID]
@@ -604,7 +634,7 @@ func (c *tcpCluster) advertiseSummary(l *clusterLink) {
 	if !ok {
 		return
 	}
-	if err := c.sendFrame(l, clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Filters: sum}); err != nil {
+	if err := c.sendFrame(l, clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Namespace: c.namespace, Filters: sum}); err != nil {
 		c.dropLink(l, "summary send failed")
 	}
 }
@@ -627,7 +657,7 @@ func (c *tcpCluster) broadcastSummary() {
 	if !ok {
 		return
 	}
-	frame := clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Filters: sum}
+	frame := clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Namespace: c.namespace, Filters: sum}
 	for _, l := range c.snapshotLinks(true) {
 		if err := c.sendFrame(l, frame); err != nil {
 			c.dropLink(l, "summary send failed")
@@ -638,11 +668,20 @@ func (c *tcpCluster) broadcastSummary() {
 // dispatchEvent hands one received event to the broker. Events from an unknown
 // or evicted member are still handled — availability over strictness — but only
 // a handshake can make that node a member again.
+//
+// Namespace isolation is the first filter: an event of another namespace is
+// dropped before it can touch the dedup table or reach the handler, so a cluster
+// that carries several namespaces never applies another scope's publish, retained
+// update or kick.
 func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 	if c.handler == nil {
 		return
 	}
 	if msg.Type != ClusterPublish && msg.Type != ClusterKick {
+		return
+	}
+	if msg.Namespace != c.namespace {
+		c.recordDrop("cluster_namespace", "event belongs to another namespace")
 		return
 	}
 	if msg.Origin == "" {

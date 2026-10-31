@@ -32,6 +32,19 @@ type client struct {
 	r      *bufio.Reader
 	wmu    sync.Mutex
 
+	// namespace is the broker's isolation scope, fixed for the connection.
+	namespace string
+	// connCtx is the cancellable context of the connection. ctx is connCtx with
+	// ConnInfo attached: it is what every hook of this connection receives. Both
+	// are written during the handshake, before the client is registered.
+	connCtx context.Context
+	ctx     context.Context
+	// cancel cancels the context derived from Config.ConnContext, parentCancel
+	// the base context it was derived from. stopCtx cancels both, once.
+	cancel       context.CancelFunc
+	parentCancel context.CancelFunc
+	stopOnce     sync.Once
+
 	mu             sync.Mutex
 	id             string
 	info           ConnectInfo
@@ -56,8 +69,14 @@ type client struct {
 }
 
 func newClient(b *Broker, conn net.Conn) *client {
+	connCtx, cancel := context.WithCancel(b.lifecycleContext())
 	return &client{
 		broker:       b,
+		namespace:    b.namespace,
+		connCtx:      connCtx,
+		ctx:          connCtx,
+		cancel:       cancel,
+		parentCancel: cancel,
 		connID:       nextConnectionID(),
 		conn:         conn,
 		r:            bufio.NewReaderSize(conn, 4096),
@@ -66,6 +85,56 @@ func newClient(b *Broker, conn net.Conn) *client {
 		topicAliases: make(map[uint16]string),
 		version:      mqtt.Version311,
 	}
+}
+
+// context returns the connection-scoped context every hook of this connection
+// receives. It carries ConnInfo and is cancelled by stopContext when the
+// connection ends. It is never nil.
+func (c *client) context() context.Context { return c.ctx }
+
+// attachConnectContext builds the connection context from the parsed CONNECT:
+// the optional Config.ConnContext hook enriches it once, and ConnInfo is attached
+// so every hook can identify the connection without a thread-local request
+// scope. The context it creates is cancelled by stopContext, even when the hook
+// returns a context that is not derived from the one it was given.
+func (c *client) attachConnectContext(info ConnectInfo) {
+	ctx := c.connCtx
+	if hook := c.broker.cfg.ConnContext; hook != nil {
+		if enriched := hook(ctx, info); enriched != nil {
+			enrichedCtx, cancel := context.WithCancel(enriched)
+			c.connCtx, c.cancel = enrichedCtx, cancel
+			ctx = enrichedCtx
+		}
+	}
+	c.ctx = ContextWithConn(ctx, c.connInfo(info))
+}
+
+// setConnInfo refreshes the ConnInfo value after the broker assigned a client
+// id. The connection context itself, and therefore its cancellation, is kept.
+func (c *client) setConnInfo(info ConnectInfo) {
+	c.ctx = ContextWithConn(c.connCtx, c.connInfo(info))
+}
+
+func (c *client) connInfo(info ConnectInfo) ConnInfo {
+	return ConnInfo{
+		ClientID:        info.ClientID,
+		ConnectionID:    string(c.connID),
+		Namespace:       c.namespace,
+		RemoteAddr:      info.RemoteAddr,
+		ProtocolVersion: c.version,
+	}
+}
+
+// stopContext cancels the connection context. close calls it as soon as the
+// connection is gone (after a will was published, before the disconnect hooks),
+// and serve calls it again when its goroutine ends, so the cancellation happens
+// even for a connection that never got past the handshake. It is safe to call
+// more than once.
+func (c *client) stopContext() {
+	c.stopOnce.Do(func() {
+		c.parentCancel()
+		c.cancel()
+	})
 }
 
 // persistentSession reports whether the session state survives the connection.
@@ -189,7 +258,8 @@ func (c *client) handshake() error {
 	c.version = connect.Version()
 	info := connectInfo(connect)
 	info.RemoteAddr = c.conn.RemoteAddr().String()
-	if err := c.broker.cfg.Auth.Authenticate(context.Background(), info); err != nil {
+	c.attachConnectContext(info)
+	if err := c.broker.cfg.Auth.Authenticate(c.context(), info); err != nil {
 		_ = c.writeConnack(connackNotAuthorized(c.version), "")
 		return fmt.Errorf("%w: %v", ErrUnauthorized, err)
 	}
@@ -226,6 +296,9 @@ func (c *client) handshake() error {
 		c.will = &will
 	}
 	c.mu.Unlock()
+	// The client id can be assigned by the broker, so ConnInfo is refreshed with
+	// the final identity before anything else observes the connection.
+	c.setConnInfo(info)
 	if err := c.broker.register(c); err != nil {
 		code := byte(5)
 		switch {
@@ -274,7 +347,7 @@ func (c *client) loop() {
 		case *mqtt.Pingreq:
 			_ = c.writeMessage(&mqtt.Pingresp{MessageHeader: c.header()})
 			if c.broker.cfg.Sink != nil {
-				c.broker.cfg.Sink.OnPing(context.Background(), c.id)
+				c.broker.cfg.Sink.OnPing(c.context(), c.id)
 			}
 		case *mqtt.Disconnect:
 			// A DISCONNECT with reason code 0x04 asks the server to publish the
@@ -395,6 +468,7 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 		QoS:          m.QoS,
 		PacketID:     m.PacketID,
 		Retain:       m.Retain,
+		Dup:          m.Dup,
 		Properties:   wireProps,
 	}, props)
 	switch m.QoS {
@@ -529,6 +603,10 @@ func (c *client) close(withWill bool) {
 			Properties: wireProps,
 		}, props)
 	}
+	// The will exchange above still runs on a live connection context; once the
+	// connection is gone, every later observer (the disconnect hooks) sees the
+	// cancelled context.
+	c.stopContext()
 }
 
 // willPublishProperties maps the will property block onto the PUBLISH properties

@@ -22,13 +22,16 @@ import (
 
 // Broker is a single-node MQTT 3.1.1 broker.
 type Broker struct {
-	cfg     Config
-	log     *slog.Logger
-	metrics MetricsManager
-	limiter *rateLimiter
-	nodeID  string
+	cfg        Config
+	log        *slog.Logger
+	metrics    MetricsManager
+	limiter    *rateLimiter
+	nodeID     string
+	namespace  string
+	dispatcher Dispatcher
 
 	mu       sync.RWMutex
+	ctx      context.Context // broker lifetime context, set by Start
 	clients  map[string]*client
 	sessions map[string]*session
 	retained map[string]retainedMessage
@@ -40,10 +43,11 @@ type Broker struct {
 }
 
 type retainedMessage struct {
-	topic   string
-	payload []byte
-	qos     byte
-	props   mqtt.Properties
+	namespace string
+	topic     string
+	payload   []byte
+	qos       byte
+	props     mqtt.Properties
 }
 
 // session is the state a persistent session keeps while no connection owns it:
@@ -103,20 +107,34 @@ func New(cfg Config) (*Broker, error) {
 		logger = slog.Default()
 	}
 	b := &Broker{
-		cfg:      cfg,
-		log:      logger,
-		metrics:  cfg.Metrics,
-		clients:  make(map[string]*client),
-		sessions: make(map[string]*session),
-		retained: make(map[string]retainedMessage),
-		addrs:    make(map[string]string),
-		done:     make(chan struct{}),
-		nodeID:   cfg.NodeID,
+		cfg:       cfg,
+		log:       logger,
+		metrics:   cfg.Metrics,
+		namespace: cfg.Namespace,
+		clients:   make(map[string]*client),
+		sessions:  make(map[string]*session),
+		retained:  make(map[string]retainedMessage),
+		addrs:     make(map[string]string),
+		done:      make(chan struct{}),
+		nodeID:    cfg.NodeID,
 	}
+	b.dispatcher = newDispatcher(cfg.Dispatcher, b)
 	if cfg.ConnectionRateLimit > 0 {
 		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
 	}
 	return b, nil
+}
+
+// newDispatcher selects the routing policy and hands it the broker's routing
+// seam. A nil Dispatcher selects DefaultDispatcher.
+func newDispatcher(d Dispatcher, b *Broker) Dispatcher {
+	if d == nil {
+		d = NewDefaultDispatcher()
+	}
+	if binder, ok := d.(DispatcherBinder); ok {
+		binder.Bind(b)
+	}
+	return d
 }
 
 // Start begins all configured listeners. It returns once they are ready.
@@ -131,6 +149,7 @@ func (b *Broker) Start(ctx context.Context) error {
 		return errors.New("gmqx: broker is closed")
 	}
 	b.started = true
+	b.ctx = ctx
 	b.mu.Unlock()
 
 	specs, err := b.listenerSpecs()
@@ -173,6 +192,11 @@ func (b *Broker) Start(ctx context.Context) error {
 		return errors.New("gmqx: no listeners configured")
 	}
 	if b.cfg.ClusterBackend != nil {
+		if scoped, ok := b.cfg.ClusterBackend.(namespaceScoped); ok {
+			// The broker's namespace is authoritative for a backend attached to
+			// it: events this broker produces are stamped by the broker.
+			scoped.setNamespace(b.namespace)
+		}
 		if err := b.cfg.ClusterBackend.Start(ctx, b.nodeID, b); err != nil {
 			_ = b.Stop(context.Background())
 			return fmt.Errorf("gmqx: cluster start: %w", err)
@@ -349,8 +373,14 @@ func (b *Broker) Stop(ctx context.Context) error {
 
 func (b *Broker) serve(conn net.Conn) {
 	c := newClient(b, conn)
+	// A safety net: close cancels the context as soon as the connection is gone,
+	// this covers a connection that failed before close was reached.
+	defer c.stopContext()
 	if err := c.handshake(); err != nil {
 		if c.registered {
+			// The connection is gone, so the disconnect hook observes the cancelled
+			// context, exactly as it does on the normal path.
+			c.stopContext()
 			b.unregister(c)
 		}
 		b.log.Debug("gmqx handshake failed", "remote", conn.RemoteAddr(), "err", err)
@@ -367,21 +397,22 @@ func (b *Broker) serve(conn net.Conn) {
 // connection's subscriptions and the CONNACK that follows reports Session
 // Present. A clean connection discards any stored session.
 func (b *Broker) register(c *client) error {
+	key := namespaceKey(b.namespace, c.id)
 	b.mu.Lock()
 	var takeover map[string]subscription
-	if old, ok := b.clients[c.id]; ok && old != c {
+	if old, ok := b.clients[key]; ok && old != c {
 		if b.cfg.ConnectMode == ConnectModeUnique {
 			b.mu.Unlock()
 			return ErrClientIDInUse
 		}
-		delete(b.clients, c.id)
+		delete(b.clients, key)
 		// In KICK mode the replacement takes the old session over. The old
 		// connection must neither save that state again nor erase the new
 		// session when its own serve goroutine unwinds.
 		old.mu.Lock()
 		old.superseded = true
 		if old.persistentSession() {
-			if stored, ok := b.sessions[c.id]; ok {
+			if stored, ok := b.sessions[key]; ok {
 				takeover = copySubscriptions(stored.subs)
 			} else {
 				takeover = copySubscriptions(old.subs)
@@ -398,7 +429,7 @@ func (b *Broker) register(c *client) error {
 	}
 
 	if c.resumesSession() {
-		if stored, ok := b.sessions[c.id]; ok {
+		if stored, ok := b.sessions[key]; ok {
 			c.subs = copySubscriptions(stored.subs)
 			c.sessionPresent = true
 		} else if takeover != nil {
@@ -406,10 +437,10 @@ func (b *Broker) register(c *client) error {
 			c.sessionPresent = true
 		}
 	} else {
-		delete(b.sessions, c.id)
+		delete(b.sessions, key)
 	}
 
-	b.clients[c.id] = c
+	b.clients[key] = c
 	c.registered = true
 	n := len(b.clients)
 	b.mu.Unlock()
@@ -420,13 +451,13 @@ func (b *Broker) register(c *client) error {
 	// KICK mode: tell peer nodes to drop any session with the same client id.
 	// This makes client-id takeover work across nodes, not just locally.
 	if b.cfg.ConnectMode == ConnectModeKick {
-		b.spreadKick(c.id)
+		b.spreadKick(c.context(), c.id)
 	}
 
 	b.metrics.IncrementConnections()
 	b.metrics.RecordConnections(n)
 	if b.cfg.Sink != nil {
-		b.cfg.Sink.OnConnect(context.Background(), c.info)
+		b.cfg.Sink.OnConnect(c.context(), c.info)
 	}
 	return nil
 }
@@ -436,18 +467,19 @@ func (b *Broker) unregister(c *client) {
 		return
 	}
 	c.registered = false
+	key := namespaceKey(b.namespace, c.id)
 	b.mu.Lock()
-	if current, ok := b.clients[c.id]; ok && current == c {
-		delete(b.clients, c.id)
+	if current, ok := b.clients[key]; ok && current == c {
+		delete(b.clients, key)
 	}
 	n := len(b.clients)
 	c.mu.Lock()
 	hadSubscriptions := len(c.subs) > 0
 	if !c.superseded {
 		if c.persistentSession() {
-			b.sessions[c.id] = &session{subs: copySubscriptions(c.subs)}
+			b.sessions[key] = &session{subs: copySubscriptions(c.subs)}
 		} else {
-			delete(b.sessions, c.id)
+			delete(b.sessions, key)
 		}
 	}
 	c.mu.Unlock()
@@ -461,16 +493,19 @@ func (b *Broker) unregister(c *client) {
 		b.subscriptionsChanged()
 	}
 	if b.cfg.Sink != nil {
+		// The disconnect hooks observe the cancelled connection context (the
+		// connection is already gone) but it still carries its ConnInfo, so a hook
+		// can attribute the event to the exact connection.
 		if c.lost {
-			b.cfg.Sink.OnConnectionLost(context.Background(), c.id, c.closeErr)
+			b.cfg.Sink.OnConnectionLost(c.context(), c.id, c.closeErr)
 		} else {
-			b.cfg.Sink.OnDisconnect(context.Background(), c.id, c.closeErr)
+			b.cfg.Sink.OnDisconnect(c.context(), c.id, c.closeErr)
 		}
 	}
 }
 
 func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bool) {
-	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
+	if !b.cfg.ACL.Check(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
 		b.metrics.RecordDroppedMessage("acl_subscribe")
 		return subscribeFailure(c.version, 0x87), false
 	}
@@ -512,14 +547,17 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 }
 
 // subscriptionFilters implements subscriptionProvider: every topic filter a
-// local session is subscribed to, sorted and de-duplicated. The built-in TCP
-// cluster advertises it so peers can route a publish only to the nodes that have
-// a matching subscriber.
+// local session of this broker's namespace is subscribed to, sorted and
+// de-duplicated. The built-in TCP cluster advertises it so peers can route a
+// publish only to the nodes that have a matching subscriber; the advertised
+// summary carries the namespace, so peers of another namespace ignore it.
 func (b *Broker) subscriptionFilters() []string {
 	b.mu.RLock()
 	clients := make([]*client, 0, len(b.clients))
 	for _, c := range b.clients {
-		clients = append(clients, c)
+		if c.namespace == b.namespace {
+			clients = append(clients, c)
+		}
 	}
 	b.mu.RUnlock()
 
@@ -555,25 +593,29 @@ func (b *Broker) subscriptionsChanged() {
 // many topics are stored (a full store still accepts a new value for a topic it
 // already holds). The QoS and the typed property set travel with the message,
 // so a retained delivery later reproduces the publish that set it.
-func (b *Broker) storeRetained(topic string, payload []byte, qos byte, props mqtt.Properties) {
+func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte, props mqtt.Properties) {
+	key := namespaceKey(namespace, topic)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(payload) == 0 {
-		delete(b.retained, topic)
+		delete(b.retained, key)
 		return
 	}
-	if _, exists := b.retained[topic]; !exists && b.cfg.MaxRetainMessages > 0 && int64(len(b.retained)) >= b.cfg.MaxRetainMessages {
+	if _, exists := b.retained[key]; !exists && b.cfg.MaxRetainMessages > 0 && int64(len(b.retained)) >= b.cfg.MaxRetainMessages {
 		b.metrics.RecordDroppedMessage("max_retain")
 		return
 	}
-	b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
+	b.retained[key] = retainedMessage{namespace: namespace, topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
 }
 
 func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool) {
 	b.mu.RLock()
 	var msgs []retainedMessage
-	for topic, m := range b.retained {
-		if matchTopic(filter, topic) {
+	for _, m := range b.retained {
+		if m.namespace != c.namespace {
+			continue
+		}
+		if matchTopic(filter, m.topic) {
 			msgs = append(msgs, m)
 		}
 	}
@@ -583,27 +625,33 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 	}
 }
 
-// publish authorizes, hands the message to the sink and only then delivers it.
+// publish authorizes, hands the message to the sink and only then routes it.
 // The returned verdict decides whether the caller may acknowledge, so nothing
 // here may claim durability the sink did not confirm.
 //
 // ev.Properties is the payload of the SPI contract (one MQTT 5 property block,
 // no length prefix); props is the same set in typed form, which is what routing,
 // retained state and outgoing packets use.
+//
+// Every hook that runs here receives the connection-scoped context of from, so a
+// hook can read the ConnInfo and is cancelled when the connection ends. Retained
+// state is written here, before routing: a Dispatcher decides where an accepted
+// publication goes, not what is retained.
 func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) PublishResult {
+	ctx := from.context()
 	ev.ConnectionID = from.connID
 	ev.ClientID = from.id
-	if !b.cfg.ACL.Check(context.Background(), SessionInfo{ClientID: from.id, Username: from.username}, ev.Topic, AclPublish) {
+	if !b.cfg.ACL.Check(ctx, SessionInfo{ClientID: from.id, Username: from.username}, ev.Topic, AclPublish) {
 		b.metrics.RecordDroppedMessage("acl_publish")
 		return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 	}
 	for _, it := range b.cfg.Interceptors {
-		if !it.OnPublish(context.Background(), from.id, ev.Topic, ev.Payload, ev.QoS) {
+		if !it.OnPublish(ctx, from.id, ev.Topic, ev.Payload, ev.QoS) {
 			b.metrics.RecordDroppedMessage("interceptor")
 			return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 		}
 	}
-	if res := b.callSink(ev); !res.Accepted() {
+	if res := b.callSink(ctx, ev); !res.Accepted() {
 		reason := "sink_rejected"
 		if res.Disposition == PublishRetryable {
 			reason = "sink_retryable"
@@ -614,55 +662,109 @@ func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) P
 	// Retain is stored only for accepted publishes: a rejected message must not
 	// become the retained value new subscribers receive.
 	if ev.Retain {
-		b.storeRetained(ev.Topic, ev.Payload, ev.QoS, props)
+		b.storeRetained(from.namespace, ev.Topic, ev.Payload, ev.QoS, props)
 	}
 	b.metrics.IncrementPublishedMessages()
 
-	b.deliverLocal(ev.Topic, ev.Payload, ev.QoS, from, props, ev.Retain)
-	b.spreadPublish(ev.Topic, ev.Payload, ev.QoS, ev.Retain, props)
+	pub := Publication{
+		Namespace:        from.namespace,
+		Topic:            ev.Topic,
+		Payload:          ev.Payload,
+		QoS:              ev.QoS,
+		Retain:           ev.Retain,
+		Dup:              ev.Dup,
+		FromClientID:     from.id,
+		FromConnectionID: string(from.connID),
+		Props:            ev.Properties,
+		props:            props,
+		propsSet:         true,
+	}
+	if err := b.dispatcher.Dispatch(ctx, pub); err != nil {
+		b.log.Warn("gmqx dispatch failed", "err", err)
+	}
 	return PublishResult{Disposition: PublishAccepted}
 }
 
 // callSink runs the sink, optionally with a bounded wait. Without a configured
-// timeout the call is synchronous and allocation-free on the hot path.
-func (b *Broker) callSink(ev PublishEvent) PublishResult {
+// timeout the call is synchronous and allocation-free on the hot path. The
+// caller's connection context parents the bounded wait, so a connection that
+// ends stops the wait as well.
+func (b *Broker) callSink(ctx context.Context, ev PublishEvent) PublishResult {
 	if b.cfg.Sink == nil {
 		return PublishResult{Disposition: PublishAccepted}
 	}
 	timeout := b.cfg.PublishCallbackTimeout
 	if timeout <= 0 {
-		return b.cfg.Sink.OnPublish(context.Background(), ev)
+		return b.cfg.Sink.OnPublish(ctx, ev)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	sinkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	done := make(chan PublishResult, 1)
-	go func() { done <- b.cfg.Sink.OnPublish(ctx, ev) }()
+	go func() { done <- b.cfg.Sink.OnPublish(sinkCtx, ev) }()
 	select {
 	case res := <-done:
 		return res
-	case <-ctx.Done():
+	case <-sinkCtx.Done():
 		return PublishResult{Disposition: PublishRetryable, ReasonCode: ReasonQuotaExceeded}
 	}
 }
 
-func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *client, props mqtt.Properties, retain bool) int {
-	b.mu.RLock()
-	type target struct {
-		client *client
-		qos    byte
-		rap    bool
+// DefaultDispatcher is the built-in routing policy: deliver to the local
+// sessions a publication matches and spread it to the cluster backend. It is
+// exactly the hardcoded path the broker used before the Dispatcher SPI existed,
+// and it is what Config.Dispatcher == nil selects.
+type DefaultDispatcher struct {
+	broker *Broker
+}
+
+// NewDefaultDispatcher returns an unbound DefaultDispatcher. New binds it to the
+// broker it belongs to; a Dispatcher that wraps the default policy can call Bind
+// itself.
+func NewDefaultDispatcher() *DefaultDispatcher { return &DefaultDispatcher{} }
+
+// Bind implements DispatcherBinder.
+func (d *DefaultDispatcher) Bind(b *Broker) { d.broker = b }
+
+// Dispatch implements Dispatcher. Local deliveries stay best-effort (a failed
+// write to one session does not stop the others), exactly as before the SPI; a
+// cluster spread failure is returned so the broker can log it.
+func (d *DefaultDispatcher) Dispatch(ctx context.Context, pub Publication) error {
+	if d == nil || d.broker == nil {
+		return errors.New("gmqx: default dispatcher is not bound to a broker")
 	}
-	targets := make([]target, 0)
+	for _, target := range d.broker.LocalTargets(pub) {
+		_ = d.broker.SendLocal(ctx, target, pub)
+	}
+	return d.broker.SpreadPublication(ctx, pub)
+}
+
+// LocalTargets is the read-only half of the routing seam a Dispatcher uses: the
+// local sessions whose subscriptions match pub, with the per-session QoS cap and
+// retain flag already applied, and no-local subscriptions of the publishing
+// connection excluded. It re-reads live subscriptions on every call; it does not
+// cache a routing table. A publication of another namespace has no local target
+// here.
+func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
+	if pub.Namespace != b.namespace {
+		return nil
+	}
+	from := ConnectionID(pub.FromConnectionID)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	targets := make([]LocalTarget, 0)
 	for _, c := range b.clients {
+		if c.namespace != pub.Namespace {
+			continue
+		}
 		c.mu.Lock()
 		found := false
 		rap := false
 		var maxQoS byte
 		for filter, sub := range c.subs {
-			if !matchTopic(filter, topic) {
+			if !matchTopic(filter, pub.Topic) {
 				continue
 			}
-			if sub.noLocal && c == from {
+			if sub.noLocal && c.connID == from {
 				continue
 			}
 			found = true
@@ -673,51 +775,76 @@ func (b *Broker) deliverLocal(topic string, payload []byte, qos byte, from *clie
 				rap = true
 			}
 		}
+		target := LocalTarget{
+			ClientID:     c.id,
+			ConnectionID: c.connID,
+			QoS:          minQoS(pub.QoS, maxQoS),
+			Retain:       rap && pub.Retain,
+			client:       c,
+		}
 		c.mu.Unlock()
 		if found {
 			// The subscription's QoS is a maximum: a QoS 1 publication on a QoS 0
 			// subscription must go out as QoS 0.
-			targets = append(targets, target{client: c, qos: minQoS(qos, maxQoS), rap: rap})
+			targets = append(targets, target)
 		}
 	}
-	b.mu.RUnlock()
-	for _, t := range targets {
-		ret := false
-		outProps := props
-		if t.rap && retain {
-			ret = true
-		}
-		_ = t.client.sendPublish(topic, payload, t.qos, ret, outProps)
-	}
-	return len(targets)
+	return targets
 }
 
-func (b *Broker) spreadPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) {
-	if b.cfg.ClusterBackend == nil {
-		return
+// SendLocal is the write half of the routing seam: it writes pub to one target
+// returned by LocalTargets. The send is synchronous and best-effort, like the
+// broker's own delivery path; ctx is the publication's context (the publishing
+// connection's context for an accepted local publication) and is carried so a
+// dispatcher can observe cancellation, not to abort a write that is already on
+// the wire.
+func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publication) error {
+	if target.client == nil {
+		return errors.New("gmqx: local target was not produced by this broker")
 	}
-	wireProps, err := encodePropertyBlock(props)
-	if err != nil {
-		b.log.Warn("gmqx cluster publish properties", "err", err)
-		return
+	props := pub.props
+	if !pub.propsSet {
+		decoded, err := decodePropertyBlock(pub.Props)
+		if err != nil {
+			return fmt.Errorf("gmqx: local delivery properties: %w", err)
+		}
+		props = decoded
+	}
+	return target.client.sendPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
+}
+
+// SpreadPublication is the cluster half of the routing seam: it hands pub to the
+// configured ClusterBackend with this broker's node id. The publication's
+// namespace travels with the event; a built-in backend stamps an empty namespace
+// with its own and refuses to produce an event for a different one. It is a
+// no-op without a backend.
+func (b *Broker) SpreadPublication(ctx context.Context, pub Publication) error {
+	if b.cfg.ClusterBackend == nil {
+		return nil
 	}
 	msg := ClusterMessage{
-		Type: ClusterPublish, NodeID: b.nodeID, Topic: topic,
-		Payload: append([]byte(nil), payload...), QoS: qos, Retain: retain,
-		Props: wireProps,
+		Type:      ClusterPublish,
+		NodeID:    b.nodeID,
+		Namespace: pub.Namespace,
+		Topic:     pub.Topic,
+		Payload:   append([]byte(nil), pub.Payload...),
+		QoS:       pub.QoS,
+		Retain:    pub.Retain,
+		Props:     pub.Props,
 	}
-	if err := b.cfg.ClusterBackend.Spread(context.Background(), msg); err != nil {
-		b.log.Warn("gmqx cluster spread failed", "err", err)
+	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
+		return fmt.Errorf("gmqx: cluster spread: %w", err)
 	}
+	return nil
 }
 
-// spreadKick tells peer nodes to drop a client that was kicked locally.
-func (b *Broker) spreadKick(clientID string) {
+// spreadKick tells peer nodes of this namespace to drop a kicked client.
+func (b *Broker) spreadKick(ctx context.Context, clientID string) {
 	if b.cfg.ClusterBackend == nil || clientID == "" {
 		return
 	}
-	msg := ClusterMessage{Type: ClusterKick, NodeID: b.nodeID, ClientID: clientID}
-	if err := b.cfg.ClusterBackend.Spread(context.Background(), msg); err != nil {
+	msg := ClusterMessage{Type: ClusterKick, NodeID: b.nodeID, Namespace: b.namespace, ClientID: clientID}
+	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
 		b.log.Warn("gmqx cluster kick spread failed", "err", err)
 	}
 }
@@ -732,7 +859,13 @@ func (b *Broker) spreadKick(clientID string) {
 // node later receives the value from the store even though the publish happened
 // on another node. The publish was already authorized and accepted by the node
 // that produced it, so it is not run through this node's ACL, interceptors or
-// sink again.
+// sink again, and it is not handed to the Dispatcher again: it was already
+// routed by its origin, and re-dispatching it would send it back to the cluster.
+//
+// Namespace isolation is enforced here as well as in the built-in backends: an
+// event whose namespace is not this broker's namespace never reaches a session
+// or the retained store. The backends drop such an event before calling this
+// method; the check also covers a third-party backend.
 //
 // The store update is applied once per event: a backend drops a duplicate
 // (Origin, Seq) before calling this method, and replaying the same retained
@@ -744,25 +877,68 @@ func (b *Broker) spreadKick(clientID string) {
 // eventually present in the store, not that a session already connected is
 // replayed the value.
 func (b *Broker) OnRemotePublish(msg ClusterMessage) {
+	if msg.Namespace != b.namespace {
+		b.metrics.RecordDroppedMessage("cluster_namespace")
+		b.log.Debug("gmqx remote publish dropped", "namespace", msg.Namespace, "topic", msg.Topic)
+		return
+	}
 	props, err := decodePropertyBlock(msg.Props)
 	if err != nil {
 		b.log.Warn("gmqx cluster publish properties", "err", err)
 		return
 	}
 	if msg.Retain {
-		b.storeRetained(msg.Topic, msg.Payload, msg.QoS, props)
+		b.storeRetained(msg.Namespace, msg.Topic, msg.Payload, msg.QoS, props)
 	}
-	b.deliverLocal(msg.Topic, msg.Payload, msg.QoS, nil, props, msg.Retain)
+	pub := Publication{
+		Namespace: msg.Namespace,
+		Topic:     msg.Topic,
+		Payload:   msg.Payload,
+		QoS:       msg.QoS,
+		Retain:    msg.Retain,
+		Props:     msg.Props,
+		props:     props,
+		propsSet:  true,
+	}
+	ctx := b.lifecycleContext()
+	for _, target := range b.LocalTargets(pub) {
+		_ = b.SendLocal(ctx, target, pub)
+	}
 }
 
-// OnRemoteKick implements ClusterHandler.
+// OnRemoteKick implements ClusterHandler. A kick for another namespace is
+// dropped: a client id is only unique inside its namespace, so applying it would
+// close an unrelated session that happens to share the id.
 func (b *Broker) OnRemoteKick(msg ClusterMessage) {
+	if msg.Namespace != b.namespace {
+		b.metrics.RecordDroppedMessage("cluster_namespace")
+		b.log.Debug("gmqx remote kick dropped", "namespace", msg.Namespace, "client", msg.ClientID)
+		return
+	}
 	b.mu.RLock()
-	c := b.clients[msg.ClientID]
+	c := b.clients[namespaceKey(b.namespace, msg.ClientID)]
 	b.mu.RUnlock()
 	if c != nil {
 		c.close(false)
 	}
+}
+
+// Namespace returns the broker's isolation scope. The empty string is the
+// default namespace.
+func (b *Broker) Namespace() string { return b.namespace }
+
+// lifecycleContext is the parent of work that belongs to the broker rather than
+// to a connection: the per-connection context derives from it, and a remote
+// publication's local fan-out runs under it. It is the context Start received,
+// or context.Background() for a broker that never started.
+func (b *Broker) lifecycleContext() context.Context {
+	b.mu.RLock()
+	ctx := b.ctx
+	b.mu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func minQoS(a, b byte) byte {

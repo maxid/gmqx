@@ -138,12 +138,17 @@ type RedisClusterConfig struct {
 	MaxSummaryFilters int
 
 	// Metrics, when set, receives RecordDroppedMessage for events the cluster
-	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward"), the same
-	// reasons the TCP backend reports.
+	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward",
+	// "cluster_namespace"), the same reasons the TCP backend reports.
 	Metrics MetricsManager
 	// Logger receives membership and connectivity decisions (default
 	// slog.Default()).
 	Logger *slog.Logger
+	// Namespace scopes the traffic of this backend: an event or subscription
+	// summary of another namespace is dropped. When the backend is passed to a
+	// Broker, the broker's Config.Namespace is authoritative and overrides this
+	// value at Start. The empty string is the default namespace.
+	Namespace string
 }
 
 // redisMemberRecord is the value of a node's member key. The key's TTL — not the
@@ -174,7 +179,11 @@ type redisOwnerRecord struct {
 type redisSummaryRecord struct {
 	NodeID  string   `json:"node"`
 	Filters []string `json:"filters"`
-	Updated int64    `json:"updated"` // unix nanoseconds
+	// Namespace scopes the summary: a peer only uses summaries of its own
+	// namespace. The field is additive on the wire; an old value without it is
+	// the default namespace.
+	Namespace string `json:"ns,omitempty"`
+	Updated   int64  `json:"updated"` // unix nanoseconds
 }
 
 // redisFrame is the envelope of one event on a node channel. The node channels
@@ -200,6 +209,7 @@ type redisPeer struct {
 func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 	return &redisCluster{
 		cfg:       cfg,
+		namespace: cfg.Namespace,
 		local:     newSummarySet(),
 		refreshCh: make(chan struct{}, 1),
 	}
@@ -224,12 +234,12 @@ func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 // only a bounded-time copy of it, refreshed from Redis and never used to decide
 // membership on its own.
 type redisCluster struct {
-	cfg   RedisClusterConfig
-	log   *slog.Logger
-	rdb   *redis.Client
-	dedup *dedupTable
-
+	cfg         RedisClusterConfig
+	log         *slog.Logger
+	rdb         *redis.Client
+	dedup       *dedupTable
 	nodeID      string
+	namespace   string
 	incarnation string
 	since       time.Time
 	handler     ClusterHandler
@@ -272,6 +282,11 @@ type redisCluster struct {
 
 	wg sync.WaitGroup
 }
+
+// setNamespace implements namespaceScoped: the broker's Config.Namespace is
+// authoritative for a backend attached to a broker. It must run before Start;
+// the broker calls it that way.
+func (c *redisCluster) setNamespace(namespace string) { c.namespace = namespace }
 
 // Start implements Cluster. It connects to Redis, takes ownership of the node
 // id, subscribes to this node's channel and only then registers the node, so a
@@ -506,6 +521,16 @@ func (c *redisCluster) Spread(ctx context.Context, msg ClusterMessage) error {
 		c.recordDrop("cluster_forward", "refusing to forward a received event")
 		return nil
 	}
+	// A locally produced event belongs to this node's namespace. An empty value
+	// is stamped, exactly as Origin is; an explicit value of another namespace
+	// cannot be produced here and is dropped instead of leaking into a scope this
+	// node does not serve.
+	if msg.Namespace == "" {
+		msg.Namespace = c.namespace
+	} else if msg.Namespace != c.namespace {
+		c.recordDrop("cluster_namespace", "locally produced event for another namespace")
+		return nil
+	}
 	msg.Origin = c.nodeID
 	msg.NodeID = c.nodeID
 	msg.Seq = c.seq.Add(1)
@@ -655,6 +680,12 @@ func (c *redisCluster) loadViewCtx(ctx context.Context) (map[string]*redisPeer, 
 		}
 		var rec redisSummaryRecord
 		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+			continue
+		}
+		if rec.Namespace != c.namespace {
+			// A summary of another namespace is not usable for directed routing:
+			// the peer stays unknown, receives every publish, and drops it on the
+			// receive path.
 			continue
 		}
 		p.filters = capFilters(rec.Filters, c.maxSummaryFilters())
@@ -816,9 +847,10 @@ func (c *redisCluster) refreshLocal(ctx context.Context) error {
 	var summary []byte
 	if known {
 		summary, err = json.Marshal(redisSummaryRecord{
-			NodeID:  c.nodeID,
-			Filters: filters,
-			Updated: time.Now().UnixNano(),
+			NodeID:    c.nodeID,
+			Filters:   filters,
+			Namespace: c.namespace,
+			Updated:   time.Now().UnixNano(),
 		})
 		if err != nil {
 			return err
@@ -1116,16 +1148,25 @@ func (c *redisCluster) handlePayload(channel, payload string) {
 
 // dispatchEvent hands one received event to the broker.
 //
-// The order of the two filters is the loop guard: an event this node produced is
-// dropped before it touches the dedup table, so own traffic can never pollute the
-// table and evict the identities of real remote events. A redelivered event is
-// dropped by (Origin, Seq) instead of being applied twice. An event is never
-// forwarded.
+// The namespace is the first filter: an event of another namespace is dropped
+// before it touches the dedup table or the handler, so a Redis deployment that
+// carries several namespaces never applies another scope's publish, retained
+// update or kick.
+//
+// The order of the two identity filters is the loop guard: an event this node
+// produced is dropped before it touches the dedup table, so own traffic can never
+// pollute the table and evict the identities of real remote events. A redelivered
+// event is dropped by (Origin, Seq) instead of being applied twice. An event is
+// never forwarded.
 func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
 	if c.handler == nil {
 		return
 	}
 	if msg.Type != ClusterPublish && msg.Type != ClusterKick {
+		return
+	}
+	if msg.Namespace != c.namespace {
+		c.recordDrop("cluster_namespace", "event belongs to another namespace")
 		return
 	}
 	if msg.Origin == "" {

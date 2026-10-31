@@ -26,6 +26,19 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - Wire-level MQTT 3.1.1/5 conformance suite (`TestConformance`)
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
   `MetricsManager`, `Interceptor`
+- Pluggable routing: `Dispatcher` receives a `Publication` for every accepted
+  publish and decides where it goes; the nil dispatcher keeps the built-in local
+  delivery plus cluster spread (`DefaultDispatcher`), and the broker exposes a
+  read-only seam (`LocalTargets`, `SendLocal`, `SpreadPublication`) so a
+  dispatcher never re-implements topic matching
+- Connection-scoped context for every hook: `ConnInfo` (client id, connection
+  id, namespace, remote address, protocol level) through
+  `ContextWithConn`/`ConnFromContext`, enriched once at CONNECT by
+  `Config.ConnContext` and cancelled when the connection ends
+- Namespace isolation: `Config.Namespace` scopes the session table, subscription
+  matching, retained state and the cluster subscription summaries/events, so a
+  publish of one namespace never reaches a session of another; the default empty
+  namespace keeps single-namespace deployments unchanged
 - Connect modes: `UNIQUE` / `KICK` (client id takeover)
 - Limits: max connections, max subscriptions, max retained messages,
   connection rate limiting
@@ -95,8 +108,49 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `MaxRetainMessages` | 0 | retained message count limit |
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
+| `Namespace` | `""` (default) | isolation scope for sessions, retained state and cluster traffic |
+| `Dispatcher` | `DefaultDispatcher` | routing SPI: local delivery plus cluster spread by default |
+| `ConnContext` | nil | enrich the per-connection context at CONNECT |
 
 Full MQTT 5 properties/semantics, full QoS 2 and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+
+## Dispatcher, connection context and namespaces
+
+`Config.Dispatcher` is the single decision point for where an accepted
+publication goes. The broker authorizes, runs the interceptors and the sink
+first; retained state is written before routing, so a dispatcher decides where
+live publications go, not what is retained. `DefaultDispatcher` (the nil
+default) delivers to local matching sessions and spreads to the cluster backend.
+A custom dispatcher routes through the broker's read-only seam instead of
+matching topics itself:
+
+```go
+type myDispatcher struct{ broker *gmqx.Broker }
+
+func (d *myDispatcher) Bind(b *gmqx.Broker) { d.broker = b }
+
+func (d *myDispatcher) Dispatch(ctx context.Context, pub gmqx.Publication) error {
+    for _, target := range d.broker.LocalTargets(pub) {
+        _ = d.broker.SendLocal(ctx, target, pub)
+    }
+    return d.broker.SpreadPublication(ctx, pub)
+}
+```
+
+Every hook receives a connection-scoped context. Go has no thread-local state,
+so the connection identity travels as a context value: `gmqx.ConnFromContext`
+returns the `gmqx.ConnInfo` of the connection a hook runs for. The context is
+created when the connection is accepted, enriched once at CONNECT by
+`Config.ConnContext` (values and deadlines put there reach every hook of that
+connection), reused for the whole exchange, and cancelled when the connection
+ends.
+
+`Config.Namespace` is the isolation scope of a broker. Sessions, subscription
+matching, the retained store and the advertised subscription summaries are
+partitioned by it, and a remote cluster event that belongs to another namespace
+is dropped by both built-in backends. The empty string is the default namespace
+(the zero value), so a deployment that does not set it behaves exactly as before,
+including the documented Redis key layout.
 
 ## Transport layering
 
