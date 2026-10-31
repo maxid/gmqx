@@ -91,6 +91,10 @@
   跨节点 publish/kick、重连）以及
   Redis 后端（按节点划分通道而非网状互联、Redis 中以 TTL 维护的成员关系、
   相同的去重与路由规则）
+- MQTT 客户端库（`github.com/maxid/gmqx/client`，仅标准库 + gnety MQTT 编解码器）：
+  MQTT 3.1.1/5、双向 QoS 1/2 状态机（DUP/PUBREL 重传与 inflight 窗口）、
+  带退避与订阅恢复的重连、keepalive、MQTT 5 属性，以及有界且有序的写队列与投递队列
+  （见下面的 **MQTT 客户端**）
 
 ## 安装
 
@@ -122,16 +126,23 @@ broker, _ := gmqx.New(gmqx.Config{
 ## 示例
 
 [`examples/broker-demo`](examples/broker-demo/main.go) 在回环地址的临时端口上启动 broker，
-连接一个客户端并完成一次发布/订阅往返。gmqx 不提供客户端 API，因此示例借助
-gnety 的 MQTT 编解码器（broker 自身使用的线格式层）充当 MQTT 3.1.1 客户端，
-并打印 broker 回送的 PUBLISH：
+借助 gnety 的 MQTT 编解码器（broker 自身使用的线格式层）连接一个客户端并完成一次
+发布/订阅往返，打印 broker 回送的 PUBLISH：
 
 ```sh
 go run ./examples/broker-demo
 go run ./examples/broker-demo -addr 127.0.0.1:1883 -topic demo/hello
 ```
 
-broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
+[`examples/client-demo`](examples/client-demo/main.go) 通过客户端库完成同样的往返：
+未指定 `-addr` 时自行启动进程内 broker，随后连接、订阅、发布、打印投递并关闭：
+
+```sh
+go run ./examples/client-demo
+go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello -qos 2 -version 5
+```
+
+两个示例都把 broker 与客户端放在同一进程内，无需第三方 MQTT 客户端。
 
 ## 配置（部分）
 
@@ -182,8 +193,87 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 取默认值，因为这四项正是防止单个慢速或沉默客户端占掉无界内存、卡住协程、或长期占用一个
 永远不完成 CONNECT 的连接槽的护栏。
 
-客户端库、与 mosquitto/paho 的互操作测试、基准与压测、v1.0 API 稳定化仍在路线图中
+### 客户端（`client.Config`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `Addr` | —（必填） | 服务器地址 |
+| `ClientID` | `""` | MQTT client id；为空时必须设置 `CleanStart`（由服务器分配） |
+| `Username` / `Password` | — | CONNECT 凭据；密码必须与用户名同时存在 |
+| `KeepAlive` | 0（关闭） | PINGREQ 间隔与看门狗；CONNECT 字段向上取整到秒 |
+| `CleanStart` | false | 每次 CONNECT 的 Clean Session（3.1.1）/ Clean Start（5）；clean 连接在重连后会重新订阅 |
+| `SessionExpiry` | 0 | MQTT 5 Session Expiry Interval（秒） |
+| `Version` | `mqtt.Version311` | `mqtt.Version311` 或 `mqtt.Version5` |
+| `TLS` | nil | 在 dialer 返回后为连接套上 TLS |
+| `Dialer` | `net.Dialer` | 首次连接与每次重连都使用的传输钩子 |
+| `ConnectTimeout` | 10 s | dial + TLS + CONNECT/CONNACK 的时限 |
+| `WriteTimeout` | 10 s | 单个数据包的写超时 |
+| `MaxInflight` | 64 | 未确认的 QoS 1/2 交换数；窗口满时阻塞而非丢弃，并受服务器 Receive Maximum 压低（负值：不限） |
+| `ReceiveMaximum` | 0（不发送） | 本客户端通告的 MQTT 5 Receive Maximum |
+| `MaximumPacketSize` | 0（解码 8 MiB 护栏） | 本客户端通告并用于入站数据包的 MQTT 5 Maximum Packet Size |
+| `Reconnect` | 关闭 | `Enabled`、`InitialDelay`（1 s）、`MaxDelay`（30 s）、`MaxAttempts`（0 = 不限）、`Jitter`（0.2） |
+| `OnMessage` / `OnConnect` / `OnDisconnect` | nil | 投递与生命周期回调，绝不在客户端方法持锁时运行 |
+| `Will` | nil | 遗嘱（topic、payload、QoS、retain、MQTT 5 will 属性） |
+| `OutboundQueueSize` | 256 | 写协程的包队列与投递协程的消息队列；队列满时阻塞，绝不丢弃 |
+| `RetryInterval` / `MaxRetries` | 5 s / 5 | QoS 1/2 重传基准间隔与上限（`MaxRetries` 为负：不重传） |
+
+与 mosquitto/paho 的互操作测试、基准与压测、v1.0 API 稳定化仍在路线图中
 （见 [ROADMAP.md](ROADMAP.md)）。
+
+## MQTT 客户端
+
+`github.com/maxid/gmqx/client` 是库的客户端半边：一个只依赖标准库与 gnety MQTT
+编解码器的 MQTT 3.1.1/5 客户端，自己实现客户端状态机，而不是包装另一个客户端：
+
+```go
+c, err := client.Dial(ctx, client.Config{
+    Addr:       "127.0.0.1:1883",
+    ClientID:   "device-42",
+    KeepAlive:  30 * time.Second,
+    CleanStart: true,
+    Version:    mqtt.Version5,
+    Reconnect:  client.ReconnectPolicy{Enabled: true},
+    OnMessage:  func(m *client.Message) { fmt.Println(m.Topic, string(m.Payload)) },
+})
+if err != nil {
+    return err
+}
+defer c.Close()
+
+if _, err := c.Subscribe(ctx, client.Subscription{Filter: "sensors/+/temp", QoS: 1}); err != nil {
+    return err
+}
+if err := c.Publish(ctx, "sensors/a/temp", []byte("21.5"), 1, false); err != nil {
+    return err
+}
+```
+
+- **双向 QoS 1/2。** `Publish` 在 QoS 1 收到 PUBACK、QoS 2 收到 PUBCOMP 后返回；
+  未确认的交换会用原 packet id 重传——PUBLISH 置 DUP、等待 PUBCOMP 的交换重发
+  PUBREL——最多 `MaxRetries` 次，之后以 `ErrRetryLimit` 失败。inflight 窗口
+  （`MaxInflight`，并由服务器的 Receive Maximum 压低）让后续 QoS 1/2 发布等待，
+  既不丢弃也不乱序。入站方向，QoS 1 PUBLISH 以 PUBACK 确认，QoS 2 PUBLISH 走
+  PUBREC/PUBREL/PUBCOMP，packet id 一直记到 PUBREL，因此重传只会投递一次。
+- **重连。** 非预期的连接丢失通过 `OnDisconnect` 上报；开启 `Reconnect.Enabled`
+  后，客户端以指数退避加抖动的间隔重连，最多 `MaxAttempts` 次（0 = 不限），
+  通过 `OnConnect(sessionPresent)` 上报结果，重放未确认的交换，并在服务器没有保留
+  会话时恢复订阅。`Close` 永不重连，服务器发来的 DISCONNECT（例如会话被接管）
+  也不会重试。
+- **Keepalive。** 设置 `KeepAlive` 后每个间隔发送一次 PINGREQ；再过一个间隔仍未收到
+  PINGRESP 即判定连接死亡，走与传输失败相同的路径。0 表示两者都关闭。
+- **MQTT 5 属性。** CONNECT 中发送 Session Expiry、Receive Maximum 与
+  Maximum Packet Size；PUBLISH 中发送 content type、response topic、correlation
+  data、user properties、payload format 与 message expiry；SUBSCRIBE 中发送
+  user properties 与 subscription identifier。CONNACK 分配的 client id、reason code、
+  Receive Maximum、Maximum Packet Size 与能力标志通过 `ClientID()` 与
+  `ServerInfo()` 暴露；被拒绝的确认是 `*ReasonError`；超过服务器 Maximum Packet Size
+  的数据包以 `ErrPacketTooLarge` 失败，而不是被静默丢弃。
+- **有界且有序的投递。** 每条连接一个读协程、一个写协程，另有投递协程与监管协程；
+  没有“每条消息一个协程”，`Close` 会 join 它们全部。所有数据包经过同一个有界 FIFO
+  （`OutboundQueueSize`，默认 256），因此按调用顺序离开，且单个客户端的写积压不会无界增长。
+  队列满时调用方阻塞到写协程追上（受其 context 约束），既不丢包也不报错。
+  `OnMessage` 在投递协程上运行，绝不在客户端方法持锁时运行，可以调用 `Publish` 与
+  `Subscribe`；回调不得阻塞或调用 `Close`。
 
 ## Dispatcher、连接 context 与命名空间
 

@@ -33,7 +33,7 @@
 - [x] Subscription index for local routing (literal filters in a map, wildcard filters per distinct filter; the publish path never calls `SessionStore`)
 - [x] Directed publish to a client id (`PublishToClient`) with Redis client-id presence and the TCP broadcast fallback
 - [x] Gossip cluster backend (SWIM membership, epidemic dissemination, gossiped summaries and client-id presence) and it is the default backend
-- [ ] Client library
+- [x] MQTT client library (`client/`): MQTT 3.1.1/5, QoS 1/2 state machines in both directions with DUP/PUBREL retransmission and inflight windows, reconnection with backoff and subscription restore, keepalive, MQTT 5 properties, bounded ordered writer/delivery queues
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests
 - [ ] v1.0 API stabilization

@@ -128,6 +128,11 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   subscription-aware directed routing, cross-node publish/kick, reconnect) and a
   Redis backend (per-node channels instead of a mesh, TTL membership in Redis,
   the same deduplication and routing rules)
+- MQTT client library (`github.com/maxid/gmqx/client`, standard library + the
+  gnety MQTT codec only): MQTT 3.1.1/5, QoS 1/2 state machines in both directions
+  with DUP/PUBREL retransmission and inflight windows, reconnection with backoff
+  and subscription restore, keepalive, MQTT 5 properties, and bounded ordered
+  writer and delivery queues (see **MQTT client** below)
 
 ## Install
 
@@ -159,17 +164,26 @@ broker, _ := gmqx.New(gmqx.Config{
 ## Examples
 
 [`examples/broker-demo`](examples/broker-demo/main.go) starts a broker on an
-ephemeral loopback port, connects one client and completes a publish/subscribe
-round trip. gmqx ships no client API, so the demo acts as an MQTT 3.1.1 client
-through the gnety MQTT codec (the wire layer the broker itself uses) and prints
-the PUBLISH the broker delivers back:
+ephemeral loopback port, connects one client through the gnety MQTT codec (the
+wire layer the broker itself uses) and completes a publish/subscribe round trip,
+printing the PUBLISH the broker delivers back:
 
 ```sh
 go run ./examples/broker-demo
 go run ./examples/broker-demo -addr 127.0.0.1:1883 -topic demo/hello
 ```
 
-Broker and client share one process, so no third-party MQTT client is needed.
+[`examples/client-demo`](examples/client-demo/main.go) runs the same round trip
+through the client library: it starts an in-process broker unless `-addr` names an
+external one, subscribes, publishes, prints the delivery and closes:
+
+```sh
+go run ./examples/client-demo
+go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello -qos 2 -version 5
+```
+
+Both demos keep broker and client in one process, so no third-party MQTT client is
+needed.
 
 ## Configuration (selected)
 
@@ -226,8 +240,99 @@ that never completes its CONNECT. `ReceiveMaximum` selects 64 when it is zero an
 65535 (the protocol default) when it is negative; the byte-rate limits are
 disabled by a negative value.
 
-The client library, an interoperability run against mosquitto/paho, benchmarks and
-the v1.0 API stabilization are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+### Client (`client.Config`)
+
+| Field | Default | Description |
+|---|---|---|
+| `Addr` | — (required) | server address |
+| `ClientID` | `""` | MQTT client id; an empty id requires `CleanStart` (the server assigns one) |
+| `Username` / `Password` | — | CONNECT credentials; a password requires a user name |
+| `KeepAlive` | 0 (disabled) | PINGREQ interval and watchdog; the CONNECT field is rounded up to seconds |
+| `CleanStart` | false | Clean Session (3.1.1) / Clean Start (5) of every CONNECT; a clean connection resubscribes after a reconnect |
+| `SessionExpiry` | 0 | MQTT 5 Session Expiry Interval in seconds |
+| `Version` | `mqtt.Version311` | `mqtt.Version311` or `mqtt.Version5` |
+| `TLS` | nil | wrap the connection in TLS after the dialer returns |
+| `Dialer` | `net.Dialer` | transport hook for the initial connection and every reconnect |
+| `ConnectTimeout` | 10 s | dial + TLS + CONNECT/CONNACK deadline |
+| `WriteTimeout` | 10 s | write deadline of one packet |
+| `MaxInflight` | 64 | unconfirmed QoS 1/2 exchanges; the window blocks instead of dropping, capped by the server's Receive Maximum (negative: unlimited) |
+| `ReceiveMaximum` | 0 (absent) | MQTT 5 Receive Maximum this client advertises |
+| `MaximumPacketSize` | 0 (8 MiB decoder guard) | MQTT 5 Maximum Packet Size this client advertises and enforces on inbound packets |
+| `Reconnect` | disabled | `Enabled`, `InitialDelay` (1 s), `MaxDelay` (30 s), `MaxAttempts` (0 = unlimited), `Jitter` (0.2) |
+| `OnMessage` / `OnConnect` / `OnDisconnect` | nil | delivery and lifecycle callbacks, never run while a client method holds a lock |
+| `Will` | nil | last will (topic, payload, QoS, retain, MQTT 5 will properties) |
+| `OutboundQueueSize` | 256 | packets queued for the writer and messages queued for the delivery goroutine; a full queue blocks, it never drops |
+| `RetryInterval` / `MaxRetries` | 5 s / 5 | QoS 1/2 retransmission base interval and limit (negative `MaxRetries`: no retransmission) |
+
+An interoperability run against mosquitto/paho, benchmarks and the v1.0 API
+stabilization are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
+
+## MQTT client
+
+`github.com/maxid/gmqx/client` is the client half of the library: an MQTT 3.1.1
+and MQTT 5 client that depends only on the standard library and the gnety MQTT
+codec. It implements the client state machines itself instead of wrapping another
+client:
+
+```go
+c, err := client.Dial(ctx, client.Config{
+    Addr:       "127.0.0.1:1883",
+    ClientID:   "device-42",
+    KeepAlive:  30 * time.Second,
+    CleanStart: true,
+    Version:    mqtt.Version5,
+    Reconnect:  client.ReconnectPolicy{Enabled: true},
+    OnMessage:  func(m *client.Message) { fmt.Println(m.Topic, string(m.Payload)) },
+})
+if err != nil {
+    return err
+}
+defer c.Close()
+
+if _, err := c.Subscribe(ctx, client.Subscription{Filter: "sensors/+/temp", QoS: 1}); err != nil {
+    return err
+}
+if err := c.Publish(ctx, "sensors/a/temp", []byte("21.5"), 1, false); err != nil {
+    return err
+}
+```
+
+- **QoS 1 and QoS 2 in both directions.** `Publish` returns after PUBACK (QoS 1)
+  or PUBCOMP (QoS 2); an unconfirmed exchange is retransmitted with the original
+  packet id — DUP set for a PUBLISH, a repeated PUBREL for an exchange awaiting
+  PUBCOMP — up to `MaxRetries`, and fails with `ErrRetryLimit` after that. The
+  inflight window (`MaxInflight`, lowered by the server's Receive Maximum) blocks
+  further QoS 1/2 publishes instead of dropping or reordering them. Inbound, a
+  QoS 1 PUBLISH is acknowledged with PUBACK and a QoS 2 PUBLISH runs
+  PUBREC/PUBREL/PUBCOMP, with the packet id remembered until PUBREL so a
+  retransmission is delivered exactly once.
+- **Reconnection.** An unexpected connection loss is reported through
+  `OnDisconnect`, and with `Reconnect.Enabled` the client reconnects with
+  exponential backoff and jitter up to `MaxAttempts` (0 means unlimited),
+  reports `OnConnect(sessionPresent)`, replays unconfirmed exchanges and restores
+  its subscriptions when the server did not keep the session. `Close` never
+  reconnects, and a server DISCONNECT (a session takeover, for example) is not
+  retried.
+- **Keepalive.** `KeepAlive` sends PINGREQ once per interval; a PINGRESP that does
+  not arrive within one further interval marks the connection dead and takes the
+  same path as a transport failure. Zero disables both.
+- **MQTT 5 properties.** Session Expiry, Receive Maximum and Maximum Packet Size
+  in CONNECT; content type, response topic, correlation data, user properties,
+  payload format and message expiry on PUBLISH; user properties and a subscription
+  identifier on SUBSCRIBE. The CONNACK's assigned client id, reason codes, Receive
+  Maximum, Maximum Packet Size and capability flags are surfaced through
+  `ClientID()` and `ServerInfo()`, a refused acknowledgement is a `*ReasonError`,
+  and a packet larger than the server's Maximum Packet Size fails with
+  `ErrPacketTooLarge` instead of being silently dropped.
+- **Bounded, ordered delivery.** One reader and one writer goroutine per
+  connection, one delivery goroutine and one supervisor own the client; there is no
+  goroutine per message, and `Close` joins them all. Every packet goes through one
+  bounded FIFO (`OutboundQueueSize`, default 256), so packets leave in the order
+  they were issued and one client cannot grow its writer backlog without bound. A
+  full queue blocks the caller until the writer catches up (honouring its context)
+  rather than dropping the packet or failing the call. `OnMessage` runs on the
+  delivery goroutine, never while a client method holds a lock, and may call
+  `Publish` and `Subscribe`; callbacks must not block or call `Close`.
 
 ## Dispatcher, connection context and namespaces
 

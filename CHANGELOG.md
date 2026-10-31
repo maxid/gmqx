@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+- **The MQTT client library is here: `github.com/maxid/gmqx/client`.**
+
+  *New package.* `client/` is a full MQTT 3.1.1/5 client built on the standard
+  library and `gnety/codec/mqtt` only: `Dial`, `Close`, `Publish`,
+  `PublishMessage`, `Subscribe`, `Unsubscribe`, `Connected`, `SessionPresent`,
+  `ClientID` and `ServerInfo`, with `Config` (keepalive, clean start/session
+  expiry, TLS, dialer, timeouts, inflight window, MQTT 5 receive maximum/maximum
+  packet size, reconnect policy, will, callbacks) and a
+  `Message`/`Subscription`/`PublishOptions`/`Will`/`ReconnectPolicy`/`ServerInfo`/
+  `ReasonError` model.
+
+  *State machines, not a wrapper.* QoS 1 keeps an exchange until PUBACK and QoS 2
+  runs PUBLISH/PUBREC/PUBREL/PUBCOMP, retransmitting with DUP and a repeated
+  PUBREL up to `MaxRetries` (`ErrRetryLimit` after that) and blocking on the
+  inflight window (`MaxInflight`, capped by the server's Receive Maximum) instead
+  of dropping or reordering. Inbound QoS 1 is PUBACKed and QoS 2 is delivered
+  exactly once per packet id until PUBREL. An unexpected connection loss is
+  reported to `OnDisconnect` and, with `Reconnect.Enabled`, reconnected with
+  exponential backoff and jitter up to `MaxAttempts`; the client reports
+  `OnConnect(sessionPresent)`, replays unconfirmed exchanges and restores
+  subscriptions when the server did not keep the session. `Close` never
+  reconnects and a server DISCONNECT is not retried. Keepalive sends PINGREQ and
+  treats a missing PINGRESP as a dead connection.
+
+  *Bounded, ordered transport.* One reader and one writer goroutine per
+  connection, one delivery goroutine and one supervisor, all joined by `Close`;
+  no goroutine per message. Every packet crosses one bounded FIFO
+  (`OutboundQueueSize`, 256 by default) in issue order and a full queue blocks
+  the caller (honouring its context) instead of dropping the packet, so memory is
+  bounded and a QoS 1/2 publish is never silently lost.
+
+  *MQTT 5.* Session Expiry, Receive Maximum and Maximum Packet Size in CONNECT;
+  user properties and subscription identifiers on SUBSCRIBE; content type,
+  response topic, correlation data, user properties, payload format and message
+  expiry on PUBLISH; the CONNACK's assigned client id, reason codes, capability
+  flags and flow-control limits are surfaced through `ClientID()`/`ServerInfo()`,
+  a refusal is a `*ReasonError`, and a packet over the server's Maximum Packet
+  Size fails with `ErrPacketTooLarge`.
+
+  *Examples and docs.* `examples/client-demo` runs a subscribe/publish/print/close
+  round trip against an in-process broker (or `-addr`), and the client test suite
+  covers the QoS handshakes, retained messages, wills, reconnection, keepalive,
+  inflight and maximum-packet-size paths against the real broker.
+
 - **MQTT 5 flow control in both directions, QoS 2 state across a reconnect,
   byte-rate shaping and listener port fallback.**
 

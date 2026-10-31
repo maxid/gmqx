@@ -1,11 +1,13 @@
 // Command broker-demo starts a gmqx broker and completes one publish/subscribe
 // round trip against it.
 //
-// gmqx has no client API, so the demo acts as an MQTT 3.1.1 client through
-// gnety/codec/mqtt, the wire codec the broker itself uses: CONNECT, SUBSCRIBE,
-// PUBLISH and DISCONNECT are encoded and sent, then CONNACK, SUBACK and the
-// delivered PUBLISH are decoded and printed. Broker and client share one
-// process, so go run shows the round trip without a third-party MQTT client.
+// The demo acts as a raw MQTT 3.1.1 client through gnety/codec/mqtt, the wire
+// codec the broker itself uses: CONNECT, SUBSCRIBE, PUBLISH and DISCONNECT are
+// encoded and sent, then CONNACK, SUBACK and the delivered PUBLISH are decoded
+// and printed. It deliberately uses the wire layer rather than
+// github.com/maxid/gmqx/client, which examples/client-demo shows. Broker and
+// client share one process, so go run shows the round trip without a third-party
+// MQTT client.
 package main
 
 import (
