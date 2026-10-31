@@ -31,7 +31,10 @@
   通配符订阅（`+`/`#`）、带 QoS/retain/属性的遗嘱消息、MQTT 5 Will Delay Interval
   （延迟到期发布、被重连取消、被会话过期提前触发）、keepalive
 - CONNECT 阶段与鉴权时限：`ConnectTimeout` 关闭永远不完成 CONNECT 的连接，
-  `AuthTimeout` 限制 `Authenticate` 与 `ACL.Check`，超时视为拒绝
+  `AuthTimeout` 限制 `Authenticate`、`AuthExchange` 的每次调用与 `ACL.Check`，超时视为拒绝
+- MQTT 5 增强认证（AUTH）：`AuthExchange` SPI（`Begin`/`Continue`）配多方法
+  `Config.Authenticator`，未知方法以 CONNACK 0x8C 拒绝，交换可给出权威身份，
+  活动连接上可重新认证，步数与时限有界（见下方 **增强认证**）
 - 线级 MQTT 3.1.1/5 一致性测试套件（`TestConformance`）
 - 可插拔钩子：`AuthManager`、`AclManager`、`EventSink`（生命周期/消息）、
   `MetricsManager`、`Interceptor`
@@ -128,7 +131,7 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `ConnectMode` | `UNIQUE` | 拒绝或踢掉已存在的 client id |
 | `NotKickSeconds` | 30 | 接管的防抖窗口，本地 CONNECT 与收到的对端 kick 都适用（负值：不设窗口） |
 | `ConnectTimeout` | 10 s | CONNECT 阶段读超时；只建连不发 CONNECT 的连接会被关闭 |
-| `AuthTimeout` | 5 s | `Authenticate` 与 `ACL.Check` 的时限；超时即拒绝（负值：不限） |
+| `AuthTimeout` | 5 s | `Authenticate`、`AuthExchange` 的每次调用与 `ACL.Check` 的时限；超时即拒绝（负值：不限） |
 | `MaxWillDelayInterval` | 5 min | 允许的最长 MQTT 5 Will Delay Interval（负值：不限） |
 | `MaxConnections` | 0（不限） | 并发连接数限制 |
 | `MaxTopicSubscriptions` | 0 | 每会话订阅数限制 |
@@ -146,6 +149,7 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `SessionSweepInterval` | 30 s | 过期会话的清理间隔（负值：不清理） |
 | `SessionStore` | `MemorySessionStore` | 离线会话状态的持久化接缝；`NewRedisSessionStore` 使其在 Redis 集群各节点间共享 |
 | `Auth` / `ACL` / `Sink` / `Metrics` | 全部放行 / 空实现 | 可插拔 SPI |
+| `Authenticator` / `AuthMethods` | nil / 空 | MQTT 5 增强认证：按方法返回 `AuthExchange` 的工厂，以及 broker 支持的方法集合（CONNECT 命名其它方法时以 0x8C 拒绝） |
 | `Namespace` | `""`（默认） | 会话、保留状态与集群流量的隔离作用域 |
 | `Dispatcher` | `DefaultDispatcher` | 路由 SPI：默认本地投递 + 集群传播 |
 | `ConnContext` | nil | 在 CONNECT 时增强每连接 context |
@@ -290,6 +294,90 @@ gnety codec 在解析阶段就拒绝 0（这是该值唯一可见的位置——
 客户端 PUBLISH 中携带的标识符会被剥离，投递的标识符由写出 PUBLISH 的节点附加，
 不会经由 `Publication.Props` 或集群传输。
 
+
+## 增强认证（MQTT 5 AUTH）
+
+MQTT 5 允许客户端用多步交换代替“用户名 + 密码”的单次认证：CONNECT 里声明
+**Authentication Method**，双方交换 AUTH 报文。gmqx 过去不声明任何方法、对每个 AUTH
+都回 DISCONNECT 0x82；现在通过 `AuthExchange`（`AuthManager` 的兄弟钩子）真正驱动交换：
+
+```go
+type AuthExchange interface {
+    Method() string
+    Begin(ctx context.Context, info gmqx.ConnectInfo) (gmqx.AuthStep, error)
+    Continue(ctx context.Context, data []byte) (gmqx.AuthStep, error)
+}
+
+broker, _ := gmqx.New(gmqx.Config{
+    AuthMethods:   []string{"scram-sha-256"},
+    Authenticator: func(method string) gmqx.AuthExchange { /* nil ⇒ 不支持该方法 */ },
+    ACL:           myACL{},
+})
+```
+
+`Config.Authenticator` 是工厂而不是单个交换：一个 broker 可支持多种方法，CONNECT 里的
+方法决定用哪一个，返回 `nil` 表示“不支持”。`Config.AuthMethods` 是声明支持的方法集合，
+在询问工厂之前就拦下不支持的 CONNECT；为空表示“工厂支持什么就接受什么”。
+
+`AuthStep` 表达下一步：
+
+| `AuthStep.Status` | broker 的处理 |
+|---|---|
+| `AuthContinue` | 发送 AUTH 0x18（Continue authentication），携带方法与 `Data`，随后等待客户端的 AUTH 0x18，并用其数据调用 `Continue` |
+| `AuthSucceeded` | 用 CONNACK 0x00 携带方法与 `Data`（活动连接上则是 AUTH 0x00）；`Info` 非空时即认证出的身份 |
+| `AuthFailed` | 用 `ReasonCode` 发送 CONNACK（或 DISCONNECT）并关闭；0 取 0x87，凭据错误用 0x86，方法无法继续用 0x8C |
+
+```text
+client                                   broker
+  │ CONNECT method=token, data=hello       │
+  │                                        │ exchange.Begin(ctx, info{AuthMethod, AuthData})
+  │ <────────── AUTH 0x18 method=token ────│  (step: continue, data="challenge")
+  │            data=challenge              │
+  │ AUTH 0x18 method=token, data=answer ──>│ exchange.Continue(ctx, "answer")
+  │ <────────── CONNACK 0x00 method=token ─│  (step: succeeded, data="done")
+```
+
+`Begin` 立即成功时完全没有 AUTH：CONNECT 直接得到 CONNACK 0x00，携带方法与最终数据。
+
+边界与语义：
+
+- **方法是协商结果，不是列表。** MQTT 5 §3.2.2.3.8 规定 CONNACK 的 Authentication Method
+  只是客户端 CONNECT 的回显（客户端未声明时禁止携带），因此 CONNACK 只会出现客户端用过的
+  那个方法。命名了 broker 不支持的方法时以 CONNACK 0x8C（Bad authentication method）拒绝并
+  关闭连接——这个拒绝就是客户端得知自己猜错方法的方式。没有方法却携带 Authentication Data
+  是 Protocol Error（CONNACK 0x82）。
+- **用了 AUTH 的连接不再经过 `AuthManager`。** 交换本身就是认证，因此跳过
+  `AuthManager.Authenticate`：`Auth` 字段里的 `DenyAll` 不会拦住增强认证的客户端；没有方法的
+  连接照旧走 `AuthManager`（`AllowAll`/`DenyAll` 行为不变）。授权不变：每次 publish 与
+  subscribe 仍由 `AclManager.Check` 按交换确定的身份判定。
+- **交换给出的身份优先。** 成功步骤返回的 `ConnectInfo` 中，非空的 `Username` 与 `ClientID`
+  覆盖 CONNECT 里的值，broker 以该身份注册会话，`EventSink`/`AclManager` 也看到它；空字段保持
+  客户端发来的值。其它字段不生效，因为 AUTH 报文只能携带方法与数据。
+- **有界。** 一次交换最多 `MaxAuthSteps`（8）次挑战，之后以 0x87 拒绝
+  （`RecordDroppedMessage("auth_steps")`），不会无限循环。整个 CONNECT 阶段的交换位于
+  `ConnectTimeout` 之内，因此不回答挑战的客户端会在该截止时间被断开。每次 `Begin`/`Continue`
+  调用受 `AuthTimeout` 限制，超时或出错一律视为认证失败（0x87），绝不视为成功。
+- **重新认证。** 活动连接上的 AUTH 0x19 会开启一次新交换（重新向工厂取一个交换，再用连接的
+  `ConnectInfo` 与该报文的数据调用 `Begin`）。成功时回 AUTH 0x00，会话（订阅、离线队列、
+  inflight 交换）完全不动；新交换可以更新 `Username`（`ClientID` 是活动会话的键，不会改变）。
+  失败时用该步骤的原因码发送 DISCONNECT 并关闭连接；重新认证声明了另一个方法、或 AUTH 不是
+  要求重新认证，都是 Protocol Error（DISCONNECT 0x82）。交换在连接自己的协程上运行，因此同一
+  客户端的 AUTH 报文永远不会与它的 PUBLISH 并发处理。
+
+实现方需要做的：`Method` 返回被请求的方法；把 `info.AuthData`（来自 CONNECT）与 `Continue`
+收到的 `data` 当作不透明凭据字节；每次调用只返回一个结论。broker 从连接的读取路径上一次调用
+一个回调，等到结论后才读取下一个报文，因此交换与该客户端的其它报文严格有序。每次调用收到的
+context 携带 `AuthTimeout` 截止时间（时限为正时回调可能跑在 broker 等待的辅助协程上）：
+回调可以阻塞在存储或目录服务上，但必须遵守该 context。返回 error 即认证失败，
+`Info` 只在成功的步骤上生效。
+
+对既有部署的行为变化：
+
+- broker 没有对应交换时，CONNECT 声明 Authentication Method 现在以 CONNACK 0x8C 拒绝；
+  过去会接受（CONNACK 不带方法），随后 AUTH 得到 0x82；
+- 携带 Authentication Data 却没有 Authentication Method 现在以 CONNACK 0x82 拒绝，不再忽略；
+- 没有协商方法的连接与过去完全一致：CONNACK 不含 Authentication Method，AUTH 得到
+  DISCONNECT 0x82。
 
 ## 持久会话、离线队列与 QoS 1/2 重传
 
@@ -481,11 +569,13 @@ kick。新节点的 kick 到达旧对端时，只是多了一个旧构建会忽�
 **CONNECT 与鉴权时限。** `ConnectTimeout`（默认 10 s）在读取第一个数据包之前设置读截止时间，
 在 CONNACK 写出后清除；随后由读循环设置它自己负责的 keepalive 截止时间。因此只建连不说话、
 或 CONNECT 发得太慢的客户端会被断开，而不是永久占用一个连接槽、一个协程和一个会话。
-`AuthTimeout`（默认 5 s）限制 `AuthManager.Authenticate` 与 `AclManager.Check`：钩子在自己的
-协程里运行，收到的 context 携带该截止时间；超时的调用一律视为拒绝——认证失败（CONNACK
-0x87）或授权不通过（SUBACK 0x87 / 不返回成功 PUBACK）——绝不视为成功。内建的 `AllowAll`
-走同步路径，所以保持默认配置的 broker 不会为每次发布多起一个协程；`AuthTimeout` 取负值即
-取消时限，此时钩子必须自己遵守 context。
+`AuthTimeout`（默认 5 s）限制 `AuthManager.Authenticate`、`AuthExchange.Begin`/`Continue`
+的每次调用与 `AclManager.Check`：钩子在自己的协程里运行，收到的 context 携带该截止时间；
+超时的调用一律视为拒绝——认证失败（CONNACK 0x87）或授权不通过（SUBACK 0x87 / 不返回成功
+PUBACK）——绝不视为成功。在活动连接上，同一时限也是整个重新认证交换的读截止时间，
+因为此时已没有 CONNECT 截止时间可用。内建的 `AllowAll` 走同步路径，所以保持默认配置的
+broker 不会为每次发布多起一个协程；`AuthTimeout` 取负值即取消时限，此时钩子必须自己遵守
+context。
 
 ## 传输分层
 

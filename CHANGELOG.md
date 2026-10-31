@@ -5,6 +5,66 @@
 
 ## [Unreleased]
 
+- **MQTT 5 enhanced authentication (AUTH) works; the broker no longer answers every
+  AUTH with DISCONNECT 0x82.**
+
+  *The SPI.* A new `AuthExchange` hook (`Method`, `Begin`, `Continue`) is built per
+  connection by `Config.Authenticator func(method string) AuthExchange`, so one
+  broker can support several methods; `Config.AuthMethods` is the advertised set a
+  CONNECT is checked against, and a `nil` factory keeps the previous behavior (no
+  method, AUTH is a Protocol Error). `AuthStep` reports `AuthContinue` (the broker
+  sends AUTH 0x18 with the step's data and calls `Continue` with the client's
+  answer), `AuthSucceeded` (CONNACK 0x00 — or AUTH 0x00 on a live connection —
+  carrying the method and the final data, plus an optional `ConnectInfo` with the
+  authenticated identity) or `AuthFailed` (CONNACK/DISCONNECT with the step's reason
+  code, 0x87 by default). `ConnectInfo` grew `AuthMethod` and `AuthData`, which is
+  how the CONNECT's authentication properties reach `Begin`.
+
+  *The handshake.* A CONNECT naming a method the broker has no exchange for is
+  refused with CONNACK 0x8C (Bad authentication method) and closed; an exchange's
+  first step may succeed immediately (CONNACK 0x00 with the method and its data) or
+  continue (AUTH 0x18, one per challenge, each answered by the client's AUTH 0x18 and
+  fed to `Continue`). The CONNACK's Authentication Method is exactly the method the
+  client used, as §3.2.2.3.8 requires; Authentication Data on a CONNECT without a
+  method is a Protocol Error (CONNACK 0x82).
+
+  *Identity.* A successful step's `ConnectInfo` is authoritative: its non-empty
+  `Username` and `ClientID` replace the CONNECT's, the session is registered under
+  them and the hooks see them. Because the exchange is the authentication, the
+  `Auth` (`AuthManager`) hook is skipped for such a connection — `DenyAll` there does
+  not block an enhanced-authenticated client — while `AclManager` still authorizes
+  every publish and subscribe of it.
+
+  *Re-authentication.* An AUTH 0x19 on a live connection starts a fresh exchange
+  over the connection (a new exchange from the factory, `Begin` again), answered with
+  AUTH 0x00 on success and a DISCONNECT with the step's reason code on failure; the
+  session — subscriptions, offline queue, inflight exchanges — is not touched and the
+  `Username` may be updated. A re-authentication naming another method, or an AUTH
+  that does not ask to re-authenticate, is a Protocol Error (DISCONNECT 0x82).
+
+  *Bounds.* One exchange runs at most `MaxAuthSteps` (8) challenges and is then
+  refused with 0x87 (`RecordDroppedMessage("auth_steps")`). The whole CONNECT
+  exchange is inside `Config.ConnectTimeout` (a client that never answers a challenge
+  is disconnected at that deadline), each `Begin`/`Continue` call is bounded by
+  `Config.AuthTimeout`, and on a live connection the same timeout is the read
+  deadline of the whole re-authentication. The exchange runs on the connection's own
+  goroutine, so no AUTH is ever handled concurrently with another packet of the
+  client.
+
+  Behavior changes for existing deployments:
+
+  - A CONNECT that names an Authentication Method when the broker has no exchange for
+    it is now refused with CONNACK 0x8C. It used to be accepted (the CONNACK carried
+    no method) and the AUTH that followed was answered with 0x82.
+  - Authentication Data without an Authentication Method is now a CONNACK 0x82
+    instead of an ignored property.
+  - A connection that negotiates no method behaves exactly as before: no
+    Authentication Method in the CONNACK and DISCONNECT 0x82 for an AUTH.
+  - New `RecordDroppedMessage` reasons: `auth_method` (a CONNECT named an unsupported
+    method) and `auth_steps` (the exchange exceeded `MaxAuthSteps`); the new exported
+    sentinel `ErrBadAuthMethod` and the constant `ReasonBadAuthMethod` (0x8C) name
+    the refusal.
+
 - **Shared subscriptions and subscription identifiers work; the CONNACK advertises
   both as available.**
 

@@ -134,6 +134,18 @@ type client struct {
 	// mqtt.Version5. MQTT 3.1 clients decode and encode with the 3.1.1 layout,
 	// which is byte-identical for everything except CONNECT.
 	version byte
+
+	// authMethod is the MQTT 5 enhanced-authentication method the CONNECT
+	// negotiated, "" when the connection authenticated any other way. It is written
+	// by the handshake before the connection is registered and never changes: a
+	// re-authentication must use the negotiated method. Only the connection's own
+	// goroutine reads it afterwards (the AUTH handler and the read loop), so it
+	// needs no lock.
+	authMethod string
+	// authData is the final Authentication Data of a successful CONNECT exchange;
+	// it goes into the CONNACK. Written with authMethod, before the connection is
+	// registered and the CONNACK is written.
+	authData []byte
 }
 
 func newClient(b *Broker, conn net.Conn) *client {
@@ -514,6 +526,9 @@ func connectError(err error) error {
 }
 
 // connectInfo maps a decoded CONNECT onto the public ConnectInfo the SPI sees.
+// The MQTT 5 authentication properties travel with it: AuthMethod selects the
+// enhanced-authentication path and AuthData is the client's first exchange
+// message.
 func connectInfo(m *mqtt.Connect) ConnectInfo {
 	info := ConnectInfo{
 		ClientID:      string(m.ClientID),
@@ -522,6 +537,8 @@ func connectInfo(m *mqtt.Connect) ConnectInfo {
 		KeepAlive:     m.KeepAlive,
 		CleanSession:  m.CleanSession,
 		SessionExpiry: m.Properties.SessionExpiryInterval,
+		AuthMethod:    m.Properties.AuthenticationMethod,
+		AuthData:      m.Properties.AuthenticationData,
 	}
 	if m.Will != nil {
 		info.WillTopic = m.Will.Topic
@@ -544,9 +561,45 @@ func (c *client) handshake() error {
 	info := connectInfo(connect)
 	info.RemoteAddr = c.conn.RemoteAddr().String()
 	c.attachConnectContext(info)
-	if err := c.broker.authenticate(c.context(), info); err != nil {
-		_ = c.writeConnack(connackNotAuthorized(c.version), "")
-		return fmt.Errorf("%w: %v", ErrUnauthorized, err)
+	if info.AuthData != nil && info.AuthMethod == "" {
+		// Authentication Data without an Authentication Method is a Protocol Error
+		// (MQTT 5 §3.1.2.11.10): there is no exchange the data could belong to, and
+		// AuthManager must not be handed bytes it never asked for.
+		_ = c.writeConnack(connackProtocolError(c.version), "")
+		return fmt.Errorf("%w: Authentication Data without an Authentication Method", ErrMalformedPacket)
+	}
+	switch {
+	case info.AuthMethod != "":
+		// MQTT 5 enhanced authentication: the exchange is the authentication of
+		// this connection, so AuthManager.Authenticate is skipped for it (see
+		// AuthExchange). The whole exchange runs inside the CONNECT read deadline,
+		// and each call into it is bounded by Config.AuthTimeout.
+		exchange := c.broker.authExchange(info.AuthMethod)
+		if exchange == nil {
+			c.broker.metrics.RecordDroppedMessage("auth_method")
+			_ = c.writeConnack(connackBadAuthMethod(c.version), "")
+			return fmt.Errorf("%w: %q", ErrBadAuthMethod, info.AuthMethod)
+		}
+		step, err := c.runAuth(exchange, info)
+		if err != nil {
+			var refused authReject
+			if errors.As(err, &refused) {
+				_ = c.writeConnack(refused.code, "")
+				return fmt.Errorf("%w: %v", ErrUnauthorized, err)
+			}
+			return err
+		}
+		// The exchange is the authentication: the identity it returns wins over the
+		// CONNECT's (a device key bound to the credential, for example), and the
+		// CONNACK reports the negotiated method and the final authentication data.
+		info = mergeAuthIdentity(info, step.Info)
+		c.authMethod = info.AuthMethod
+		c.authData = step.Data
+	default:
+		if err := c.broker.authenticate(c.context(), info); err != nil {
+			_ = c.writeConnack(connackNotAuthorized(c.version), "")
+			return fmt.Errorf("%w: %v", ErrUnauthorized, err)
+		}
 	}
 	assigned := ""
 	if info.ClientID == "" {
@@ -666,11 +719,10 @@ func (c *client) loop() {
 			c.close(withWill)
 			return
 		case *mqtt.Auth:
-			// Enhanced authentication was not negotiated: CONNECT carried no
-			// Authentication Method, so an AUTH packet is a protocol error
-			// (MQTT 5 3.15.2) rather than something to ignore.
-			c.protocolError(0x82)
-			return
+			// AUTH on an established connection is a re-authentication (0x19) or a
+			// protocol error; handleAuth runs the exchange inline, on this goroutine,
+			// so it is ordered with every other packet of the client.
+			c.handleAuth(m)
 		default:
 			c.broker.log.Debug("gmqx ignoring packet type", "type", msg.Type())
 		}
@@ -931,7 +983,7 @@ func (c *client) writeConnack(code byte, assignedClientID string) error {
 		ack.SessionPresent = c.sessionPresent
 	}
 	if c.version == mqtt.Version5 && code == 0 {
-		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize))
+		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize), c.authMethod, c.authData)
 	}
 	return c.writeMessage(ack)
 }
@@ -1008,6 +1060,27 @@ func willPublishProperties(p mqtt.Properties) mqtt.Properties {
 func connackNotAuthorized(version byte) byte {
 	if version == mqtt.Version5 {
 		return 0x87
+	}
+	return 5
+}
+
+// connackBadAuthMethod is the CONNACK of a CONNECT that named an MQTT 5
+// Authentication Method this broker has no exchange for (§3.2.2.2: 0x8C Bad
+// authentication method). MQTT 3.1.1 has no Authentication Method at all, so only
+// a malformed CONNECT could ask; it is refused like any other failed
+// authentication.
+func connackBadAuthMethod(version byte) byte {
+	if version == mqtt.Version5 {
+		return ReasonBadAuthMethod
+	}
+	return 5
+}
+
+// connackProtocolError is the CONNACK of a protocol violation the broker detects
+// before the connection is admitted (MQTT 5 §3.2.2.2: 0x82 Protocol Error).
+func connackProtocolError(version byte) byte {
+	if version == mqtt.Version5 {
+		return ReasonProtocolError
 	}
 	return 5
 }

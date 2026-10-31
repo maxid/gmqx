@@ -86,18 +86,23 @@ type Config struct {
 	// A client that opens the socket and sends nothing, or sends its CONNECT too
 	// slowly, is therefore disconnected instead of holding a connection slot, a
 	// goroutine and a session forever. The deadline also covers the authentication
-	// call (see AuthTimeout, which bounds that call on its own). Default 10 s;
+	// call (see AuthTimeout, which bounds that call on its own) and the whole MQTT
+	// 5 enhanced-authentication exchange, so a client that stalls on an AUTH is
+	// disconnected at this deadline instead of being waited on. Default 10 s;
 	// a non-positive value selects the default and there is no unlimited setting.
 	ConnectTimeout time.Duration
 	// AuthTimeout bounds one call into the authentication/authorization SPI:
-	// AuthManager.Authenticate at CONNECT, and AclManager.Check for every
-	// SUBSCRIBE and PUBLISH. The hook receives a context carrying the deadline and
-	// is abandoned when it expires; an expired call is a refusal — a failed
-	// authentication or a denied authorization — never a success. The built-in
-	// AllowAll (the default of both SPIs) cannot block and always takes the
-	// synchronous path, so a broker that keeps the defaults pays no goroutine per
-	// check. Default 5 s; a negative value disables the bound and calls the hook
-	// synchronously, which then has to respect its context itself.
+	// AuthManager.Authenticate at CONNECT, each AuthExchange.Begin/Continue call of
+	// an enhanced-authentication exchange, and AclManager.Check for every SUBSCRIBE
+	// and PUBLISH. On a live connection it is also the read deadline of a whole
+	// re-authentication exchange, because no CONNECT deadline exists any more. The
+	// hook receives a context carrying the deadline and is abandoned when it
+	// expires; an expired call is a refusal — a failed authentication or a denied
+	// authorization — never a success. The built-in AllowAll (the default of both
+	// SPIs) cannot block and always takes the synchronous path, so a broker that
+	// keeps the defaults pays no goroutine per check. Default 5 s; a negative value
+	// disables the bound and calls the hook synchronously, which then has to
+	// respect its context itself.
 	AuthTimeout time.Duration
 	// MaxWillDelayInterval bounds the MQTT 5 Will Delay Interval this broker
 	// honours. A will that asks for a longer delay is published after this bound
@@ -197,10 +202,41 @@ type Config struct {
 	// session.
 	SessionStore SessionStore
 
-	// SPI
+	// Auth is the authentication hook of a CONNECT that carries no MQTT 5
+	// Authentication Method. A connection that negotiates an enhanced
+	// authentication method is authenticated by Config.Authenticator instead and
+	// this hook is skipped for it; every other connection goes through it, so
+	// AllowAll and DenyAll keep working for the non-AUTH path.
 	Auth AuthManager
-	ACL  AclManager
-	Sink EventSink
+	// Authenticator builds the MQTT 5 enhanced-authentication exchange (AUTH) of
+	// one connection, given the Authentication Method the client named in its
+	// CONNECT. Returning nil means "this method is not supported" and the CONNECT
+	// is refused with CONNACK 0x8C (Bad authentication method). A nil factory
+	// advertises no method at all: the previous behavior, in which a connection
+	// that somehow has no negotiated method and sends AUTH is a Protocol Error
+	// (DISCONNECT 0x82). The returned exchange must report the method it was asked
+	// for (AuthExchange.Method).
+	//
+	// The exchange replaces AuthManager for the connection it authenticates: on
+	// success its ConnectInfo is the authoritative identity (ClientID/Username)
+	// and AuthManager.Authenticate is not called. AclManager still authorizes every
+	// publish and subscribe of the connection. See AuthExchange for the flow, the
+	// deadline (Config.AuthTimeout per call) and the step limit (MaxAuthSteps).
+	Authenticator func(method string) AuthExchange
+	// AuthMethods lists the MQTT 5 Authentication Methods this broker advertises.
+	// A CONNECT that names a method outside the list is refused with CONNACK 0x8C
+	// even when Config.Authenticator would build an exchange for it; an empty list
+	// means "whatever the factory supports".
+	//
+	// MQTT 5 has no field for a list of methods in CONNACK (§3.2.2.3.8 makes the
+	// Authentication Method an echo of the client's, and including one the client
+	// did not send is a Protocol Error), so the list is what the CONNACK echo can
+	// name and what a CONNECT is checked against: a client that guesses a method
+	// learns from 0x8C that it guessed wrong. When a method is negotiated, the
+	// CONNACK Authentication Method is exactly the one the client used.
+	AuthMethods []string
+	ACL         AclManager
+	Sink        EventSink
 	// PublishCallbackTimeout bounds how long a publish waits for the sink. When
 	// it expires the publish is Retryable and no success ACK is sent. Zero waits
 	// without a bound (the sink must respect ctx).

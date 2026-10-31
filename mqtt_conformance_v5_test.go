@@ -5,6 +5,7 @@ package gmqx
 // property blocks, topic aliases, subscription options and reason codes.
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -615,13 +616,52 @@ func test5SharedSubscriptions(t *testing.T) {
 }
 
 func test5Auth(t *testing.T) {
-	// Enhanced authentication is not negotiated: the CONNACK carries no
-	// Authentication Method, so an AUTH packet is a protocol error (MQTT 5
-	// 3.15.2) and the broker must say so rather than ignore the packet.
-	b := startBroker(t, Config{})
-	c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-auth", clean: true})
-	c.write(&mqtt.Auth{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
-	expectDisconnect(t, c, 0x82)
+	t.Run("not_negotiated", func(t *testing.T) {
+		// Enhanced authentication is not negotiated: the CONNACK carries no
+		// Authentication Method, so an AUTH packet is a protocol error (MQTT 5
+		// 3.15.2) and the broker must say so rather than ignore the packet.
+		b := startBroker(t, Config{})
+		c, ack := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-auth", clean: true})
+		if ack.Properties.AuthenticationMethod != "" {
+			t.Fatalf("CONNACK Authentication Method = %q, want none", ack.Properties.AuthenticationMethod)
+		}
+		c.write(&mqtt.Auth{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
+		expectDisconnect(t, c, 0x82)
+	})
+	t.Run("negotiated_one_step", func(t *testing.T) {
+		// With an exchange for the method, the same CONNECT is authenticated by
+		// the exchange and the CONNACK names the method the client used.
+		exchange := &scriptedAuth{method: "token", begin: func(context.Context, ConnectInfo) (AuthStep, error) {
+			return AuthStep{Status: AuthSucceeded, Data: []byte("welcome")}, nil
+		}}
+		b := startBroker(t, Config{Authenticator: authFactory(exchange), AuthMethods: []string{"token"}})
+		c, ack := mustConnect(t, b.Addr(), confConnect{
+			version: mqtt.Version5, clientID: "v5-auth-ok", clean: true,
+			props: mqtt.Properties{AuthenticationMethod: "token", AuthenticationData: []byte("t")},
+		})
+		if ack.Properties.AuthenticationMethod != "token" {
+			t.Fatalf("CONNACK Authentication Method = %q, want token", ack.Properties.AuthenticationMethod)
+		}
+		if string(ack.Properties.AuthenticationData) != "welcome" {
+			t.Fatalf("CONNACK Authentication Data = %q, want welcome", ack.Properties.AuthenticationData)
+		}
+		c.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
+		readConf[*mqtt.Pingresp](t, c)
+	})
+	t.Run("unknown_method", func(t *testing.T) {
+		// A CONNECT naming a method the broker has no exchange for is a CONNACK
+		// 0x8C (Bad authentication method), not a successful connect that later
+		// fails on AUTH.
+		b := startBroker(t, Config{})
+		c, ack := dialConf(t, b.Addr(), confConnect{
+			version: mqtt.Version5, clientID: "v5-auth-unknown", clean: true,
+			props: mqtt.Properties{AuthenticationMethod: "token", AuthenticationData: []byte("t")},
+		})
+		if ack.ReasonCode != 0x8c {
+			t.Fatalf("CONNACK reason %#x, want 0x8C Bad authentication method", ack.ReasonCode)
+		}
+		expectClosed(t, c)
+	})
 }
 
 func test5ProtocolErrorDisconnect(t *testing.T) {

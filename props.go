@@ -30,9 +30,17 @@ const topicAliasMaximum uint16 = 16
 // Subscription Available state the other capabilities; the four of them are
 // implemented (shared subscription routing lives in shared.go, subscription
 // identifiers in subscription_id.go), so all four are advertised as available.
-func connackProperties(assignedClientID string, maxPacketSize uint32) mqtt.Properties {
+//
+// authMethod is the enhanced authentication method the connection negotiated and
+// authData the final data of its exchange; both are empty for a connection that
+// authenticated any other way. MQTT 5 §3.2.2.3.8 makes the Authentication Method
+// an echo of the client's CONNECT: it may only be sent when the client named a
+// method, and it must be that method, so this function never advertises a method
+// the client did not use. Authentication Data without a method is a Protocol
+// Error, which is why it is written only together with one.
+func connackProperties(assignedClientID string, maxPacketSize uint32, authMethod string, authData []byte) mqtt.Properties {
 	yes := true
-	return mqtt.Properties{
+	props := mqtt.Properties{
 		RetainAvailable:                 &yes,
 		WildcardSubscriptionAvailable:   &yes,
 		SubscriptionIdentifierAvailable: &yes,
@@ -41,6 +49,13 @@ func connackProperties(assignedClientID string, maxPacketSize uint32) mqtt.Prope
 		TopicAliasMaximum:               topicAliasMaximum,
 		AssignedClientID:                assignedClientID,
 	}
+	if authMethod != "" {
+		props.AuthenticationMethod = authMethod
+		if len(authData) > 0 {
+			props.AuthenticationData = authData
+		}
+	}
+	return props
 }
 
 // encodePropertyBlock returns the PUBLISH property bytes of p, without the

@@ -40,8 +40,12 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   properties, and MQTT 5 Will Delay Interval (published after the delay, cancelled
   by a reconnect, cut short by session expiry), keepalive
 - CONNECT-phase and authorization deadlines: `ConnectTimeout` closes a socket
-  that never completes its CONNECT, `AuthTimeout` bounds `Authenticate` and
-  `ACL.Check` and treats an expired call as a refusal
+  that never completes its CONNECT, `AuthTimeout` bounds `Authenticate`, the steps
+  of an `AuthExchange` and `ACL.Check` and treats an expired call as a refusal
+- MQTT 5 enhanced authentication (AUTH): an `AuthExchange` SPI (`Begin`/`Continue`)
+  behind a multi-method `Config.Authenticator`, CONNACK 0x8C for an unknown method,
+  an identity the exchange authenticates, re-authentication on a live connection
+  and a bounded number of steps (see **Enhanced authentication** below)
 - Wire-level MQTT 3.1.1/5 conformance suite (`TestConformance`)
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
   `MetricsManager`, `Interceptor`
@@ -157,7 +161,7 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `ConnectMode` | `UNIQUE` | reject or kick an existing client id |
 | `NotKickSeconds` | 30 | anti-flap window of a takeover, enforced for a local CONNECT and for a peer's kick (negative: no window) |
 | `ConnectTimeout` | 10 s | CONNECT-phase read deadline; a socket that says nothing is closed |
-| `AuthTimeout` | 5 s | bound on `Authenticate` and `ACL.Check`; an expiry is a refusal (negative: no bound) |
+| `AuthTimeout` | 5 s | bound on `Authenticate`, each `AuthExchange` call and `ACL.Check`; an expiry is a refusal (negative: no bound) |
 | `MaxWillDelayInterval` | 5 min | largest MQTT 5 Will Delay Interval honoured (negative: unbounded) |
 | `MaxConnections` | 0 (unlimited) | concurrent connection limit |
 | `MaxTopicSubscriptions` | 0 | per-session subscription limit |
@@ -175,6 +179,7 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `SessionSweepInterval` | 30 s | how often expired sessions are deleted (negative: never) |
 | `SessionStore` | `MemorySessionStore` | persistence seam for offline session state; `NewRedisSessionStore` shares it across the nodes of a Redis cluster |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
+| `Authenticator` / `AuthMethods` | nil / empty | MQTT 5 enhanced authentication: the `AuthExchange` factory per method and the methods the broker supports (a CONNECT naming another method is refused with 0x8C) |
 | `Namespace` | `""` (default) | isolation scope for sessions, retained state and cluster traffic |
 | `Dispatcher` | `DefaultDispatcher` | routing SPI: local delivery plus cluster spread by default |
 | `ConnContext` | nil | enrich the per-connection context at CONNECT |
@@ -371,6 +376,117 @@ hop-local: a PUBLISH from a client that carries it is stripped, and a delivery's
 identifiers are attached by the node that writes the PUBLISH, never carried through
 `Publication.Props` or across the cluster.
 
+
+## Enhanced authentication (MQTT 5 AUTH)
+
+MQTT 5 lets a client authenticate with a multi-step exchange instead of a single
+user name and password: its CONNECT names an **Authentication Method** and the two
+ends trade AUTH packets. gmqx used to advertise no method and answer every AUTH
+with DISCONNECT 0x82; it now drives a real exchange through an `AuthExchange`, the
+sibling of `AuthManager`:
+
+```go
+type AuthExchange interface {
+    Method() string
+    Begin(ctx context.Context, info gmqx.ConnectInfo) (gmqx.AuthStep, error)
+    Continue(ctx context.Context, data []byte) (gmqx.AuthStep, error)
+}
+
+broker, _ := gmqx.New(gmqx.Config{
+    AuthMethods:   []string{"scram-sha-256"},
+    Authenticator: func(method string) gmqx.AuthExchange { /* nil ⇒ unsupported */ },
+    ACL:           myACL{},
+})
+```
+
+`Config.Authenticator` is a factory, not a single exchange: a broker can support
+several methods, the CONNECT's method selects one, and `nil` for a method means
+"this broker does not support it". `Config.AuthMethods` is the advertised set and
+gates the CONNECT before the factory is asked; an empty list accepts whatever the
+factory builds.
+
+An `AuthStep` says what happens next:
+
+| `AuthStep.Status` | Broker reaction |
+|---|---|
+| `AuthContinue` | sends AUTH 0x18 (Continue authentication) with the method and `Data`, then waits for the client's AUTH 0x18 and calls `Continue` with its data |
+| `AuthSucceeded` | CONNACK 0x00 with the method and `Data` (or AUTH 0x00 on a live connection); `Info`, when set, is the authenticated identity |
+| `AuthFailed` | CONNACK (or DISCONNECT) with `ReasonCode` and close; 0 selects 0x87, 0x86 is the code for bad credentials, 0x8C for a method the broker cannot continue |
+
+The state machine, for a broker that supports `token`:
+
+```
+client                                   broker
+  │ CONNECT method=token, data=hello       │
+  │                                        │ exchange.Begin(ctx, info{AuthMethod, AuthData})
+  │ <────────── AUTH 0x18 method=token ────│  (step: continue, data="challenge")
+  │            data=challenge              │
+  │ AUTH 0x18 method=token, data=answer ──>│ exchange.Continue(ctx, "answer")
+  │ <────────── CONNACK 0x00 method=token ─│  (step: succeeded, data="done")
+```
+
+With a `Begin` that succeeds immediately there is no AUTH at all: the CONNECT is
+answered with CONNACK 0x00 carrying the method and the final data.
+
+Boundaries:
+
+- **Methods are negotiated, not listed.** MQTT 5 §3.2.2.3.8 makes the CONNACK
+  Authentication Method an echo of the client's CONNECT (and forbids including one
+  the client did not send), so the CONNACK names exactly the method the client
+  used. A client that names a method the broker does not support is refused with
+  CONNACK 0x8C (Bad authentication method) and the connection closes — that
+  refusal is how a client learns it guessed wrong. Authentication Data on a
+  CONNECT that carries no method is a Protocol Error (CONNACK 0x82).
+- **A connection that used AUTH never reaches `AuthManager`.** The exchange *is*
+  the authentication. `AuthManager.Authenticate` is skipped for it, so `DenyAll`
+  in the `Auth` field does not block an enhanced-authenticated client; every
+  connection without a method still goes through `AuthManager` (and `AllowAll` /
+  `DenyAll` behave as before). Authorization is unchanged: `AclManager.Check` runs
+  for every publish and subscribe of the connection, against the identity the
+  exchange established.
+- **The exchange's identity wins.** The `ConnectInfo` of a successful step
+  replaces the CONNECT's `Username` and `ClientID` when they are set, and that
+  identity is what the broker registers, what `EventSink`/`AclManager` see and what
+  the session is keyed by. An empty field keeps the client's value. Every other
+  field stays the CONNECT's, because an AUTH packet can carry nothing but the
+  method and the data.
+- **Bounded.** One exchange runs at most `MaxAuthSteps` (8) challenges and is then
+  refused with 0x87 (`RecordDroppedMessage("auth_steps")`) instead of looping. The
+  whole CONNECT exchange lives inside `ConnectTimeout`, so a client that never
+  answers a challenge is disconnected at that deadline. Each `Begin`/`Continue`
+  call is bounded by `AuthTimeout`, and an expired or failing call is a failed
+  authentication (0x87), never a success.
+- **Re-authentication.** An AUTH 0x19 on a live connection starts a fresh exchange
+  (a new value from the factory, then `Begin` with the connection's `ConnectInfo`
+  and the packet's data). Success answers AUTH 0x00 and leaves the session — its
+  subscriptions, its queued messages and its inflight exchanges — untouched; the
+  new exchange may update the `Username` (the `ClientID` is a live session key and
+  does not change). A failure ends the connection with a DISCONNECT carrying the
+  step's reason code, and a re-authentication that names another method, or an AUTH
+  that does not ask to re-authenticate, is a Protocol Error (DISCONNECT 0x82).
+  The exchange runs on the connection's own goroutine, so no AUTH packet is ever
+  handled concurrently with a PUBLISH or SUBSCRIBE from the same client.
+
+What an implementation has to do: report the method it was asked for from
+`Method`, treat `info.AuthData` (CONNECT) and `Continue`'s `data` as opaque
+credential bytes, and return exactly one verdict per call. The broker invokes the
+callbacks one at a time from the connection's read path and waits for each verdict
+before it reads the next packet, so an exchange is ordered with the client's other
+packets. Each call receives a context carrying the `AuthTimeout` deadline (with a
+positive timeout it runs on a helper goroutine the broker waits for): a callback
+may block on a store or a directory, and must respect that context. Returning an
+error is a failed authentication, and the broker honours `Info` only on the step
+that succeeds.
+
+Behaviour changes for existing deployments:
+
+- a CONNECT that names an Authentication Method when the broker has no exchange
+  for it is now refused with CONNACK 0x8C. It used to be accepted (the CONNACK
+  carried no method) and the AUTH that followed was answered with 0x82;
+- Authentication Data without an Authentication Method is now refused with CONNACK
+  0x82 rather than ignored;
+- a connection that negotiates no method behaves exactly as before: the CONNACK
+  carries no Authentication Method and an AUTH is DISCONNECT 0x82.
 
 ## Persistent sessions, the offline queue and QoS 1/2 retransmission
 
@@ -637,11 +753,13 @@ read deadline before the first packet is read and clears it once the CONNACK is
 written; the read loop then arms the keep-alive deadline it owns. A client that
 opens the socket and sends nothing, or sends its CONNECT too slowly, is therefore
 disconnected instead of holding a connection slot, a goroutine and a session
-forever. `AuthTimeout` (default 5 s) bounds `AuthManager.Authenticate` and
-`AclManager.Check`: the hook runs in its own goroutine with a context that carries
-the deadline, and an expired call is a refusal — a failed authentication
-(CONNACK 0x87) or a denied authorization (SUBACK 0x87 / no success PUBACK) —
-never a success. The built-in `AllowAll` hooks take the synchronous path, so a
+forever. `AuthTimeout` (default 5 s) bounds `AuthManager.Authenticate`, each
+`AuthExchange.Begin`/`Continue` call and `AclManager.Check`: the hook runs in its
+own goroutine with a context that carries the deadline, and an expired call is a
+refusal — a failed authentication (CONNACK 0x87) or a denied authorization
+(SUBACK 0x87 / no success PUBACK) — never a success. On a live connection the same
+bound is the read deadline of a whole re-authentication exchange, which has no
+CONNECT deadline left to live inside. The built-in `AllowAll` hooks take the synchronous path, so a
 broker that keeps the defaults pays no goroutine per publish; a negative
 `AuthTimeout` disables the bound and calls the hook synchronously, which then has
 to honour its context itself.

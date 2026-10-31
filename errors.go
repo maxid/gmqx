@@ -9,6 +9,11 @@ import (
 var (
 	// ErrUnauthorized is returned when authentication fails.
 	ErrUnauthorized = errors.New("gmqx: unauthorized")
+	// ErrBadAuthMethod is returned when a CONNECT names an MQTT 5 Authentication
+	// Method this broker has no exchange for (Config.Authenticator returns nil, or
+	// the method is outside Config.AuthMethods). The CONNACK that accompanies it is
+	// 0x8C (Bad authentication method) on MQTT 5.
+	ErrBadAuthMethod = errors.New("gmqx: bad authentication method")
 	// ErrMalformedPacket indicates an invalid MQTT packet.
 	// It aliases the wire codec error so callers can match either sentinel.
 	ErrMalformedPacket = mqtt.ErrMalformedPacket

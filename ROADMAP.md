@@ -16,6 +16,7 @@
 - [x] Shared subscriptions (`$share/{ShareName}/{filter}`): validated per §4.8.2, one live member per group round robin, one node per group across a cluster (origin-side election over the advertised groups), no retained replay and no shared offline queue
 - [x] Subscription identifiers (SUBSCRIBE property 0x0B): stored with the subscription, round-tripped through the `SessionStore`, attached to live, retained-replay, offline-queue and shared-group deliveries, deduplicated and capped per delivery
 - [x] MQTT 5 Will Delay Interval (cancelled by resume, cut short by session expiry, bounded by `MaxWillDelayInterval`)
+- [x] MQTT 5 enhanced authentication (AUTH): `AuthExchange` SPI (`Begin`/`Continue`) with `Config.Authenticator`/`AuthMethods`, CONNACK method echo, identity precedence over `AuthManager`, re-authentication on a live connection, bounded steps and deadlines
 - [x] Retained message expiry (MQTT 5 Message Expiry Interval, replayed decremented, deleted when elapsed)
 - [x] Takeover parity across nodes (connect-time kick in both connect modes, DISCONNECT 0x8E) and the `NotKickSeconds` anti-flap window
 - [x] Kick epochs: a kick names the node and the connect time of the connection that produced it, so a delayed kick cannot close a newer connection, and the anti-flap window applies on the receiving side too
