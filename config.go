@@ -27,16 +27,50 @@ type TLSConfig struct {
 }
 
 // ClusterConfig holds cluster settings. ClusterBackend selects the optional
-// cross-node implementation; the built-in TCP backend uses these settings where applicable.
+// cross-node implementation; when it is nil and Enabled is set, the built-in
+// gossip backend is created from these fields (see New and NewGossipCluster).
+// The fields that have no meaning for the gossip backend are not here: the
+// backend is selected by Enabled/ClusterBackend, its listen address by Addr and
+// its peer list by Seeds.
 type ClusterConfig struct {
-	Enabled                  bool
-	URL                      string
-	Port                     int
-	Node                     string
-	Namespace                string
-	PingTimeout              time.Duration
-	SuspicionMultiplier      int
-	ClusterMessageBufferSize int
+	// Enabled turns the cluster on. An explicit Config.ClusterBackend always wins
+	// over it: Enabled is what selects the default (gossip) backend when no
+	// backend object was supplied.
+	Enabled bool
+	// Addr is the gossip cluster listen address this node advertises, e.g.
+	// "10.0.0.1:7946". It must be explicit (no ":0") and must differ from every
+	// MQTT listener address, because peers dial it and compare it with their own
+	// view of this node. It is required when Enabled is set and ClusterBackend is
+	// nil. The empty string is an error at broker Start, exactly as for
+	// NewTCPCluster.
+	Addr string
+	// Seeds are the cluster addresses of other nodes to contact. A node learns
+	// the rest of the cluster from their gossip, so one reachable seed is enough
+	// to join; a node with no seeds starts alone and still serves local traffic.
+	Seeds []string
+	// Node is the node id this broker announces in the cluster. It is used only
+	// when Config.NodeID is empty; an explicit Config.NodeID wins.
+	Node string
+	// Namespace scopes the gossip traffic. It is used only when Config.Namespace
+	// is empty; the broker's namespace is authoritative for a backend attached to
+	// it. The empty string is the default namespace.
+	Namespace string
+	// PingInterval is how often a node probes one random member (default 1s).
+	PingInterval time.Duration
+	// PingTimeout is how long a direct probe may take before the member is probed
+	// indirectly through the other members (default 500ms).
+	PingTimeout time.Duration
+	// SuspicionMultiplier is how many PingIntervals a suspected member may stay
+	// silent before it is declared dead (default 3). A negative value is an
+	// error.
+	SuspicionMultiplier int
+	// Fanout is how many peers one node writes one event to (default
+	// min(len(members), 3), computed at send time). Receivers forward to Fanout
+	// peers they did not receive the event from, so the whole cluster is reached
+	// with O(N·Fanout) frames instead of N². A value at or above the member count
+	// makes every event a full broadcast, which is what a 2- or 3-node cluster
+	// wants. A negative value is an error.
+	Fanout int
 }
 
 // Config is the broker configuration. Transport-specific tuning knobs are

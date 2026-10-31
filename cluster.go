@@ -131,8 +131,11 @@ type clientPresence interface {
 //
 // Start may refuse a nodeID that another live process already owns by returning
 // an error that wraps ErrNodeIDInUse: two processes sharing an id would apply
-// every event twice. A backend without shared state (the built-in TCP mesh)
-// cannot arbitrate that and collapses duplicate links into one member instead.
+// every event twice. A backend without shared state (the built-in TCP mesh and
+// the gossip backend) cannot arbitrate that before a peer is seen: the gossip
+// backend refuses the link of a peer that announces this node's own id and keeps
+// the id for itself, while the TCP mesh collapses duplicate links into one
+// member.
 type Cluster interface {
 	Start(ctx context.Context, nodeID string, handler ClusterHandler) error
 	Stop(ctx context.Context) error
@@ -151,6 +154,22 @@ type SharedDelivery struct {
 	Groups []string `json:"groups"`
 }
 
+// MemberState is the liveness of one node in a cluster backend's member view.
+type MemberState string
+
+const (
+	// MemberAlive is a node that answers and is routable.
+	MemberAlive MemberState = "alive"
+	// MemberSuspect is a node that missed a ping and is being probed again,
+	// directly and through other members, before it is declared dead.
+	MemberSuspect MemberState = "suspect"
+	// MemberDead is a node that stopped answering its probe window. It is still
+	// in the view until DeadTimeout elapses, because a dead record has to outlive
+	// the suspicion that produced it, and a node that refutes its incarnation can
+	// come back.
+	MemberDead MemberState = "dead"
+)
+
 // Member is one node in a cluster backend's member view.
 type Member struct {
 	// NodeID is the node id the peer announced in its handshake.
@@ -161,6 +180,10 @@ type Member struct {
 	Incarnation string
 	// Since is when this incarnation became a member.
 	Since time.Time
+	// State is the liveness the backend tracks for the node. A backend that
+	// only exposes a peer list leaves it empty, which means alive; the gossip
+	// backend reports MemberAlive, MemberSuspect or MemberDead (see MemberState).
+	State MemberState
 }
 
 // MemberView is implemented by cluster backends that expose their member view.

@@ -29,7 +29,7 @@
 - [x] Redis cluster backend (per-node channels, TTL membership in Redis, directed routing)
 - [x] Subscription index for local routing (literal filters in a map, wildcard filters per distinct filter; the publish path never calls `SessionStore`)
 - [x] Directed publish to a client id (`PublishToClient`) with Redis client-id presence and the TCP broadcast fallback
-- [ ] A gossip cluster backend
+- [x] Gossip cluster backend (SWIM membership, epidemic dissemination, gossiped summaries and client-id presence) and it is the default backend
 - [ ] Client library
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests

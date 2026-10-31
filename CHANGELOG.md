@@ -5,6 +5,60 @@
 
 ## [Unreleased]
 
+- **A gossip cluster backend is the default; `Config.Cluster.Enabled` now does
+  something without an explicit backend.**
+
+  *The backend.* `NewGossipCluster` (and `GossipClusterConfig`) implements the
+  existing `Cluster`/`ClusterHandler`/`MemberView` contracts with a SWIM-style
+  membership service and epidemic event dissemination over gnety's length-prefixed
+  TCP transport. Membership: a random incarnation per process, one random direct
+  probe per `PingInterval`, up to three indirect probes after `PingTimeout`, a
+  suspect window of `SuspicionMultiplier × PingInterval`, incarnation-number
+  refutation of false suspicions, bounded member deltas piggybacked on every
+  ping/ack, and removal of dead members after `DeadTimeout`. Seeding needs one
+  reachable address: the rest of the view arrives through the deltas.
+
+  *Dissemination.* Publishes, kicks, retained updates and directed publishes are
+  written to at most `Fanout` peers (`min(len(members), 3)` by default) and forwarded
+  by every receiver to peers it did not receive them from; the existing
+  `(Origin, Seq)` dedup table terminates the epidemic, so a cluster of N nodes
+  costs O(N·Fanout) frames per event instead of N². At N ≤ Fanout the origin writes
+  every peer and nothing is left to forward, which is the full broadcast a small
+  cluster wants. Subscription summaries (filters and shared-group keys, the same
+  `summarySet`) travel as membership metadata and still direct ordinary publishes;
+  an unknown or stale summary is included in the epidemic instead of being skipped.
+  Client-id presence is gossiped the same way (Lamport version, process
+  incarnation, TTL, namespace-scoped), so `PublishToClient` is written to the one
+  node that holds the client id and falls back to the epidemic only when that
+  claim is absent, expired or dead.
+
+  *Bounds.* One frame carries at most `MaxGossipDelta` member records and
+  `MaxPresenceDelta` presence claims; the presence table, dedup table, probe tables,
+  dial queue and per-link frame queue are bounded; fan-out is bounded; each link
+  has one writer goroutine, never one per message. `Members()` reports the new
+  `Member.State` (`alive`/`suspect`/`dead`) sorted by node id.
+
+  *Default selection and configuration.* `Config.Cluster.Enabled` with no
+  `Config.ClusterBackend` creates the gossip backend from `ClusterConfig.Addr`,
+  `Seeds`, `PingInterval`, `PingTimeout`, `SuspicionMultiplier` and `Fanout`; an
+  explicit backend still wins, so `NewTCPCluster` and `NewRedisCluster` keep
+  working. `Cluster.Node`/`Cluster.Namespace` now seed `Config.NodeID`/`Config.Namespace`
+  when those are empty. A node with no seeds starts alone and logs it.
+
+  *Removed configuration* (none of it was ever read): `Config.Cluster.URL`,
+  `Config.Cluster.Port` and `Config.Cluster.ClusterMessageBufferSize`.
+  `Config.Cluster.PingTimeout` and `Config.Cluster.SuspicionMultiplier` were dead
+  too and are now wired to the gossip backend, and `Cluster.Addr`, `Seeds`,
+  `PingInterval` and `Fanout` were added to it.
+
+  *Behaviour changes for existing users.* A deployment that set
+  `Cluster.Enabled` without a backend now runs a cluster backend instead of none
+  (and must therefore set `Cluster.Addr`); a deployment that set `Cluster.Node` or
+  `Cluster.Namespace` now gets them applied instead of ignored. Nothing changes for
+  a deployment that installs `NewTCPCluster`/`NewRedisCluster` explicitly. Code
+  that set `Cluster.URL`, `Cluster.Port` or `Cluster.ClusterMessageBufferSize`
+  no longer compiles, because those fields were removed.
+
 - **MQTT 5 enhanced authentication (AUTH) works; the broker no longer answers every
   AUTH with DISCONNECT 0x82.**
 

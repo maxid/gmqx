@@ -587,6 +587,69 @@ TCP/TLS/WebSocket/WSS 监听器由
 
 ## 集群后端
 
+### Gossip 后端（默认）
+
+`Config.Cluster.Enabled` 且未显式提供 `ClusterBackend` 时，选择内置 gossip 后端。
+它不需要任何外部服务：节点只需配置一个可达的 seed 地址，其余成员从集群 gossip 中学习。
+
+```go
+broker, _ := gmqx.New(gmqx.Config{
+    Addr: "10.0.0.1:1883",
+    Cluster: gmqx.ClusterConfig{
+        Enabled:             true,
+        Addr:                "10.0.0.1:7946", // 必须显式指定，不能是 :0
+        Seeds:               []string{"10.0.0.2:7946"},
+        PingInterval:        time.Second,
+        PingTimeout:         500 * time.Millisecond,
+        SuspicionMultiplier: 3,
+        Fanout:              3,
+    },
+})
+```
+
+`ClusterConfig` 到 `GossipClusterConfig` 的映射：`Addr`/`Seeds` 是集群监听地址与
+seed 列表，`PingInterval`/`PingTimeout` 是探测定时器，`SuspicionMultiplier` 决定
+`SuspectTimeout = SuspicionMultiplier × PingInterval`（可疑成员沉默超过该时长即被判死），
+`Fanout` 是疫情式传播的扇出。`Config.NodeID`/`Config.Namespace` 为空时分别由
+`Cluster.Node`/`Cluster.Namespace` 填充。显式的 `Config.ClusterBackend` 始终优先，
+因此 `NewTCPCluster` 与 `NewRedisCluster` 仍可使用（`gmqx.NewGossipCluster` 可直接
+构造默认后端）。
+
+- **成员关系**采用 SWIM 风格，不依赖共享存储。每个节点有随机 incarnation；
+  每个 `PingInterval` 探测一个随机成员。`PingTimeout` 内无 ack 时改为间接探测：
+  请求最多 3 个其他成员代为 ping。间接探测也超时的成员变为 suspect，随后沉默
+  `SuspectTimeout` 即被判定为 dead。成员变更以有界增量随每个 ping/ack 捎带传播
+  （按 incarnation 合并，发送者自身记录始终在内），所以只认识一个 seed 的新节点也能
+  收敛到完整视图。误判会自愈：得知自己被怀疑的节点递增 incarnation number，更新的记录获胜。
+  dead 成员在视图中保留 `DeadTimeout` 后移除，使重启进程能以同一 id 重新加入。
+- **事件传播**是疫情式的：源节点最多写 `Fanout` 个对等节点（默认
+  `min(len(members), 3)`），每个接收者再转发给它没有从其收到事件的 `Fanout` 个节点。
+  既有 `(Origin, Seq)` 去重表保证每个节点对同一事件最多应用并转发一次，因此一个事件的
+  代价是 O(N·Fanout) 帧而不是每对节点一帧。节点数不超过 `Fanout` 时，源节点写给所有
+  对等节点、接收者已无节点可转发：2–3 节点集群退化为全广播，这正是它需要的。
+- **路由精度**叠加在疫情式传播之上。节点把订阅摘要（过滤器加共享组键，复用其他后端
+  同样的 `summarySet`）作为成员元数据通告。普通 publish 优先发给摘要匹配的对等节点，
+  跳过摘要已知不匹配的节点，对摘要未知（或超过三个 `SummaryInterval` 未刷新）的节点
+  仍然发送，让疫情式传播仍能到达。retained 与 kick 忽略摘要：retained 状态必须在每个
+  节点存在以服务未来订阅者，kick 指向的是 client id 而不是 topic。
+- **Presence** 同样通过 gossip 传播。每个成功的 CONNECT 为本节点认领 client id（断开时
+  传播 tombstone），带 Lamport 版本、所属进程 incarnation 和 TTL。`PublishToClient`
+  对由其他节点持有的 client id 只发给认领者；认领缺失、过期或指向已 dead/离开的节点时
+  回退到疫情式传播，使接管了该 client id 的节点仍能收到。认领按 namespace 隔离，
+  事件去重与其他集群事件一致。
+- **边界**：一帧最多携带 `MaxGossipDelta` 条成员记录和 `MaxPresenceDelta` 条 presence
+  认领；去重表、presence 表与成员视图均有界；单条链路最多排队 32 帧（队列满时丢弃并计入
+  `cluster_backpressure`）；扇出有界；每条链路一个写协程，而不是每条消息一个协程。
+
+`Members()`（通过 `MemberView`）返回按 node id 排序的
+`Member{NodeID, Addr, Incarnation, Since, State}`。`State` 为 `alive`、`suspect` 或
+`dead`；TCP 与 Redis 后端留空，表示 alive。没有 seed 的单节点会正常启动、服务本地流量，
+并记录自己处于独立运行状态。
+
+成员链路与 TCP 后端一样是明文 gnety TCP：两个后端都没有集群链路的 TLS 配置。
+
+### TCP 后端
+
 `gmqx.NewTCPCluster` 通过 gnety TCP 连接各 broker 节点，在带长度前缀的分帧之上
 使用带版本的 JSON 帧：
 
@@ -604,7 +667,7 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: cluster})
 （例如某个 seed 写出的地址与该节点自己的 `Addr` 不同）会由握手折叠，
 因此一个 node id 永远不会有两个成员。失败的对等节点会被丢弃并重试。
 
-### 成员关系
+### TCP 成员关系
 
 每条链路都以一个带版本的握手帧开始，其中携带 node id、
 通告的监听地址、进程化身（incarnation，每次 `Start` 随机生成）以及
@@ -638,7 +701,7 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: cluster})
   }
   ```
 
-### 去重与环路
+### TCP 去重与环路
 
 每个本地产生的事件都会打上 `Origin`（产生该事件的节点）和
 `Seq`（该来源单调递增的序号）。接收方维护一张有界的、带 TTL 的
@@ -651,7 +714,7 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: cluster})
 收到的事件永远不会被转发，来源为接收节点自身的事件会被丢弃，
 因此重广播拓扑不会形成环路。
 
-### 定向路由
+### TCP 定向路由
 
 每个节点通告其本地会话所订阅的主题过滤器集合，每隔 `SummaryInterval`
 刷新一次，订阅变化时立即刷新。

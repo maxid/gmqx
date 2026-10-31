@@ -158,6 +158,18 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.WebsocketPath == "" {
 		cfg.WebsocketPath = "/mqtt"
 	}
+	if cfg.NodeID == "" && cfg.Cluster.Node != "" {
+		// Cluster.Node is the cluster-named node id; an explicit Config.NodeID
+		// always wins over it. Without either, the random id below is used, so a
+		// gossip cluster never collides by default.
+		cfg.NodeID = cfg.Cluster.Node
+	}
+	if cfg.Namespace == "" && cfg.Cluster.Namespace != "" {
+		// A namespace can be named on the cluster block; the broker's
+		// Config.Namespace stays authoritative once it is set, because the broker
+		// stamps every event and summary it produces.
+		cfg.Namespace = cfg.Cluster.Namespace
+	}
 	if cfg.NodeID == "" {
 		cfg.NodeID = randomID()
 	}
@@ -197,6 +209,25 @@ func New(cfg Config) (*Broker, error) {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	// Cluster.Enabled selects the default backend only when no backend object was
+	// supplied: an explicit Config.ClusterBackend always wins. The gossip backend
+	// takes its listen address and seeds from the same ClusterConfig, so a
+	// deployment that only sets Cluster.Enabled/Addr/Seeds gets a working
+	// cluster, while NewTCPCluster and NewRedisCluster stay available for the
+	// static-mesh and shared-store deployments.
+	if cfg.ClusterBackend == nil && cfg.Cluster.Enabled {
+		cfg.ClusterBackend = NewGossipCluster(GossipClusterConfig{
+			Addr:                cfg.Cluster.Addr,
+			Seeds:               append([]string(nil), cfg.Cluster.Seeds...),
+			PingInterval:        cfg.Cluster.PingInterval,
+			PingTimeout:         cfg.Cluster.PingTimeout,
+			SuspicionMultiplier: cfg.Cluster.SuspicionMultiplier,
+			Fanout:              cfg.Cluster.Fanout,
+			Namespace:           cfg.Namespace,
+			Metrics:             cfg.Metrics,
+			Logger:              logger,
+		})
 	}
 	b := &Broker{
 		cfg:       cfg,

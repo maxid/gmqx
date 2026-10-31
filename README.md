@@ -774,6 +774,85 @@ state machine and no packet layout of its own.
 
 ## Cluster backend
 
+### Gossip backend (default)
+
+`Config.Cluster.Enabled` with no explicit `ClusterBackend` selects the built-in
+gossip backend. It needs no external service: a node is seeded with one reachable
+peer address and learns the rest of the cluster from the membership gossip.
+
+```go
+broker, _ := gmqx.New(gmqx.Config{
+    Addr: "10.0.0.1:1883",
+    Cluster: gmqx.ClusterConfig{
+        Enabled:             true,
+        Addr:                "10.0.0.1:7946", // explicit, never :0
+        Seeds:               []string{"10.0.0.2:7946"},
+        PingInterval:        time.Second,
+        PingTimeout:         500 * time.Millisecond,
+        SuspicionMultiplier: 3,
+        Fanout:              3,
+    },
+})
+```
+
+`ClusterConfig` maps onto `GossipClusterConfig`: `Addr` and `Seeds` are the
+cluster listen address and the seed list, `PingInterval` and `PingTimeout` are the
+probe timers, `SuspicionMultiplier` defines `SuspectTimeout = SuspicionMultiplier ×
+PingInterval` (a suspected member that stays silent that long is declared dead),
+and `Fanout` is the epidemic fan-out. `Cluster.Node` and `Cluster.Namespace` seed
+`Config.NodeID` and `Config.Namespace` when those are empty. An explicit
+`Config.ClusterBackend` always wins, so `NewTCPCluster` and `NewRedisCluster` stay
+available (`gmqx.NewGossipCluster` builds the default backend directly).
+
+- **Membership** is SWIM-style and needs no shared store. Every node has a random
+  incarnation; each `PingInterval` it probes one random member. A probe with no ack
+  within `PingTimeout` is retried indirectly: up to three other members are asked to
+  ping the target. A member that also misses that window becomes suspect, and a
+  suspect that stays silent for `SuspectTimeout` is declared dead. Membership
+  changes travel as bounded deltas piggybacked on every ping/ack (merged by
+  incarnation, with the sender's own record always present), so a new node that
+  knows one seed converges on the whole view. A false suspicion heals: a node that
+  learns it is suspect increments its incarnation number and the newer record wins.
+  A dead member stays in the view for `DeadTimeout` and is then removed, which lets
+  a restarted process rejoin under the same id.
+- **Dissemination** is epidemic. The origin writes an event to at most `Fanout`
+  peers (default `min(len(members), 3)`), and each receiver forwards it to `Fanout`
+  peers it did not receive it from. The existing `(Origin, Seq)` dedup table makes
+  every node apply and forward an event at most once, so one event costs
+  O(N·Fanout) frames instead of one frame per pair. With N at or below `Fanout` the
+  origin writes every peer and the receivers have nothing left to forward: a 2- or
+  3-node cluster degenerates to a full broadcast, which is what it wants.
+- **Routing** sits on top of the epidemic. A node advertises its subscription
+  summary (filters plus shared-group keys, the same `summarySet` the other backends
+  use) as membership metadata. A publish is preferred to peers whose summary
+  matches, is skipped for peers whose summary is known not to match, and is sent to
+  peers whose summary is unknown (or stale after three `SummaryInterval`s) so the
+  epidemic can still reach them. Retained publishes and kicks ignore summaries:
+  retained state must exist on every node for its future subscribers, and a kick
+  names a client id rather than a topic.
+- **Presence** is gossiped too. Every admitted CONNECT claims its client id for
+  this node (a tombstone is gossiped on disconnect), with a Lamport version, the
+  owning process incarnation and a TTL. `PublishToClient` for a client id held
+  elsewhere is written to the claimed owner only; when the claim is absent, expired
+  or names a dead/left node, the event falls back to the epidemic so a node that
+  adopted the client id still receives it. Claims are namespace-scoped and events
+  are deduplicated like every other cluster event.
+- **Bounds**: one frame carries at most `MaxGossipDelta` member records and
+  `MaxPresenceDelta` presence claims; the dedup table, the presence table and the
+  member view are bounded; one link queues at most 32 frames (a full queue drops
+  and counts `cluster_backpressure`); fan-out is bounded; there is one writer
+  goroutine per link, never one per message.
+
+`Members()` (through `MemberView`) reports `Member{NodeID, Addr, Incarnation,
+Since, State}` sorted by node id. `State` is `alive`, `suspect` or `dead`; the TCP
+and Redis backends leave it empty, which means alive. A node with no seeds starts
+alone, serves local traffic and logs that it is alone.
+
+Member links are plain gnety TCP, exactly like the TCP backend: neither backend
+exposes TLS settings for the cluster link.
+
+### TCP backend
+
 `gmqx.NewTCPCluster` connects broker nodes over gnety TCP with versioned JSON
 frames over length-prefixed framing:
 
@@ -792,7 +871,7 @@ that both ends dial (for example because a seed spells the peer differently than
 the peer's `Addr`) is collapsed by the handshake, so a node id never has two
 members. Failed peers are dropped and retried.
 
-### Membership
+### TCP membership
 
 Every link starts with a versioned handshake frame carrying the node id, the
 advertised listen address, the process incarnation (random per `Start`) and the
@@ -826,7 +905,7 @@ advertised `(NodeID, Addr, Incarnation)` triple:
   }
   ```
 
-### Deduplication and loops
+### TCP deduplication and loops
 
 Every locally produced event is stamped with `Origin` (the producing node) and
 `Seq` (that origin's monotonically increasing sequence). Receivers keep a bounded,
@@ -839,7 +918,7 @@ events and forwarded events are counted and reported through
 A received event is never forwarded, and an event whose origin is the receiving
 node is dropped, so a re-broadcasting topology cannot loop.
 
-### Directed routing
+### TCP directed routing
 
 Each node advertises the set of topic filters its local sessions are subscribed
 to, refreshed every `SummaryInterval` and immediately when a subscription changes.
