@@ -34,6 +34,12 @@ type subscription struct {
 	noLocal           bool
 	retainAsPublished bool
 	retainHandling    byte
+	// subscriptionIDs are the Subscription Identifiers the SUBSCRIBE that created
+	// or modified this subscription carried (at most one per packet, §3.8.2.1.2,
+	// but the field is a slice because it is part of the session state the
+	// SessionStore round-trips). They are attached to every PUBLISH delivered
+	// because of this subscription; see subscription_id.go.
+	subscriptionIDs []uint32
 }
 
 type client struct {
@@ -686,7 +692,19 @@ func (c *client) failProtocol(err error) {
 	if wire.KindOf(err) == wire.KindTooLarge {
 		reason = 0x95 // Packet too large
 	}
+	if zeroSubscriptionIdentifier(err) {
+		reason = ReasonProtocolError
+	}
 	c.sendDisconnect(reason)
+}
+
+// zeroSubscriptionIdentifier reports whether err is the codec refusing a
+// Subscription Identifier whose value is 0. MQTT 5 §3.8.2.1.2 calls that a
+// Protocol Error (DISCONNECT 0x82) while every other unparsable packet is a
+// Malformed Packet (0x81); the codec exposes a dedicated sentinel so the broker
+// can tell them apart without matching on error text.
+func zeroSubscriptionIdentifier(err error) bool {
+	return errors.Is(err, mqtt.ErrZeroSubscriptionIdentifier)
 }
 
 // protocolError answers an MQTT 5 protocol violation with a DISCONNECT and ends
@@ -722,7 +740,12 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 	// (and records) the topic name, and neither property is forwarded.
 	alias := props.TopicAlias
 	props.TopicAlias = 0
-	props.SubscriptionIdentifiers = nil
+	if len(props.SubscriptionIdentifiers) > 0 {
+		// A PUBLISH from a client must not carry a Subscription Identifier
+		// (MQTT 5 §3.3.4); it is a protocol error, not something to strip.
+		c.protocolError(0x82)
+		return
+	}
 	var wireProps []byte
 	if c.version == mqtt.Version5 {
 		if alias > topicAliasMaximum {
@@ -806,32 +829,47 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 }
 
 func (c *client) handleSubscribe(m *mqtt.Subscribe) {
-	if len(m.Properties.SubscriptionIdentifiers) > 0 {
-		// The CONNACK this connection was admitted with advertises Subscription
-		// Identifier Available 0 (props.go), so a SUBSCRIBE that carries one asks
-		// for a capability this broker does not have. MQTT 5 §3.9.2.1.2 makes
-		// that a protocol error, answered with DISCONNECT 0x9A (Subscription
-		// Identifiers not supported); MQTT 3.1.1 has neither the property nor a
-		// server DISCONNECT and is simply closed.
+	// Subscription Identifiers are accepted: the CONNACK this connection was
+	// admitted with advertises Subscription Identifier Available 1 (props.go). A
+	// value of 0 is a Protocol Error (§3.8.2.1.2) and ends the connection; the
+	// identifiers themselves are stored per subscription and attached to the
+	// deliveries that subscription causes (subscription_id.go).
+	ids, dropped, ok := normalizeSubscriptionIDs(m.Properties.SubscriptionIdentifiers)
+	if !ok {
 		c.broker.metrics.RecordDroppedMessage("subscription_identifier")
-		c.protocolError(ReasonSubscriptionIdentifiersNotSupported)
+		c.protocolError(ReasonProtocolError)
 		return
+	}
+	if dropped > 0 {
+		c.broker.metrics.RecordDroppedMessage("subscription_identifier_limit")
 	}
 	codes := make([]byte, 0, len(m.Subscriptions))
 	existed := make([]bool, 0, len(m.Subscriptions))
 	for _, req := range m.Subscriptions {
-		if isSharedSubscription(req.Filter) {
-			// A shared subscription is a filter starting with "$share/". The
-			// CONNACK advertises Shared Subscription Available 0, and accepting it
-			// as the literal filter it looks like would admit a subscription that
-			// never matches anything — the client would "succeed" and silently
-			// never receive a message. MQTT 5 names the refusal per filter (0x9E,
-			// Shared Subscriptions not supported) and keeps the connection, as
-			// §3.9 requires; MQTT 3.1.1 has only the 0x80 failure code.
-			c.broker.metrics.RecordDroppedMessage("shared_subscription")
-			codes = append(codes, subscribeFailure(c.version, ReasonSharedSubscriptionsNotSupported))
-			existed = append(existed, false)
-			continue
+		sub := subscription{
+			qos:               req.QoS,
+			noLocal:           req.NoLocal,
+			retainAsPublished: req.RetainAsPublished,
+			retainHandling:    req.RetainHandling,
+			subscriptionIDs:   ids,
+		}
+		if _, isShared, wellFormed := parseSharedFilter(req.Filter); isShared {
+			// A "$share/<shareName>/<filter>" subscription, MQTT 5 §4.8.2. The
+			// filter must be well formed (MQTT-4.8.2-1, -2) and must not set No
+			// Local (MQTT-3.8.3-4): the two refusals are per filter in the SUBACK,
+			// so the rest of the packet still applies (MQTT 5 §3.9). MQTT 3.1.1 has
+			// no per-filter rejection code for them and closes the connection, like
+			// its one failure code does for a malformed filter.
+			if !wellFormed || req.NoLocal {
+				if c.version != mqtt.Version5 {
+					c.protocolError(0)
+					return
+				}
+				c.broker.metrics.RecordDroppedMessage("shared_subscription")
+				codes = append(codes, 0x8f)
+				existed = append(existed, false)
+				continue
+			}
 		}
 		if !validFilter(req.Filter) {
 			// MQTT 3.1.1 has no per-filter rejection code for a malformed
@@ -845,12 +883,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 			existed = append(existed, false)
 			continue
 		}
-		code, had := c.broker.subscribe(c, req.Filter, subscription{
-			qos:               req.QoS,
-			noLocal:           req.NoLocal,
-			retainAsPublished: req.RetainAsPublished,
-			retainHandling:    req.RetainHandling,
-		})
+		code, had := c.broker.subscribe(c, req.Filter, sub)
 		codes = append(codes, code)
 		existed = append(existed, had)
 	}
@@ -866,7 +899,14 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 		if req.RetainHandling == 2 || (req.RetainHandling == 1 && existed[i]) {
 			continue
 		}
-		c.broker.sendRetained(c, req.Filter, req.QoS, req.RetainAsPublished)
+		// No retained message is sent to a shared subscription (§4.8.2: the replay
+		// is skipped for the members of a group; later matching publications are
+		// delivered normally). A malformed shared filter is already skipped above,
+		// because its SUBACK code is not a granted QoS.
+		if _, isShared, _ := parseSharedFilter(req.Filter); isShared {
+			continue
+		}
+		c.broker.sendRetained(c, req.Filter, req.QoS, req.RetainAsPublished, ids)
 	}
 }
 

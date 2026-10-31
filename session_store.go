@@ -104,11 +104,20 @@ type SessionState struct {
 }
 
 // SessionSubscription is one stored subscription of a session.
+//
+// It carries every option that decides what the subscription delivers, the
+// Subscription Identifier included: that identifier is state of the subscription,
+// not of the connection, so it survives a session that expires out and is resumed
+// elsewhere (MQTT 5 §3.8.3.1). A store written by a build that predates the field
+// decodes it as "no identifier", which is what such a subscription had.
 type SessionSubscription struct {
 	QoS               byte
 	NoLocal           bool
 	RetainAsPublished bool
 	RetainHandling    byte
+	// SubscriptionIdentifiers are the identifiers attached to every PUBLISH this
+	// subscription causes, deduplicated and capped (see subscription_id.go).
+	SubscriptionIdentifiers []uint32
 }
 
 // QueuedMessage is one message a persistent session owes its client. It carries
@@ -188,6 +197,9 @@ func copySessionState(state SessionState) SessionState {
 	if len(state.Subscriptions) > 0 {
 		out.Subscriptions = make(map[string]SessionSubscription, len(state.Subscriptions))
 		for filter, sub := range state.Subscriptions {
+			// The identifier slice is copied with the subscription: a store must
+			// never share mutable state with its caller.
+			sub.SubscriptionIdentifiers = append([]uint32(nil), sub.SubscriptionIdentifiers...)
 			out.Subscriptions[filter] = sub
 		}
 	}

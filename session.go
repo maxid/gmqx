@@ -56,6 +56,9 @@ func sessionState(s *session) SessionState {
 				NoLocal:           sub.noLocal,
 				RetainAsPublished: sub.retainAsPublished,
 				RetainHandling:    sub.retainHandling,
+				// The subscription identifier is part of the session state, so a
+				// resumed session keeps tagging its deliveries (subscription_id.go).
+				SubscriptionIdentifiers: append([]uint32(nil), sub.subscriptionIDs...),
 			}
 		}
 	}
@@ -91,6 +94,7 @@ func sessionFromState(state SessionState) (*session, int) {
 			noLocal:           sub.NoLocal,
 			retainAsPublished: sub.RetainAsPublished,
 			retainHandling:    sub.RetainHandling,
+			subscriptionIDs:   sub.SubscriptionIdentifiers,
 		}
 	}
 	dropped := 0
@@ -350,12 +354,23 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 	}
 	queue := make([]QueuedMessage, 0, len(state.Queue)+1)
 	queue = append(queue, state.Queue...)
+	// The queued message keeps the MQTT 5 property block of the delivery, which
+	// carries the target's subscription identifiers when it has any: they are part
+	// of the subscription state and have to be there when the session drains its
+	// queue after the next CONNACK. Without them the block the publisher sent is
+	// stored unchanged, so an ordinary message is not re-encoded.
+	wireProps := pub.Props
+	if len(props.SubscriptionIdentifiers) > 0 {
+		if encoded, err := encodePropertyBlock(props); err == nil {
+			wireProps = encoded
+		}
+	}
 	queue = append(queue, QueuedMessage{
 		Topic:   pub.Topic,
 		Payload: append([]byte(nil), pub.Payload...),
 		QoS:     target.QoS,
 		Retain:  target.Retain,
-		Props:   append([]byte(nil), pub.Props...),
+		Props:   append([]byte(nil), wireProps...),
 	})
 	queued := 1
 	evicted := false

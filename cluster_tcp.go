@@ -133,9 +133,14 @@ type clusterFrame struct {
 	Incarnation string            `json:"inc,omitempty"`
 	View        []clusterPeerWire `json:"view,omitempty"`
 	Filters     []string          `json:"filters,omitempty"`
-	Namespace   string            `json:"ns,omitempty"`
-	Seq         uint64            `json:"seq,omitempty"`
-	Event       *ClusterMessage   `json:"event,omitempty"`
+	// Shared carries the shared subscription group keys the node holds a live
+	// member of. It travels beside Filters in the same summary frame: peers need
+	// it to elect one node per shared group (see shared.go), while Filters stays
+	// the set of filters a normal subscriber uses.
+	Shared    []string        `json:"shared,omitempty"`
+	Namespace string          `json:"ns,omitempty"`
+	Seq       uint64          `json:"seq,omitempty"`
+	Event     *ClusterMessage `json:"event,omitempty"`
 }
 
 // clusterPeerWire is one entry of the member view a handshake carries.
@@ -149,12 +154,13 @@ type clusterPeerWire struct {
 // gnety's length-prefixed TCP transport.
 func NewTCPCluster(cfg TCPClusterConfig) Cluster {
 	return &tcpCluster{
-		cfg:       cfg,
-		namespace: cfg.Namespace,
-		links:     map[*clusterLink]struct{}{},
-		members:   map[string]*clusterMember{},
-		seeds:     map[string]string{},
-		local:     newSummarySet(),
+		cfg:         cfg,
+		namespace:   cfg.Namespace,
+		links:       map[*clusterLink]struct{}{},
+		members:     map[string]*clusterMember{},
+		seeds:       map[string]string{},
+		local:       newSummarySet(),
+		sharedLocal: newSummarySet(),
 	}
 }
 
@@ -187,8 +193,11 @@ func (l *clusterLink) close()          { l.closeOnce.Do(func() { _ = l.closeFn()
 // currently backs it and the subscription summary it advertised.
 type clusterMember struct {
 	Member
-	link         *clusterLink
-	filters      []string
+	link    *clusterLink
+	filters []string
+	// shared holds the shared subscription group keys the peer advertised; it is
+	// what sharedGroups answers with.
+	shared       []string
 	filtersKnown bool
 	filtersAt    time.Time
 }
@@ -213,8 +222,10 @@ type tcpCluster struct {
 	// seeds maps a dialed seed address to the node id behind it, so a dial loop
 	// stops dialing while another link already backs that node.
 	seeds map[string]string
-	// local is the advertised filter summary, oldest first.
-	local *summarySet
+	// local is the advertised filter summary, oldest first, sharedLocal the
+	// advertised shared group keys.
+	local       *summarySet
+	sharedLocal *summarySet
 	// summaryMu serialises summary computation and broadcast, so a peer cannot
 	// end up with an older snapshot than the one already sent.
 	summaryMu sync.Mutex
@@ -429,6 +440,12 @@ func (c *tcpCluster) routingTargets(msg ClusterMessage) []*clusterLink {
 			// backend has no presence, so both go to every peer, and each peer
 			// applies the event only if it holds that client id.
 			out = append(out, m.link)
+		case namesNode(msg.Shared, m.NodeID):
+			// The origin elected this peer for a shared subscription group (see
+			// shared.go). The peer may have no advertised filter that matches the
+			// topic - a group's members are the only subscribers it has - so the
+			// election, not the summary, is what routes the event.
+			out = append(out, m.link)
 		case !m.filtersKnown || now.Sub(m.filtersAt) > staleAfter:
 			// Unknown or stale summary: send to this peer only. Falling back to
 			// a full flood would defeat directed routing; falling back to
@@ -436,6 +453,39 @@ func (c *tcpCluster) routingTargets(msg ClusterMessage) []*clusterLink {
 			out = append(out, m.link)
 		case summaryMatches(m.filters, msg.Topic):
 			out = append(out, m.link)
+		}
+	}
+	return out
+}
+
+// namesNode reports whether a shared-delivery list names nodeID.
+func namesNode(shared []SharedDelivery, nodeID string) bool {
+	for _, d := range shared {
+		if d.Node == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// sharedGroups implements sharedDirectory: the shared subscription group keys the
+// peers of this node advertised, per node id. A peer that has not sent a summary
+// yet is not in the answer, so a group it holds is not elected to it until the
+// advertisement arrives; the summary is pushed whenever a local subscription
+// changes, so the window is one handshake or one summary frame.
+func (c *tcpCluster) sharedGroups() map[string][]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.members) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, 4)
+	for nodeID, m := range c.members {
+		if m.link == nil || nodeID == "" || nodeID == c.nodeID {
+			continue
+		}
+		for _, group := range m.shared {
+			out[group] = append(out[group], nodeID)
 		}
 	}
 	return out
@@ -592,6 +642,7 @@ func (c *tcpCluster) admitLocked(l *clusterLink) (member *clusterMember, replace
 		// routing does not blink while the link is replaced.
 		m.Since = existing.Since
 		m.filters, m.filtersKnown, m.filtersAt = existing.filters, existing.filtersKnown, existing.filtersAt
+		m.shared = existing.shared
 	}
 	c.members[l.nodeID] = m
 	return m, replaced
@@ -630,6 +681,7 @@ func (c *tcpCluster) handleSummary(l *clusterLink, f clusterFrame) {
 		return
 	}
 	m.filters = capFilters(f.Filters, c.maxSummaryFilters())
+	m.shared = capFilters(f.Shared, c.maxSummaryFilters())
 	m.filtersKnown = true
 	m.filtersAt = time.Now()
 }
@@ -637,25 +689,34 @@ func (c *tcpCluster) handleSummary(l *clusterLink, f clusterFrame) {
 // refreshLocalFilters recomputes the advertised summary and reports whether the
 // handler offers one at all. A handler that cannot describe its subscriptions
 // never advertises, so peers keep sending it every publish.
-func (c *tcpCluster) refreshLocalFilters() ([]string, bool) {
+//
+// The shared group keys travel in the same frame but through a summary set of
+// their own: they are evicted and ordered independently of the topic filters, so a
+// node that subscribes to many normal filters does not push its groups out of the
+// advertisement (a group a peer cannot see is a group it cannot elect).
+func (c *tcpCluster) refreshLocalFilters() (filters, shared []string, ok bool) {
 	provider, ok := c.handler.(subscriptionProvider)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
 	current := provider.subscriptionFilters()
+	var groups []string
+	if sp, ok := c.handler.(sharedSubscriptionProvider); ok {
+		groups = sp.sharedSubscriptionGroups()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.local.refresh(current, c.maxSummaryFilters()), true
+	return c.local.refresh(current, c.maxSummaryFilters()), c.sharedLocal.refresh(groups, c.maxSummaryFilters()), true
 }
 
 func (c *tcpCluster) advertiseSummary(l *clusterLink) {
 	c.summaryMu.Lock()
 	defer c.summaryMu.Unlock()
-	sum, ok := c.refreshLocalFilters()
+	sum, shared, ok := c.refreshLocalFilters()
 	if !ok {
 		return
 	}
-	if err := c.sendFrame(l, clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Namespace: c.namespace, Filters: sum}); err != nil {
+	if err := c.sendFrame(l, clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Namespace: c.namespace, Filters: sum, Shared: shared}); err != nil {
 		c.dropLink(l, "summary send failed")
 	}
 }
@@ -674,11 +735,11 @@ func (c *tcpCluster) subscriptionsChanged() {
 func (c *tcpCluster) broadcastSummary() {
 	c.summaryMu.Lock()
 	defer c.summaryMu.Unlock()
-	sum, ok := c.refreshLocalFilters()
+	sum, shared, ok := c.refreshLocalFilters()
 	if !ok {
 		return
 	}
-	frame := clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Namespace: c.namespace, Filters: sum}
+	frame := clusterFrame{Kind: frameSubs, Version: clusterWireVersion, NodeID: c.nodeID, Namespace: c.namespace, Filters: sum, Shared: shared}
 	for _, l := range c.snapshotLinks(true) {
 		if err := c.sendFrame(l, frame); err != nil {
 			c.dropLink(l, "summary send failed")

@@ -13,7 +13,8 @@
 - [x] Bounded per-connection inflight queue (a window-full delivery waits instead of being dropped)
 - [x] One writer goroutine per connection, bounded outbound queue and a write deadline per packet
 - [x] CONNECT-phase read deadline and authorization timeouts (`ConnectTimeout`, `AuthTimeout`)
-- [x] Refuse the capabilities the CONNACK advertises as unavailable (`$share/...` -> SUBACK 0x9E, Subscription Identifier -> DISCONNECT 0x9A)
+- [x] Shared subscriptions (`$share/{ShareName}/{filter}`): validated per §4.8.2, one live member per group round robin, one node per group across a cluster (origin-side election over the advertised groups), no retained replay and no shared offline queue
+- [x] Subscription identifiers (SUBSCRIBE property 0x0B): stored with the subscription, round-tripped through the `SessionStore`, attached to live, retained-replay, offline-queue and shared-group deliveries, deduplicated and capped per delivery
 - [x] MQTT 5 Will Delay Interval (cancelled by resume, cut short by session expiry, bounded by `MaxWillDelayInterval`)
 - [x] Retained message expiry (MQTT 5 Message Expiry Interval, replayed decremented, deleted when elapsed)
 - [x] Takeover parity across nodes (connect-time kick in both connect modes, DISCONNECT 0x8E) and the `NotKickSeconds` anti-flap window

@@ -270,11 +270,11 @@ func TestMQTT5ConnackProperties(t *testing.T) {
 	if p.WildcardSubscriptionAvailable == nil || !*p.WildcardSubscriptionAvailable {
 		t.Fatalf("CONNACK does not declare wildcard subscriptions: %+v", p)
 	}
-	if p.SubscriptionIdentifierAvailable == nil || *p.SubscriptionIdentifierAvailable {
-		t.Fatalf("CONNACK must declare subscription identifiers unsupported: %+v", p)
+	if p.SubscriptionIdentifierAvailable == nil || !*p.SubscriptionIdentifierAvailable {
+		t.Fatalf("CONNACK must declare subscription identifiers supported: %+v", p)
 	}
-	if p.SharedSubscriptionAvailable == nil || *p.SharedSubscriptionAvailable {
-		t.Fatalf("CONNACK must declare shared subscriptions unsupported: %+v", p)
+	if p.SharedSubscriptionAvailable == nil || !*p.SharedSubscriptionAvailable {
+		t.Fatalf("CONNACK must declare shared subscriptions supported: %+v", p)
 	}
 	if p.TopicAliasMaximum != topicAliasMaximum {
 		t.Fatalf("topic alias maximum = %d, want %d", p.TopicAliasMaximum, topicAliasMaximum)

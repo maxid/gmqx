@@ -27,14 +27,16 @@ const topicAliasMaximum uint16 = 16
 // Maximum QoS is deliberately absent: the specification allows only 0 or 1
 // there, and its absence already means "QoS 2", which is what this broker
 // offers. Retain Available, Wildcard/Subscription Identifier/Shared
-// Subscription Available state the other capabilities.
+// Subscription Available state the other capabilities; the four of them are
+// implemented (shared subscription routing lives in shared.go, subscription
+// identifiers in subscription_id.go), so all four are advertised as available.
 func connackProperties(assignedClientID string, maxPacketSize uint32) mqtt.Properties {
-	yes, no := true, false
+	yes := true
 	return mqtt.Properties{
 		RetainAvailable:                 &yes,
 		WildcardSubscriptionAvailable:   &yes,
-		SubscriptionIdentifierAvailable: &no,
-		SharedSubscriptionAvailable:     &no,
+		SubscriptionIdentifierAvailable: &yes,
+		SharedSubscriptionAvailable:     &yes,
 		MaximumPacketSize:               maxPacketSize,
 		TopicAliasMaximum:               topicAliasMaximum,
 		AssignedClientID:                assignedClientID,

@@ -49,8 +49,16 @@
   该事件的连接的建立时间，因此它仍会关闭其他节点上的重复连接，而迟到的 kick 无法关闭更新的连接）
 - 集群内共享持久会话：可选的 `RedisSessionStore` 把订阅与离线队列放进集群后端所用的同一个
   Redis，客户端重连到其他节点时会话得以恢复
-- CONNACK 宣告为不可用的能力会被显式拒绝而不是静默忽略：`$share/...` 过滤器回 SUBACK 0x9E
-  （MQTT 3.1.1 回 0x80），带 Subscription Identifier 的 SUBSCRIBE 回 DISCONNECT 0x9A
+- 共享订阅（MQTT 5 §4.8.2）：`$share/{ShareName}/{filter}` 按 ShareName 规则校验
+  （畸形的按过滤器回 SUBACK 0x8F；只以 `$share` 开头的普通过滤器仍是字面量过滤器；
+  共享订阅上的 No Local 被拒绝），单节点按 round-robin 只投递给组内一个活成员；
+  集群内每个组只选一个节点投递，因此组不会在每个节点各收一份。离线成员不收共享消息
+  （共享状态不入队），订阅共享过滤器时也不重放保留消息
+- 订阅标识符（MQTT 5 属性 0x0B）：每个 SUBSCRIBE 携带的标识符作为订阅状态保存，
+  持久会话恢复后依然有效，并附加到该订阅产生的每条 PUBLISH（实时投递、保留消息重放、
+  离线队列排空、共享组投递），跨多个匹配订阅去重并受每次投递上限约束
+- CONNACK 宣告 Retain、Wildcard Subscription、Subscription Identifier 与 Shared
+  Subscription 均可用，且四者都已实现
 - 限制：最大连接数、最大订阅数、最大保留消息数、每个方向的 inflight 窗口、
   每会话与全局离线队列长度、连接速率限制
 - 优雅关闭与 client-id 会话接管
@@ -209,6 +217,79 @@ at-most-once），未命中通过 `RecordDroppedMessage("target_unknown")` 计�
 
 定向发布是服务端投递而非客户端 PUBLISH：不经过 ACL、interceptor、`EventSink`（鉴权由调用方
 负责），不写入保留状态；对端收到 target 事件后也不会再交给它的 `Dispatcher`。
+
+## 共享订阅与订阅标识符
+
+两项 MQTT 5 能力均已实现，并在 CONNACK 中宣告为可用（`SharedSubscriptionAvailable`
+与 `SubscriptionIdentifierAvailable`）。
+
+### 共享订阅
+
+共享订阅是 `$share/{ShareName}/{filter}` 形式的过滤器（MQTT 5 §4.8.2）。SUBSCRIBE 到达时校验：
+
+- ShareName 不能为空，且不能包含 `/`、`+`、`#`，其后必须是合法的 topic filter；
+  违反任一条的 `$share/...` 过滤器按过滤器返回 SUBACK `0x8F`，连接保持可用
+  （MQTT 3.1.1 只有 `0x80`，与其它畸形过滤器一样关闭连接）；
+- 仅以 `$share` 开头的过滤器（单独的 `$share`、`$sharex/g/t`）仍是普通字面量过滤器；
+- 共享订阅上的 No Local 被拒绝（MQTT-3.8.3-4），同样按过滤器回 `0x8F`。
+
+单节点路由：匹配某个组的消息只投递给该组**恰好一个**活成员，按会话 key 排序后 round-robin
+选择。同一过滤器的不同组互相独立、各收一份；同一过滤器上的普通订阅者另外再收一份。
+组的 round-robin 游标保存在路由索引里，随最后一个成员离开而消失，因此客户端无法通过
+不断更换组名让索引膨胀。要点：
+
+- 只有活会话是成员。持久会话订阅了某个组后，订阅会被保存（恢复时还原），但离线期间
+  不是成员，**共享状态也不会入队**：其余成员接手这些消息；会话恢复后重新加入组；
+- 订阅共享订阅时不重放保留消息（§4.8.2），之后匹配的 publish 正常投递；
+- 共享订阅携带的订阅标识符会随被选中成员的投递一起发出。
+
+集群中若“每个节点各自投递”，一个组会每个节点各收一份。因此由**产生该 publish 的节点**为每个组
+恰好选出一个节点：
+
+```
+candidates = 通告持有该组活成员的其它节点 + 本节点（当索引中有成员时），排序
+chosen     = candidates[(fnv64(groupKey) + seat) % len(candidates)]
+```
+
+`seat` 是产生节点上按组递增的计数器，使同一组的连续 publish 轮流落到每个持有成员的节点；
+哈希决定组的亲和性，不同组无需协调即可分散。选举不需要共享状态、也不需要额外往返，
+因此 TCP 网状与 Redis 后端共用同一规则：被选中的节点写进 `ClusterMessage.Shared`
+（每个节点一条 `SharedDelivery`），未被点名的节点对该组不做任何投递；被选中节点再在本地
+按 round-robin 选成员。
+
+据此确定的行为：
+
+- 一个组在集群内**至多投递一次**；
+- 若被选中节点在此期间失去了最后一个成员（断连，或摘要晚了一个刷新周期），它会**丢弃**
+  并计入 `Metrics.RecordDroppedMessage("shared_no_member")`；**不会**转交给其它节点的成员：
+  集群投递是至多一次，转交可能造成重复。成员全部离开而仍有对端通告该组时同样计数；
+- 已经没有任何节点通告的组不再算共享发布：消息只是没有匹配的订阅者，不计数；
+- 两个内置后端都在订阅摘要中通告组 key（`subscriptionFilters` 是普通过滤器，
+  `sharedSubscriptionGroups` 是共享组）；本包之外的 `Cluster` 实现不实现该通告，
+  共享订阅因此只在本节点内投递。旧版本的对端会忽略 `ClusterMessage.Shared`，
+  降级为“跨节点收不到共享消息”而不是重复投递。
+
+### 订阅标识符
+
+SUBSCRIBE 可以携带 Subscription Identifier（属性 `0x0B`，取值 1..268435455）。它属于**订阅**
+而不是连接：随过滤器一起保存、写入 `SessionStore`（`SessionSubscription.SubscriptionIdentifiers`）、
+会话恢复时还原，并附加到该订阅产生的每条 PUBLISH：
+
+- 实时投递；一个会话有多个匹配订阅时，一条 PUBLISH 携带它们全部的标识符并去重（§3.3.2.3.8）；
+- 保留消息重放；
+- 下次 CONNACK 之后从离线队列排空的消息；
+- 共享组投递给被选中成员的投递。
+
+取值 0（以及超过 268435455 的值）是 Protocol Error，以 DISCONNECT `0x82` 结束连接。
+gnety codec 在解析阶段就拒绝 0（这是该值唯一可见的位置——gmqx 不维护属性表，见 `props.go`），
+因此 broker 仅把这一种拒绝映射为 `0x82`，其余无法解析的报文仍为 `0x81`（Malformed Packet）。
+
+上限：`maxSubscriptionIdentifiersPerSubscription`（8）限制单个订阅保存的数量，
+`maxSubscriptionIdentifiersPerDelivery`（8）限制一条出站 PUBLISH 的属性块长度，未能附加的
+标识符计入 `Metrics.RecordDroppedMessage("subscription_identifier_limit")`。该属性是逐跳的：
+客户端 PUBLISH 中携带的标识符会被剥离，投递的标识符由写出 PUBLISH 的节点附加，
+不会经由 `Publication.Props` 或集群传输。
+
 
 ## 持久会话、离线队列与 QoS 1/2 重传
 

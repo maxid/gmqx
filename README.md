@@ -75,9 +75,22 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - Shared persistent sessions across the nodes of a cluster: the opt-in
   `RedisSessionStore` keeps subscriptions and the offline queue in the same Redis the
   cluster backend uses, so a client that reconnects to another node resumes them
-- Capabilities the CONNACK advertises as unavailable are refused, not silently
-  ignored: a `$share/...` filter gets SUBACK 0x9E (0x80 on MQTT 3.1.1) and a
-  SUBSCRIBE carrying a Subscription Identifier gets DISCONNECT 0x9A
+- Shared subscriptions (MQTT 5 §4.8.2): `$share/{ShareName}/{filter}` is validated
+  per the ShareName rules (a malformed one is refused with SUBACK 0x8F, a filter
+  that merely starts with `$share` stays a literal filter, and No Local on a shared
+  subscription is refused), routed to exactly one live member of each group round
+  robin, and — across a cluster — to exactly one node per group, elected by the node
+  that produced the publication from the nodes that advertise a member (see
+  **Shared subscriptions** below). A group's members on other nodes do not get a
+  second copy, offline members get nothing (shared state is never queued), and no
+  retained message is replayed when a session subscribes
+- Subscription identifiers (MQTT 5 property 0x0B): one per SUBSCRIBE is stored with
+  the subscription, survives a persistent session, and is attached to every PUBLISH
+  that subscription causes — live, retained replay, offline-queue drain and shared
+  group delivery alike, deduplicated across the subscriptions that matched and
+  bounded per delivery (see **Subscription identifiers** below)
+- The CONNACK advertises Retain, Wildcard Subscriptions, Subscription Identifiers and
+  Shared Subscriptions as available, and all four are implemented
 - Limits: max connections, max subscriptions, max retained messages, inflight
   windows per direction, offline queue size per session and globally, connection
   rate limiting
@@ -254,6 +267,110 @@ A directed publish is a server-side delivery, not a client PUBLISH: it does not 
 through the ACL, the interceptors or the `EventSink` (the caller owns the
 authorization of the call), it does not touch the retained store, and a target
 event a peer receives is not re-dispatched through its `Dispatcher`.
+
+## Shared subscriptions and subscription identifiers
+
+Both MQTT 5 capabilities are implemented and advertised in the CONNACK
+(`SharedSubscriptionAvailable` and `SubscriptionIdentifierAvailable`).
+
+### Shared subscriptions
+
+A shared subscription is a filter of the form `$share/{ShareName}/{filter}`
+(MQTT 5 §4.8.2). It is validated when the SUBSCRIBE arrives:
+
+- the ShareName must be non-empty and must not contain `/`, `+` or `#`, and the
+  rest must be a valid topic filter (`validFilter`); a `$share/...` filter that
+  breaks either rule is refused **per filter** with SUBACK `0x8F` (Topic Filter
+  invalid) and the connection stays usable. MQTT 3.1.1, whose SUBACK has only
+  `0x80`, closes the connection instead, like it does for any malformed filter;
+- a filter that merely starts with `$share` (`$share` alone, `$sharex/g/t`) is an
+  ordinary literal filter and stays one;
+- No Local on a shared subscription is refused (MQTT-3.8.3-4), also with `0x8F`
+  per filter.
+
+Routing, on one node: a publication matching a group goes to **exactly one** live
+member, chosen round robin over the group's members (sorted by session key, so the
+choice is stable and easy to test). Two groups with the same filter are independent
+and each get one copy, and a normal subscriber on the same filter gets its own copy
+on top. The group's round-robin cursor lives with the group in the routing index
+and disappears with its last member, so a client that invents group names cannot
+grow the index. Characteristics worth knowing:
+
+- only live sessions are members. A persistent session that subscribed to a group
+  keeps the subscription (a resume restores it) but is not a member while it is
+  offline, and **shared state is never queued** for it: the other members take the
+  publications instead (§4.8.2: a publication goes to one of the sessions, not to a
+  mailbox). On its return the session rejoins the group;
+- no retained message is replayed when a session subscribes to a group (§4.8.2);
+  later matching publications are delivered normally;
+- the identifier of a shared subscription (see below) travels with the delivery the
+  elected member receives.
+
+Across a cluster, a naive "every node delivers its own copy" would give a group one
+copy **per node**. Instead the node that produces the publication elects exactly one
+node per group:
+
+```
+candidates = peer nodes that advertise a live member of the group
+           + this node, when its index holds one      (sorted)
+chosen     = candidates[(fnv64(groupKey) + seat) % len(candidates)]
+```
+
+`seat` is a per-group counter of the producing node, so successive publications of
+one group visit every node that holds a member; the hash is the group's affinity, so
+different groups spread over different nodes without coordination. No shared state
+and no round trip are involved, which is why the same rule works for the TCP mesh
+and the Redis backend: the chosen node is named in `ClusterMessage.Shared` (one
+entry per node, `SharedDelivery`), the election is the routing decision, and a node
+that is not named delivers nothing for that group. The chosen node then picks the
+member round robin locally, exactly as a single node does.
+
+Consequences, deliberately chosen:
+
+- a publication is delivered **at most once per group, cluster-wide**;
+- if the chosen node lost its last member in the meantime (a disconnect, or a
+  summary one refresh old), it **drops** the publication and counts it with
+  `Metrics.RecordDroppedMessage("shared_no_member")`. It is never handed to another
+  node's member: delivery is at-most-once, and re-routing could duplicate a copy the
+  chosen node already delivered. The same counter covers a group whose members have
+  all left while a peer still advertises it;
+- a group that no node advertises any more is not a shared publication at all: the
+  publication simply matches no subscriber and nothing is counted;
+- both built-in backends advertise the group keys in their subscription summary
+  (`subscriptionFilters` carries the normal filters, `sharedSubscriptionGroups` the
+  groups); a `Cluster` implementation outside this package does not, and shared
+  subscriptions then stay local to the node that produced the publication. A peer
+  running an older build ignores `ClusterMessage.Shared` and delivers no shared copy
+  across nodes instead of a duplicate.
+
+### Subscription identifiers
+
+A SUBSCRIBE may carry a Subscription Identifier (property `0x0B`, value
+1..268435455). The identifier is state of the **subscription**, not of the
+connection: it is stored with the filter, written to the `SessionStore` with it
+(`SessionSubscription.SubscriptionIdentifiers`), restored on a resume, and copied
+into every PUBLISH that subscription causes:
+
+- a live delivery, including one that matched several subscriptions of the session
+  — one PUBLISH carrying all of their identifiers, deduplicated (§3.3.2.3.8);
+- a retained replay;
+- a message drained from the offline queue after the next CONNACK;
+- a shared-group delivery, for the member the group picked.
+
+A value of 0 (and any value above 268435455) is a Protocol Error and ends the
+connection with DISCONNECT `0x82`. The gnety codec refuses the zero while parsing
+(it is the only place the value is visible — gmqx keeps no property table, see
+`props.go`), so the broker maps that one refusal onto `0x82` and every other
+unparsable packet stays `0x81` (Malformed Packet).
+
+Limits: `maxSubscriptionIdentifiersPerSubscription` (8) bounds what one
+subscription stores, `maxSubscriptionIdentifiersPerDelivery` (8) bounds one outgoing
+PUBLISH property block, and the identifiers a delivery had to leave out are counted
+with `Metrics.RecordDroppedMessage("subscription_identifier_limit")`. The property is
+hop-local: a PUBLISH from a client that carries it is stripped, and a delivery's
+identifiers are attached by the node that writes the PUBLISH, never carried through
+`Publication.Props` or across the cluster.
+
 
 ## Persistent sessions, the offline queue and QoS 1/2 retransmission
 
@@ -626,7 +743,12 @@ writes internally so the trade-off is measurable.
 
 A node advertises at most `MaxSummaryFilters` filters; when it has more, the
 filters present longest are left out (newer subscriptions keep routing), at the
-cost of not routing publishes that only match an evicted filter.
+cost of not routing publishes that only match an evicted filter. The same frame
+carries the shared subscription groups the node holds a live member of (in a summary
+set of its own, so many normal filters cannot push the groups out): they are what the
+publishing node elects a node per shared group from, and a publish that names a peer
+in `ClusterMessage.Shared` is routed to that peer even when its topic filters do not
+match.
 
 A retained publish received from a peer is applied to the receiving node's own
 retained store with the rules of a local retained publish: an empty payload
@@ -701,7 +823,7 @@ Every key and channel sits under one prefix (`ChannelPrefix`, default
 | `<prefix>:node:<nodeID>` | pub/sub channel of one node | — |
 | `<prefix>:owner:<nodeID>` | JSON `{node, inc, since}`: node id ownership lease | `NodeTTL` |
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`: liveness and identity | `NodeTTL` |
-| `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`: subscription summary | `SummaryTTL` |
+| `<prefix>:subs:<nodeID>` | JSON `{node, filters, shared, updated}`: subscription summary, `shared` being the node's shared subscription groups | `SummaryTTL` |
 | `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`: which node holds the client id | `PresenceTTL` |
 | `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON session record, written by `RedisSessionStore` when it is configured (see [Shared sessions](#persistent-sessions-the-offline-queue-and-qos-12-retransmission)) | the session's deadline |
 
@@ -756,7 +878,14 @@ Redis is unreachable). The rules are the TCP backend's rules:
   are kept); the guarantee is eventual presence in the store, not a replay to a
   session already connected;
 - a node advertises at most `MaxSummaryFilters` filters, and the filters present
-  longest are the ones left out.
+  longest are the ones left out;
+- the same record carries the shared subscription groups the node holds a live
+  member of (`shared` beside `filters`, capped the same way). A publish whose shared
+  election names a peer is routed to that peer's channel whether or not its topic
+  filters match, exactly as the TCP backend routes it; a peer with an unknown
+  summary contributes no groups, so a group it holds is elected to nobody until its
+  next summary refresh (at most one `SummaryInterval`), and the publication is then
+  dropped and counted at the elected node with `shared_no_member`.
 
 A directed publish (`Broker.PublishToClient`) is routed by presence instead: the
 broker reports every CONNECT and every session that really ends, the backend

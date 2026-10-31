@@ -54,6 +54,16 @@ type ClusterMessage struct {
 	// the default namespace, which keeps the pre-namespace wire behaviour.
 	Namespace string
 
+	// Shared names the shared subscription groups this event must deliver, one
+	// entry per node: the entry whose Node is the receiving node names the groups
+	// that node has to deliver one member of (see shared.go). The producing node
+	// elects them, so a group is delivered on exactly one node even when its
+	// members live on several. An event that matches no shared group carries none,
+	// and a peer that does not know the field (an older build) ignores it and
+	// delivers no shared copy, which degrades a shared subscription to "no message
+	// across nodes" rather than to a duplicate.
+	Shared []SharedDelivery
+
 	// Origin is the node id of the node that first produced the event. An empty
 	// Origin means "produced locally": the built-in TCP cluster fills it in
 	// before the event leaves the node and never rewrites a received one.
@@ -129,6 +139,18 @@ type Cluster interface {
 	Spread(ctx context.Context, msg ClusterMessage) error
 }
 
+// SharedDelivery is the shared-subscription half of one cluster publish: the
+// shared subscription groups one node must deliver one member of (see shared.go).
+// The groups are full shared filters ("$share/{ShareName}/{filter}"), because that
+// is what identifies a group; the node picks the member and attaches the member's
+// own subscription identifiers.
+type SharedDelivery struct {
+	// Node is the node id that must deliver the groups.
+	Node string `json:"node"`
+	// Groups are the shared subscription group keys it must deliver.
+	Groups []string `json:"groups"`
+}
+
 // Member is one node in a cluster backend's member view.
 type Member struct {
 	// NodeID is the node id the peer announced in its handshake.
@@ -155,6 +177,15 @@ type MemberView interface {
 // publish to it (availability over precision).
 type subscriptionProvider interface {
 	subscriptionFilters() []string
+}
+
+// sharedSubscriptionProvider is implemented by a ClusterHandler that can describe
+// the shared subscription groups its local sessions hold a live member of. It is
+// the shared half of the advertised summary: a peer needs it to elect one node per
+// shared group (see shared.go), so a handler without it leaves shared
+// subscriptions local to the node that produced the publication.
+type sharedSubscriptionProvider interface {
+	sharedSubscriptionGroups() []string
 }
 
 // namespaceScoped is implemented by cluster backends that scope their traffic to

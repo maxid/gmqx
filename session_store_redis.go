@@ -228,10 +228,11 @@ func (s *RedisSessionStore) Save(key string, state SessionState) {
 		record.Subscriptions = make(map[string]redisSessionSubscription, len(state.Subscriptions))
 		for filter, sub := range state.Subscriptions {
 			record.Subscriptions[filter] = redisSessionSubscription{
-				QoS:               sub.QoS,
-				NoLocal:           sub.NoLocal,
-				RetainAsPublished: sub.RetainAsPublished,
-				RetainHandling:    sub.RetainHandling,
+				QoS:                     sub.QoS,
+				NoLocal:                 sub.NoLocal,
+				RetainAsPublished:       sub.RetainAsPublished,
+				RetainHandling:          sub.RetainHandling,
+				SubscriptionIdentifiers: sub.SubscriptionIdentifiers,
 			}
 		}
 	}
@@ -372,10 +373,11 @@ func (s *RedisSessionStore) decode(key string, raw []byte) (SessionState, bool) 
 		state.Subscriptions = make(map[string]SessionSubscription, len(record.Subscriptions))
 		for filter, sub := range record.Subscriptions {
 			state.Subscriptions[filter] = SessionSubscription{
-				QoS:               sub.QoS,
-				NoLocal:           sub.NoLocal,
-				RetainAsPublished: sub.RetainAsPublished,
-				RetainHandling:    sub.RetainHandling,
+				QoS:                     sub.QoS,
+				NoLocal:                 sub.NoLocal,
+				RetainAsPublished:       sub.RetainAsPublished,
+				RetainHandling:          sub.RetainHandling,
+				SubscriptionIdentifiers: sub.SubscriptionIdentifiers,
 			}
 		}
 	}
@@ -436,11 +438,14 @@ type redisSessionRecord struct {
 }
 
 // redisSessionSubscription is one stored subscription with its MQTT 5 options.
+// SubscriptionIdentifiers is additive on the wire: a record written by a build
+// that predates the field decodes as "no identifier", exactly as it behaved.
 type redisSessionSubscription struct {
-	QoS               byte `json:"qos,omitempty"`
-	NoLocal           bool `json:"nl,omitempty"`
-	RetainAsPublished bool `json:"rap,omitempty"`
-	RetainHandling    byte `json:"rh,omitempty"`
+	QoS                     byte     `json:"qos,omitempty"`
+	NoLocal                 bool     `json:"nl,omitempty"`
+	RetainAsPublished       bool     `json:"rap,omitempty"`
+	RetainHandling          byte     `json:"rh,omitempty"`
+	SubscriptionIdentifiers []uint32 `json:"si,omitempty"`
 }
 
 // redisSessionMessage is one queued message: topic, payload, QoS, retain flag and

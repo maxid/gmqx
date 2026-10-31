@@ -1,90 +1,76 @@
 package gmqx
 
-// Capabilities the CONNACK advertises as unavailable must be refused, not
-// silently accepted. props.go advertises exactly two of them: Shared Subscription
-// Available 0 and Subscription Identifier Available 0 (Retain, Wildcard
-// Subscriptions and Topic Alias are advertised as available and are implemented).
-// These tests pin the refusal of each.
+// Capabilities the CONNACK advertises must be real. props.go advertises Retain,
+// Wildcard Subscriptions, Subscription Identifiers and Shared Subscriptions as
+// available, and all four are implemented. This file pins the two that used to be
+// refused — a "$share/..." filter and a SUBSCRIBE carrying a Subscription
+// Identifier — from the capability side: granted, not refused, and with the
+// connection still usable afterwards. The routing and property behaviour of both
+// lives in shared_subscription_test.go, subscription_identifier_test.go and
+// shared_cluster_test.go.
 
 import (
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
 )
 
-// TestSharedSubscriptionRejected pins that a "$share/..." filter is answered with
-// the reason code that names the missing capability — per filter, in the SUBACK,
-// as MQTT 5 §3.9 requires — and is not stored as a literal filter that could
-// never match.
-func TestSharedSubscriptionRejected(t *testing.T) {
+// TestSharedSubscriptionCapability pins that a shared subscription is a real
+// subscription on both protocol versions: the filter is granted with the requested
+// QoS, and the routing summary advertises the group (never the filter as a literal
+// topic that could never match).
+func TestSharedSubscriptionCapability(t *testing.T) {
 	metrics := newDeliveryMetrics()
 	b := startBroker(t, Config{Metrics: metrics})
 
-	t.Run("mqtt5", func(t *testing.T) {
-		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "share-v5", clean: true})
-		sub := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/t", QoS: 1})
-		if len(sub.ReasonCodes) != 1 || sub.ReasonCodes[0] != 0x9E {
-			t.Fatalf("SUBACK codes %#v for \"$share/g/t\", want [0x9E] (Shared Subscriptions not supported)", sub.ReasonCodes)
+	// MQTT 5: granted, and the group is part of the advertised summary.
+	c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "cap-v5", clean: true})
+	if codes := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/cap/t", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("SUBACK codes %#v for \"$share/g/cap/t\", want [1]", codes)
+	}
+	if groups := b.sharedSubscriptionGroups(); len(groups) != 1 || groups[0] != "$share/g/cap/t" {
+		t.Fatalf("advertised shared groups = %v, want the subscribed group", groups)
+	}
+	for _, filter := range b.subscriptionFilters() {
+		if filter == "$share/g/cap/t" {
+			t.Fatal("the routing summary advertises the shared filter as a normal one")
 		}
-		// The refusal is per filter and does not end the connection: a plain
-		// filter in the same SUBSCRIBE is still granted.
-		sub = subscribe(t, c, 2, mqtt.Properties{},
-			mqtt.Subscription{Filter: "g/t", QoS: 1},
-			mqtt.Subscription{Filter: "$share/g/t", QoS: 1},
-		)
-		if len(sub.ReasonCodes) != 2 || sub.ReasonCodes[0] != 1 || sub.ReasonCodes[1] != 0x9E {
-			t.Fatalf("SUBACK codes %#v, want [1 0x9E]", sub.ReasonCodes)
-		}
-		c.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
-		readConf[*mqtt.Pingresp](t, c)
+	}
 
-		// The shared filter is not part of the session: a publish to its literal
-		// text reaches nobody, and the routing summary never advertises it.
-		pub, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "share-v5-pub", clean: true})
-		pub.publish(confPublish{topic: "$share/g/t", payload: "literal", qos: 0})
-		expectNoMessage(t, c, 150*time.Millisecond)
-		for _, filter := range b.subscriptionFilters() {
-			if strings.HasPrefix(filter, "$share/") {
-				t.Fatalf("routing summary advertises the rejected shared filter %q", filter)
-			}
-		}
-	})
+	// MQTT 3.1.1 has no shared subscription concept, but the filter syntax is the
+	// broker's, so the subscription is granted there too (0 is the granted QoS; the
+	// 0x80 failure code the old refusal used is gone).
+	legacy, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version311, clientID: "cap-v311", clean: true})
+	if codes := subscribe(t, legacy, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/cap/t", QoS: 0}).ReasonCodes; len(codes) != 1 || codes[0] != 0 {
+		t.Fatalf("SUBACK codes %#v for \"$share/g/cap/t\" on MQTT 3.1.1, want [0]", codes)
+	}
+	legacy.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}})
+	readConf[*mqtt.Pingresp](t, legacy)
 
-	t.Run("mqtt311", func(t *testing.T) {
-		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version311, clientID: "share-v311", clean: true})
-		sub := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/t", QoS: 0})
-		if len(sub.ReasonCodes) != 1 || sub.ReasonCodes[0] != 0x80 {
-			t.Fatalf("SUBACK codes %#v for \"$share/g/t\", want [0x80]", sub.ReasonCodes)
-		}
-		c.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}})
-		readConf[*mqtt.Pingresp](t, c)
-	})
-
-	if got := metrics.count("shared_subscription"); got != 3 {
-		t.Fatalf("shared_subscription drops = %d, want 3", got)
+	// Nothing was refused, so nothing is counted as dropped.
+	if got := metrics.count("shared_subscription"); got != 0 {
+		t.Fatalf("shared_subscription drops = %d, want 0: accepted filters are not refusals", got)
 	}
 }
 
-// TestSubscriptionIdentifierRejected pins the other advertised capability: a
-// SUBSCRIBE that carries a Subscription Identifier asks for something the CONNACK
-// said is unavailable, so MQTT 5 answers with DISCONNECT 0x9A and closes.
-//
-// MQTT 3.1.1 has no SUBSCRIBE properties at all, so there is nothing to refuse
-// there and the broker cannot be asked the question.
-func TestSubscriptionIdentifierRejected(t *testing.T) {
+// TestSubscriptionIdentifierCapability pins the other advertised capability: a
+// SUBSCRIBE carrying a Subscription Identifier is accepted (the DISCONNECT 0x9A
+// of the unavailable-capability build is gone), the identifier is stored with the
+// subscription, and the connection keeps working.
+func TestSubscriptionIdentifierCapability(t *testing.T) {
 	b := startBroker(t, Config{})
-	c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "sub-id", clean: true})
-	c.write(&mqtt.Subscribe{
-		MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5},
-		PacketID:      1,
-		Properties:    mqtt.Properties{SubscriptionIdentifiers: []uint32{7}},
-		Subscriptions: []mqtt.Subscription{{Filter: "si/x", QoS: 0}},
-	})
-	expectDisconnect(t, c, 0x9A)
-	waitDisconnected(t, b, "sub-id")
-	if filters := b.subscriptionFilters(); len(filters) != 0 {
-		t.Fatalf("rejected SUBSCRIBE left filters behind: %v", filters)
+	c, ack := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "cap-si", clean: true})
+	if ack.Properties.SubscriptionIdentifierAvailable == nil || !*ack.Properties.SubscriptionIdentifierAvailable {
+		t.Fatalf("CONNACK subscription identifier available = %v, want true", ack.Properties.SubscriptionIdentifierAvailable)
+	}
+	if codes := subscribe(t, c, 1, mqtt.Properties{SubscriptionIdentifiers: []uint32{7}},
+		mqtt.Subscription{Filter: "si/cap", QoS: 0}).ReasonCodes; len(codes) != 1 || codes[0] != 0 {
+		t.Fatalf("SUBACK codes %#v for a SUBSCRIBE carrying an identifier, want [0]", codes)
+	}
+	// The connection is still usable and the subscription is routable.
+	c.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
+	readConf[*mqtt.Pingresp](t, c)
+	if filters := b.subscriptionFilters(); len(filters) != 1 || filters[0] != "si/cap" {
+		t.Fatalf("routing summary = %v, want the accepted subscription", filters)
 	}
 }

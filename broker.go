@@ -37,6 +37,15 @@ type Broker struct {
 	// backend that implements it is told about every connect and disconnect, so a
 	// directed publish can be routed instead of broadcast.
 	presence clientPresence
+	// sharedNodes is the optional cluster view of which nodes hold a live member of
+	// a shared subscription group. It is what lets one node deliver a shared
+	// publication instead of every node delivering a copy (see shared.go).
+	sharedNodes sharedDirectory
+	// sharedMu guards sharedRotation, the per-group counter that rotates the node
+	// election of a shared group so successive publications of one group do not all
+	// land on the same node. The table is bounded by maxSharedRotationEntries.
+	sharedMu       sync.Mutex
+	sharedRotation map[string]uint64
 
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
@@ -204,6 +213,7 @@ func New(cfg Config) (*Broker, error) {
 		nodeID:    cfg.NodeID,
 	}
 	b.presence, _ = cfg.ClusterBackend.(clientPresence)
+	b.sharedNodes, _ = cfg.ClusterBackend.(sharedDirectory)
 	b.dispatcher = newDispatcher(cfg.Dispatcher, b)
 	// A store may have been restored or preloaded before the broker was created;
 	// those sessions are local targets from the first publication on, exactly as
@@ -773,7 +783,15 @@ func (b *Broker) unregister(c *client) {
 }
 
 func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bool) {
-	if !b.checkACL(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
+	// A shared subscription is authorized by the filter it delivers: "$share/g/t"
+	// receives the publications of "t", so an ACL that allows "t" allows it and a
+	// rule written for the group name would not be consulted. The full filter is
+	// what the session stores, the index keys and an UNSUBSCRIBE names.
+	aclFilter := filter
+	if shared, isShared, ok := parseSharedFilter(filter); isShared && ok {
+		aclFilter = shared.filter
+	}
+	if !b.checkACL(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, aclFilter, AclSubscribe) {
 		b.metrics.RecordDroppedMessage("acl_subscribe")
 		return subscribeFailure(c.version, ReasonNotAuthorized), false
 	}
@@ -797,9 +815,8 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 }
 
 // subscribeFailure maps a subscription refusal onto the protocol level: MQTT 5
-// names the reason (0x87 Not authorized, 0x97 Quota exceeded, 0x9E Shared
-// Subscriptions not supported), while MQTT 3.1.1 has the single 0x80 failure
-// code.
+// names the reason (0x87 Not authorized, 0x97 Quota exceeded), while MQTT 3.1.1
+// has the single 0x80 failure code.
 func subscribeFailure(version, reason byte) byte {
 	if version == mqtt.Version5 {
 		return reason
@@ -830,6 +847,16 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 // namespace, so peers of another namespace ignore it.
 func (b *Broker) subscriptionFilters() []string {
 	return b.index.liveFilters()
+}
+
+// sharedSubscriptionGroups implements sharedSubscriptionProvider: the shared
+// subscription groups this node holds at least one live member of. It is the
+// shared half of the routing summary, and it is what lets one node elect the node
+// that delivers a publication for a group instead of every node delivering a copy
+// (see Broker.dispatchShared). Stored sessions are not advertised: an offline
+// member receives no shared delivery.
+func (b *Broker) sharedSubscriptionGroups() []string {
+	return b.index.liveSharedGroups()
 }
 
 // subscriptionsChanged tells a cluster backend that can push subscription
@@ -876,7 +903,11 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 }
 
 // sendRetained replays the retained messages a new subscription matches, in its
-// own namespace only.
+// own namespace only. ids are the Subscription Identifiers of the subscription
+// that caused the replay: a replayed PUBLISH is a delivery like any other, so it
+// carries them. A shared subscription is not replayed at all (§4.8.2: "No Retained
+// Messages are sent to the Session when it first subscribes"), so the caller never
+// reaches here for one.
 //
 // A message whose Message Expiry Interval has elapsed is not replayed: it is
 // deleted from the store on the way, because that is the only moment the broker
@@ -885,7 +916,7 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 // the interval it has left, rounded up: the property counts from the publish and
 // the subscriber has to see the time the message may still live here, and a
 // rounding down to zero would mean "never expires" on the wire.
-func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool) {
+func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool, ids []uint32) {
 	now := time.Now()
 	type replay struct {
 		topic   string
@@ -916,7 +947,11 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 	}
 	b.mu.Unlock()
 	for _, m := range msgs {
-		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true, m.props)
+		props, dropped := withSubscriptionIDs(m.props, ids)
+		if dropped {
+			b.metrics.RecordDroppedMessage("subscription_identifier_limit")
+		}
+		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true, props)
 	}
 }
 
@@ -1167,6 +1202,14 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 		}
 		props = decoded
 	}
+	// The identifiers belong to the subscriptions the target was reached
+	// through, so they are attached here, once per delivery, and never travel in
+	// Publication.Props (see subscription_id.go).
+	var dropped bool
+	props, dropped = withSubscriptionIDs(props, target.subscriptionIDs)
+	if dropped {
+		b.metrics.RecordDroppedMessage("subscription_identifier_limit")
+	}
 	if target.client == nil {
 		b.enqueueOffline(target, pub, props)
 		return nil
@@ -1179,7 +1222,14 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 // namespace travels with the event; a built-in backend stamps an empty namespace
 // with its own and refuses to produce an event for a different one. It is a
 // no-op without a backend.
+//
+// It also routes shared subscriptions (see shared.go): deciding which node
+// delivers a shared publication is part of the same hand-off, so the groups this
+// node was elected for are delivered before the event leaves and the ones a peer
+// must deliver travel in ClusterMessage.Shared. A publication that matches no
+// shared group costs nothing extra.
 func (b *Broker) SpreadPublication(ctx context.Context, pub Publication) error {
+	shared := b.dispatchShared(ctx, pub)
 	if b.cfg.ClusterBackend == nil {
 		return nil
 	}
@@ -1192,6 +1242,7 @@ func (b *Broker) SpreadPublication(ctx context.Context, pub Publication) error {
 		QoS:       pub.QoS,
 		Retain:    pub.Retain,
 		Props:     pub.Props,
+		Shared:    shared,
 	}
 	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
 		return fmt.Errorf("gmqx: cluster spread: %w", err)
@@ -1420,6 +1471,12 @@ func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 	ctx := b.lifecycleContext()
 	for _, target := range b.LocalTargets(pub) {
 		_ = b.SendLocal(ctx, target, pub)
+	}
+	// The origin elected this node for some shared groups: deliver one member of
+	// each. A node the event does not name delivers no shared copy, which is what
+	// keeps a publication from reaching one member per node.
+	for _, group := range b.sharedGroupsFor(msg.Shared) {
+		b.deliverSharedGroup(ctx, group, pub)
 	}
 }
 

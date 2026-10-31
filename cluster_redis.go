@@ -202,6 +202,11 @@ type redisOwnerRecord struct {
 type redisSummaryRecord struct {
 	NodeID  string   `json:"node"`
 	Filters []string `json:"filters"`
+	// Shared lists the shared subscription group keys this node holds a live
+	// member of. It travels beside Filters in the same record: peers elect one
+	// node per shared group from it (see shared.go). A record written by a build
+	// that predates the field simply advertises no groups.
+	Shared []string `json:"shared,omitempty"`
 	// Namespace scopes the summary: a peer only uses summaries of its own
 	// namespace. The field is additive on the wire; an old value without it is
 	// the default namespace.
@@ -229,6 +234,7 @@ type redisFrame struct {
 type redisPeer struct {
 	Member
 	filters      []string
+	shared       []string
 	filtersKnown bool
 }
 
@@ -240,6 +246,7 @@ func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 		cfg:          cfg,
 		namespace:    cfg.Namespace,
 		local:        newSummarySet(),
+		sharedLocal:  newSummarySet(),
 		refreshCh:    make(chan struct{}, 1),
 		presence:     make(map[string]time.Time),
 		presenceGone: make(map[string]struct{}),
@@ -304,9 +311,10 @@ type redisCluster struct {
 	view   map[string]*redisPeer
 	viewAt time.Time
 
-	// summaryMu guards the local advertised summary.
-	summaryMu sync.Mutex
-	local     *summarySet
+	// summaryMu guards the local advertised summary and its shared half.
+	summaryMu   sync.Mutex
+	local       *summarySet
+	sharedLocal *summarySet
 
 	// refreshCh wakes the housekeeping loop after a local subscription change.
 	// It is buffered and never blocks the SUBSCRIBE/UNSUBSCRIBE path: a change
@@ -860,6 +868,12 @@ func (c *redisCluster) routingTargets(view map[string]*redisPeer, msg ClusterMes
 		switch {
 		case msg.Type == ClusterKick || msg.Retain:
 			out = append(out, nodeID)
+		case namesNode(msg.Shared, nodeID):
+			// The origin elected this peer for a shared subscription group (see
+			// shared.go): the election routes the event, not its filter summary,
+			// because a node whose only subscribers are group members advertises no
+			// matching topic filter.
+			out = append(out, nodeID)
 		case !p.filtersKnown:
 			// Unknown summary: send to this node only. Flooding every node would
 			// defeat directed routing; sending nothing would lose messages.
@@ -869,6 +883,30 @@ func (c *redisCluster) routingTargets(view map[string]*redisPeer, msg ClusterMes
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+// sharedGroups implements sharedDirectory: the shared subscription group keys each
+// peer advertised, per node id, read from the cached routing view. It is the same
+// view normal routing uses, so electing a node costs no round trip; a peer whose
+// summary is unknown contributes no groups, and its groups are elected to nobody
+// until the next summary refresh (one SummaryInterval).
+func (c *redisCluster) sharedGroups() map[string][]string {
+	c.viewMu.Lock()
+	view := c.view
+	c.viewMu.Unlock()
+	if len(view) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, 4)
+	for nodeID, p := range view {
+		if nodeID == "" || nodeID == c.nodeID {
+			continue
+		}
+		for _, group := range p.shared {
+			out[group] = append(out[group], nodeID)
+		}
+	}
 	return out
 }
 
@@ -969,6 +1007,7 @@ func (c *redisCluster) loadViewCtx(ctx context.Context) (map[string]*redisPeer, 
 			continue
 		}
 		p.filters = capFilters(rec.Filters, c.maxSummaryFilters())
+		p.shared = capFilters(rec.Shared, c.maxSummaryFilters())
 		p.filtersKnown = true
 	}
 	return view, nil
@@ -1123,12 +1162,13 @@ func (c *redisCluster) refreshLocal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	filters, known := c.localFilters()
+	filters, shared, known := c.localFilters()
 	var summary []byte
 	if known {
 		summary, err = json.Marshal(redisSummaryRecord{
 			NodeID:    c.nodeID,
 			Filters:   filters,
+			Shared:    shared,
 			Namespace: c.namespace,
 			Updated:   time.Now().UnixNano(),
 		})
@@ -1149,18 +1189,25 @@ func (c *redisCluster) refreshLocal(ctx context.Context) error {
 	return err
 }
 
-// localFilters recomputes the summary this node advertises. A handler that does
-// not implement subscriptionProvider never advertises, which makes peers treat
-// it as unknown (availability over precision).
-func (c *redisCluster) localFilters() ([]string, bool) {
+// localFilters recomputes the summary this node advertises: the topic filters of
+// its normal subscriptions and the shared subscription groups it holds a live
+// member of. A handler that does not implement subscriptionProvider never
+// advertises, which makes peers treat it as unknown (availability over
+// precision); a handler without the shared half advertises no groups, which keeps
+// shared subscriptions local to the node that publishes (see shared.go).
+func (c *redisCluster) localFilters() (filters, shared []string, known bool) {
 	provider, ok := c.handler.(subscriptionProvider)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
 	current := provider.subscriptionFilters()
+	var groups []string
+	if sp, ok := c.handler.(sharedSubscriptionProvider); ok {
+		groups = sp.sharedSubscriptionGroups()
+	}
 	c.summaryMu.Lock()
 	defer c.summaryMu.Unlock()
-	return c.local.refresh(current, c.maxSummaryFilters()), true
+	return c.local.refresh(current, c.maxSummaryFilters()), c.sharedLocal.refresh(groups, c.maxSummaryFilters()), true
 }
 
 // subscriptionsChanged implements subscriptionChangeNotifier. The broker calls it

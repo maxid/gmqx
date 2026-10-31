@@ -5,6 +5,71 @@
 
 ## [Unreleased]
 
+- **Shared subscriptions and subscription identifiers work; the CONNACK advertises
+  both as available.**
+
+  *Shared subscriptions.* A `$share/{ShareName}/{filter}` filter is validated per
+  MQTT 5 §4.8.2 (non-empty ShareName without `/`, `+` or `#`, then a valid topic
+  filter) and refused **per filter** with SUBACK 0x8F when malformed; a filter that
+  merely starts with `$share` (`$share` alone) stays an ordinary literal filter, as
+  before. A publication matching a group goes to exactly one live member of each
+  group, chosen round robin; normal subscribers on the same filter still get their
+  own copy; a shared subscription with No Local is refused with 0x8F
+  (MQTT-3.8.3-4); no retained message is replayed on a shared subscription (§4.8.2);
+  an offline persistent member receives nothing because shared state is never queued
+  (the subscription itself survives in the stored session and rejoins the group on a
+  resume); the group's round-robin state is dropped with its last member.
+
+  Across a cluster the node that produces the publication elects exactly one node
+  per group — `fnv64(groupKey) + a per-group seat` over the sorted nodes that
+  advertise a live member — and names it in the new `ClusterMessage.Shared`
+  (`SharedDelivery`). The elected node picks the member locally. Both built-in
+  backends advertise the group keys in their subscription summary (a new `Shared`
+  field beside `Filters` in the TCP summary frame and in
+  `redisSummaryRecord`/`redisPeer`), and route a publish to a peer named in
+  `Shared` regardless of its topic summary. A publication is delivered at most once
+  per group cluster-wide; if the elected node has lost its last member it drops the
+  publication and counts `RecordDroppedMessage("shared_no_member")` instead of
+  handing it to another node's member. A `Cluster` backend outside this package
+  does not advertise groups, so shared subscriptions there stay local to the
+  publishing node; a peer from an older build ignores `Shared` and delivers no
+  shared copy across nodes — never a duplicate.
+
+  *Subscription identifiers.* A SUBSCRIBE carrying property 0x0B is accepted (the
+  DISCONNECT 0x9A is gone). The identifier is stored with the subscription,
+  written through the `SessionStore` in the new
+  `SessionSubscription.SubscriptionIdentifiers` (additive on both the in-memory and
+  the Redis record), restored on a resume, and attached to every PUBLISH that
+  subscription causes: live, retained replay, offline-queue drain and shared-group
+  delivery. All identifiers of the subscriptions that matched one session are
+  merged into a single PUBLISH, deduplicated, and capped at
+  `maxSubscriptionIdentifiersPerDelivery` (8, plus 8 stored per subscription);
+  identifiers a delivery had to leave out are counted with
+  `RecordDroppedMessage("subscription_identifier_limit")`. A value of 0 is a
+  Protocol Error: the connection is closed with DISCONNECT 0x82 (the gnety codec
+  refuses the value while parsing, and the broker maps that one refusal; every other
+  unparsable packet remains 0x81). The property stays hop-local: a client PUBLISH
+  that carries it is still stripped, and delivery identifiers are attached by the
+  node that writes the PUBLISH.
+
+  Behavior changes for existing deployments:
+
+  - The CONNACK now advertises `SubscriptionIdentifierAvailable = true` and
+    `SharedSubscriptionAvailable = true`, and a `$share/...` SUBSCRIBE or a
+    Subscription Identifier no longer gets SUBACK 0x9E / DISCONNECT 0x9A. The two
+    exported reason-code constants that named those refusals
+    (`ReasonSharedSubscriptionsNotSupported`, `ReasonSubscriptionIdentifiersNotSupported`)
+    are removed.
+  - `SessionSubscription` grew a field. A store written by an older build decodes it
+    as "no identifier", which is what those subscriptions had, so a mixed-version
+    cluster keeps working in both directions.
+  - `Broker.SpreadPublication` now also performs the shared-subscription routing of
+    the publication (the local deliveries of the groups this node was elected for),
+    so a custom `Dispatcher` that spreads after its own local fan-out keeps getting
+    correct shared behaviour without a new call.
+  - `ClusterMessage` grew the additive `Shared` field; the TCP summary frame and the
+    Redis summary record grew a `shared` list. Older peers ignore both.
+
 - **Kicks carry an epoch, and a Redis-backed store lets the nodes of a cluster share
   persistent sessions.**
 

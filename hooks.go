@@ -113,20 +113,16 @@ const (
 
 // MQTT 5 reason codes used when a sink does not pick one.
 const (
-	ReasonUnspecified   byte = 0x80
+	ReasonUnspecified byte = 0x80
+	// ReasonProtocolError is the DISCONNECT of a packet the specification calls a
+	// Protocol Error rather than a malformed one: a Subscription Identifier of 0
+	// on a SUBSCRIBE (§3.8.2.1.2) is the case this package answers with it.
+	ReasonProtocolError byte = 0x82
 	ReasonNotAuthorized byte = 0x87
 	// ReasonSessionTakenOver is the DISCONNECT a server sends to the connection a
 	// new CONNECT displaced (MQTT 5 §3.1.2.5, 4.13).
 	ReasonSessionTakenOver byte = 0x8E
 	ReasonQuotaExceeded    byte = 0x97
-	// ReasonSubscriptionIdentifiersNotSupported is the DISCONNECT a SUBSCRIBE
-	// carrying a Subscription Identifier gets, because the CONNACK advertised
-	// Subscription Identifier Available 0.
-	ReasonSubscriptionIdentifiersNotSupported byte = 0x9A
-	// ReasonSharedSubscriptionsNotSupported is the per-filter SUBACK code of a
-	// "$share/..." filter, because the CONNACK advertised Shared Subscription
-	// Available 0 (MQTT 5 §3.9.3).
-	ReasonSharedSubscriptionsNotSupported byte = 0x9E
 	// ReasonConnectionRateExceeded is the CONNACK of a CONNECT refused by the
 	// Config.NotKickSeconds anti-flap window (MQTT 5 §3.2.2.2).
 	ReasonConnectionRateExceeded byte = 0x9F
@@ -180,9 +176,14 @@ type EventSink interface {
 // replayed because its Message Expiry Interval elapsed, and it was deleted),
 // "max_connections", "max_subscriptions", "connection_rate_limit",
 // "takeover_rate_limit" (a CONNECT inside the Config.NotKickSeconds window would
-// have displaced a live connection), "shared_subscription" (a "$share/..."
-// filter was refused), "subscription_identifier" (a SUBSCRIBE carrying one was
-// rejected), "cluster_namespace", "inflight_overflow" (a QoS 1/2 delivery found
+// have displaced a live connection), "shared_subscription" (a malformed
+// "$share/..." filter, or one that sets No Local, was refused), "shared_no_member"
+// (a shared publication reached a node with no live member of the group, so it was
+// dropped instead of being handed to another node's member),
+// "subscription_identifier" (a SUBSCRIBE carried an out-of-range Subscription
+// Identifier, which is a Protocol Error), "subscription_identifier_limit" (a
+// delivery carried more Subscription Identifiers than the documented cap, or a
+// subscription stored more), "cluster_namespace", "inflight_overflow" (a QoS 1/2 delivery found
 // the connection's inflight window and the queue behind it both full, so it was
 // dropped), "inflight_qos2_full" (an inbound QoS 2 PUBLISH over the window),
 // "retry_exhausted" (an outbound exchange used up its retransmissions),
@@ -302,6 +303,11 @@ type LocalTarget struct {
 
 	client     *client
 	sessionKey string
+	// subscriptionIDs are the Subscription Identifiers of the subscriptions the
+	// target was reached through, deduplicated. SendLocal attaches them to the
+	// PUBLISH it writes (or queues), which is what makes the identifier a property
+	// of the subscription rather than of the publication.
+	subscriptionIDs []uint32
 }
 
 // Offline reports whether the target is a persistent session with no live

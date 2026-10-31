@@ -10,8 +10,8 @@ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/klauspost/cpuid/v2 v2.4.0 h1:S6Hrbc7+ywsr0r+RLapfGBHfyefhCTwEh3A0tV913Dw=
 github.com/klauspost/cpuid/v2 v2.4.0/go.mod h1:19jmZ9mjzoF//ddRSUsv0zfBTJWh3QJh9FNxZTMrGxU=
-github.com/maxid/gnety v0.0.0-20261031080901-7d8021d3c664 h1:88AWlFV16QuqR9Hhk0mKzhfs43SWmowVT7Yd8fS2lqQ=
-github.com/maxid/gnety v0.0.0-20261031080901-7d8021d3c664/go.mod h1:uVjoynffjJX5EZV0eS8cpUJ8X2Nhzmnq0Ywqq0ia2es=
+github.com/maxid/gnety v0.0.0-20261031140716-cf189e47d917 h1:MCrFvKHPp9hIq4aEdM5Sa9AQmSqE42mi8BMJxehDoFM=
+github.com/maxid/gnety v0.0.0-20261031140716-cf189e47d917/go.mod h1:uVjoynffjJX5EZV0eS8cpUJ8X2Nhzmnq0Ywqq0ia2es=
 github.com/pion/dtls/v2 v2.2.12 h1:KP7H5/c1EiVAAKUmXyCzPiQe5+bCJrpOeKg/L05dunk=
 github.com/pion/dtls/v2 v2.2.12/go.mod h1:d9SYc9fch0CqK90mRk1dC7AkzzpwJj6u2GU3u+9pqFE=
 github.com/pion/logging v0.2.2 h1:M9+AIj/+pxNsDfAT64+MAVgJO0rsyLnoJKCqf//DoeY=

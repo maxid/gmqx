@@ -189,11 +189,11 @@ func test5ConnackProperties(t *testing.T) {
 	if p.WildcardSubscriptionAvailable == nil || !*p.WildcardSubscriptionAvailable {
 		t.Fatalf("wildcard subscription available = %v, want true", p.WildcardSubscriptionAvailable)
 	}
-	if p.SubscriptionIdentifierAvailable == nil || *p.SubscriptionIdentifierAvailable {
-		t.Fatalf("subscription identifier available = %v, want false", p.SubscriptionIdentifierAvailable)
+	if p.SubscriptionIdentifierAvailable == nil || !*p.SubscriptionIdentifierAvailable {
+		t.Fatalf("subscription identifier available = %v, want true", p.SubscriptionIdentifierAvailable)
 	}
-	if p.SharedSubscriptionAvailable == nil || *p.SharedSubscriptionAvailable {
-		t.Fatalf("shared subscription available = %v, want false", p.SharedSubscriptionAvailable)
+	if p.SharedSubscriptionAvailable == nil || !*p.SharedSubscriptionAvailable {
+		t.Fatalf("shared subscription available = %v, want true", p.SharedSubscriptionAvailable)
 	}
 }
 
@@ -248,23 +248,39 @@ func test5TopicAlias(t *testing.T) {
 func test5SubscriptionIdentifiers(t *testing.T) {
 	b := startBroker(t, Config{})
 	_, ack := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-sub-id", clean: true})
-	if ack.Properties.SubscriptionIdentifierAvailable == nil || *ack.Properties.SubscriptionIdentifierAvailable {
-		t.Fatalf("CONNACK subscription identifier available = %v, want false", ack.Properties.SubscriptionIdentifierAvailable)
+	if ack.Properties.SubscriptionIdentifierAvailable == nil || !*ack.Properties.SubscriptionIdentifierAvailable {
+		t.Fatalf("CONNACK subscription identifier available = %v, want true", ack.Properties.SubscriptionIdentifierAvailable)
 	}
-	t.Run("refused_because_unavailable", func(t *testing.T) {
-		// The capability is advertised as unavailable, so a SUBSCRIBE that asks
-		// for it is a protocol error (MQTT 5 §3.9.2.1.2): DISCONNECT 0x9A.
-		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-sub-id-request", clean: true})
-		c.write(&mqtt.Subscribe{
-			MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5},
-			PacketID:      1,
-			Properties:    mqtt.Properties{SubscriptionIdentifiers: []uint32{1}},
-			Subscriptions: []mqtt.Subscription{{Filter: "si/x", QoS: 0}},
-		})
-		expectDisconnect(t, c, 0x9A)
-	})
 	t.Run("association_round_trip", func(t *testing.T) {
-		t.Skip("no publication is tagged with a subscription identifier: CONNACK advertises Subscription Identifier Available 0 (props.go connackProperties) and a SUBSCRIBE carrying one is refused")
+		// The identifier is stored with the subscription it was sent on and copied
+		// into every PUBLISH that subscription causes; a publication matching two
+		// tagged subscriptions carries both identifiers (§3.3.2.3.8).
+		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-sub-id-request", clean: true})
+		if codes := subscribe(t, c, 1, mqtt.Properties{SubscriptionIdentifiers: []uint32{1}},
+			mqtt.Subscription{Filter: "si/x", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		if codes := subscribe(t, c, 2, mqtt.Properties{SubscriptionIdentifiers: []uint32{268435455}},
+			mqtt.Subscription{Filter: "si/#", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+			t.Fatalf("SUBACK codes %v for the second tagged subscription", codes)
+		}
+		pub, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-sub-id-pub", clean: true})
+		pub.mustPublish(t, confPublish{topic: "si/x", payload: "tagged", qos: 1, pid: 1})
+		got := expectPublish(t, c)
+		if ids := got.Properties.SubscriptionIdentifiers; !sameIDs(ids, []uint32{1, 268435455}) {
+			t.Fatalf("delivery identifiers = %v, want [1 268435455]", ids)
+		}
+	})
+	t.Run("zero_identifier_is_a_protocol_error", func(t *testing.T) {
+		// MQTT 5 §3.8.2.1.2: a Subscription Identifier of 0 is a Protocol Error.
+		// It is sent as a raw frame because the codec refuses to encode it.
+		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-sub-id-zero", clean: true})
+		body := []byte{0, 1}
+		body = append(body, 0x02, 0x0b, 0x00)
+		body = mqtt.AppendString(body, "si/zero")
+		body = append(body, 0)
+		c.writeRaw(append(appendRemainingLength([]byte{0x82}, len(body)), body...))
+		expectDisconnect(t, c, 0x82)
 	})
 }
 
@@ -549,22 +565,52 @@ func test5MaximumPacketSize(t *testing.T) {
 func test5SharedSubscriptions(t *testing.T) {
 	b := startBroker(t, Config{})
 	_, ack := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared", clean: true})
-	if ack.Properties.SharedSubscriptionAvailable == nil || *ack.Properties.SharedSubscriptionAvailable {
-		t.Fatalf("CONNACK shared subscription available = %v, want false", ack.Properties.SharedSubscriptionAvailable)
+	if ack.Properties.SharedSubscriptionAvailable == nil || !*ack.Properties.SharedSubscriptionAvailable {
+		t.Fatalf("CONNACK shared subscription available = %v, want true", ack.Properties.SharedSubscriptionAvailable)
 	}
-	t.Run("refused_because_unavailable", func(t *testing.T) {
-		// A "$share/..." filter must not be accepted as a literal filter: the
-		// refusal is per filter in the SUBACK (MQTT 5 §3.9), and the connection
-		// stays usable.
-		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-request", clean: true})
-		if codes := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/t", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 0x9E {
-			t.Fatalf("SUBACK codes %v for \"$share/g/t\", want [0x9E]", codes)
+	t.Run("round_robin", func(t *testing.T) {
+		// A publication matching a shared subscription goes to exactly one member of
+		// the group; the group alternates, and a normal subscriber of the same filter
+		// gets its own copy (§4.8.2).
+		first, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-1", clean: true})
+		second, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-2", clean: true})
+		plain, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-plain", clean: true})
+		for _, c := range []*confClient{first, second} {
+			if codes := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/v5/shared", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+				t.Fatalf("SUBACK codes %v for the shared filter", codes)
+			}
+		}
+		if codes := subscribe(t, plain, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "v5/shared", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+			t.Fatalf("SUBACK codes %v for the normal filter", codes)
+		}
+		pub, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-pub", clean: true})
+		for i, payload := range []string{"one", "two"} {
+			pub.publish(confPublish{topic: "v5/shared", payload: payload, qos: 0})
+			want := first
+			if i == 1 {
+				want = second
+			}
+			if got := expectPublish(t, want); string(got.Payload) != payload {
+				t.Fatalf("group member received %q for publication %d, want %q", got.Payload, i, payload)
+			}
+			if got := expectPublish(t, plain); string(got.Payload) != payload {
+				t.Fatalf("normal subscriber received %q for publication %d", got.Payload, i)
+			}
+		}
+	})
+	t.Run("malformed_filter_is_refused_per_filter", func(t *testing.T) {
+		// A "$share/..." filter without a ShareName and a Topic Filter is refused
+		// with 0x8F, per filter, and the connection stays usable (§3.9).
+		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-bad", clean: true})
+		ack := subscribe(t, c, 1, mqtt.Properties{},
+			mqtt.Subscription{Filter: "$share/g/v5/ok", QoS: 1},
+			mqtt.Subscription{Filter: "$share//v5/ok", QoS: 1},
+		)
+		if len(ack.ReasonCodes) != 2 || ack.ReasonCodes[0] != 1 || ack.ReasonCodes[1] != 0x8f {
+			t.Fatalf("SUBACK codes %v, want [1 0x8F]", ack.ReasonCodes)
 		}
 		c.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
 		readConf[*mqtt.Pingresp](t, c)
-	})
-	t.Run("round_robin", func(t *testing.T) {
-		t.Skip("shared subscriptions are not implemented: CONNACK advertises Shared Subscription Available 0 (props.go connackProperties) and a \"$share/...\" filter is refused with SUBACK 0x9E")
 	})
 }
 
