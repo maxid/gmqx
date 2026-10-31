@@ -99,9 +99,14 @@ type client struct {
 	lost           bool
 	superseded     bool
 	sessionPresent bool
-	inboundQoS2    map[uint16]struct{}
-	topicAliases   map[uint16]string
-	outPID         uint16
+	// kicked is set when a peer's connect-time kick ended this connection:
+	// another node accepted the same client id, so the client itself is live
+	// elsewhere and this node must stop claiming its presence, even when its
+	// persistent session stays stored here (see Broker.unregister).
+	kicked       bool
+	inboundQoS2  map[uint16]struct{}
+	topicAliases map[uint16]string
+	outPID       uint16
 
 	// inflight holds the outbound QoS 1/2 exchanges this connection has not
 	// confirmed yet, keyed by packet id; retryWake asks retransmitLoop to
@@ -935,6 +940,9 @@ func (c *client) close(withWill bool) {
 // the caller is the handshake of the new connection or the cluster receive
 // goroutine.
 func (c *client) displace() {
+	c.mu.Lock()
+	c.kicked = true
+	c.mu.Unlock()
 	c.writeClosed.Store(true)
 	if c.version == mqtt.Version5 {
 		c.sendDisconnect(ReasonSessionTakenOver)

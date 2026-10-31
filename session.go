@@ -142,33 +142,67 @@ func (b *Broker) takeStoredSession(key string) (*session, bool) {
 }
 
 // deleteStoredSession removes key and forgets its queued messages. The caller
-// holds b.mu.
+// holds b.mu. The session leaves the routing index with it: an expired or
+// discarded session must not be a target any more.
 func (b *Broker) deleteStoredSession(key string) {
 	if state, ok := b.store.Load(key); ok {
 		b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
 	}
 	b.store.Delete(key)
+	b.index.remove(key)
 }
 
 // saveStoredSession writes the state the connection c leaves behind: its
 // subscriptions, the messages of the queue it did not manage to drain, and its
 // expiry deadline. The caller holds b.mu and c.mu, and c.queue is handed over to
 // the store.
+//
+// The session's filters move from live to stored in the routing index here: from
+// this point a matching publication is queued for it instead of written to a
+// connection, and no store call is needed to find out that it is a target.
 func (b *Broker) saveStoredSession(key string, c *client) {
 	if stale, ok := b.store.Load(key); ok {
 		// Defensive: a stored session of a live connection should not exist, but
 		// the counter must follow what the store actually holds.
 		b.offlineQueued = max(0, b.offlineQueued-len(stale.Queue))
 	}
+	// One deadline for both halves: the store the sweeper enforces and the index
+	// that decides whether a publication still finds a target.
+	expiresAt := c.sessionExpiryDeadline()
 	state := sessionState(&session{
 		clientID:  c.id,
 		subs:      c.subs,
 		queue:     c.queue,
-		expiresAt: c.sessionExpiryDeadline(),
+		expiresAt: expiresAt,
 	})
 	b.store.Save(key, state)
 	b.offlineQueued += len(c.queue)
 	c.queue = nil
+	b.index.setStored(key, c.id, c.subs, expiresAt)
+}
+
+// loadStoredSessions indexes the sessions a store already held when the broker
+// was created: a deployment restores session state before New, and those sessions
+// have to be local targets from the first publication on. A session whose deadline
+// already passed is skipped — nothing is queued for it, and the sweeper deletes
+// it. A store that is written behind the broker's back while it runs is not
+// re-read: the broker indexes what it saves, hands over and expires.
+func (b *Broker) loadStoredSessions() {
+	now := time.Now()
+	for _, key := range b.store.Keys() {
+		if !keyInNamespace(b.namespace, key) {
+			// A store may be shared with a broker of another namespace.
+			continue
+		}
+		state, ok := b.store.Load(key)
+		if !ok {
+			continue
+		}
+		if !state.ExpiresAt.IsZero() && !now.Before(state.ExpiresAt) {
+			continue
+		}
+		b.index.setStored(key, state.ClientID, indexedSubscriptions(state.Subscriptions), state.ExpiresAt)
+	}
 }
 
 // sessionExpiryDeadline is the deadline the sweeper enforces for the session a
@@ -243,6 +277,10 @@ func (b *Broker) sweepExpiredSessions() {
 		current, ok := b.store.Load(key)
 		if ok && !current.ExpiresAt.IsZero() && !now.Before(current.ExpiresAt) {
 			b.deleteStoredSession(key)
+			// The session is gone, so no directed publish can be queued for it
+			// here any more: a presence-tracking cluster backend stops routing it to
+			// this node.
+			b.forgetClientPresence(current.ClientID)
 			b.metrics.RecordDroppedMessage("session_expired")
 			b.metrics.RecordQueueDepth("offline", b.offlineQueued)
 		}

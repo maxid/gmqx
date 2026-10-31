@@ -42,4 +42,13 @@ var (
 	// retryable while that process lives; a process that died without releasing
 	// the key blocks the id only until the key's TTL expires.
 	ErrNodeIDInUse = errors.New("gmqx: cluster node id already in use")
+	// ErrClientIDRequired reports that Broker.PublishToClient was called without a
+	// client id: a directed publish has no other way to name its target.
+	ErrClientIDRequired = errors.New("gmqx: client id is required")
+	// ErrNamespaceMismatch reports that Broker.PublishToClient was handed a
+	// publication stamped with a namespace other than the broker's. A client id is
+	// only unique inside its namespace, so such a publication is refused instead of
+	// being delivered to a session of a different scope or silently dropped. An
+	// empty Publication.Namespace means the broker's own namespace.
+	ErrNamespaceMismatch = errors.New("gmqx: publication namespace does not match the broker's")
 )

@@ -75,6 +75,17 @@ end
 return 0
 `
 
+// redisPresenceReleaseScript deletes a client id's presence record only when it
+// still names this process. A client that reconnected to another node has
+// overwritten the record there, and the disconnect of its previous connection must
+// not erase the presence of the new one.
+const redisPresenceReleaseScript = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`
+
 // RedisClusterConfig configures the Redis cluster backend, the centralized
 // alternative to the TCP mesh: a node publishes an event once per target node to
 // that node's own channel, so N nodes need one Redis connection each instead of
@@ -121,6 +132,17 @@ type RedisClusterConfig struct {
 	// TTLs above are the authority. Spreading an event also exercises Redis, so a
 	// publish-heavy node needs no heartbeat at all.
 	HeartbeatInterval time.Duration
+	// PresenceTTL is how long the presence record of one client id survives
+	// without a refresh (default 3×SummaryInterval; it must exceed
+	// SummaryInterval). The broker reports every CONNECT and every disconnect, so
+	// a record is written when a client connects here and deleted when it leaves;
+	// the TTL is the safety net for a node that dies without saying goodbye, and
+	// the records of connected clients are refreshed every SummaryInterval so a
+	// live client never expires from the view. A directed publish reads the record
+	// of its client id and is sent to that node's channel only (see
+	// Broker.PublishToClient); a missing record means "no node claims this client
+	// id" and the publish is counted and dropped instead of broadcast.
+	PresenceTTL time.Duration
 
 	// DedupSize is the number of event identities remembered for duplicate
 	// suppression (default 4096). The oldest identity is evicted first, so the
@@ -139,7 +161,8 @@ type RedisClusterConfig struct {
 
 	// Metrics, when set, receives RecordDroppedMessage for events the cluster
 	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward",
-	// "cluster_namespace"), the same reasons the TCP backend reports.
+	// "cluster_namespace", and "target_unknown" for a directed publish whose client
+	// id no presence record claims), the same reasons the TCP backend reports.
 	Metrics MetricsManager
 	// Logger receives membership and connectivity decisions (default
 	// slog.Default()).
@@ -186,6 +209,12 @@ type redisSummaryRecord struct {
 	Updated   int64  `json:"updated"` // unix nanoseconds
 }
 
+// Redis presence is a plain string value per client id, not a JSON record: it is
+// read on the directed-publish path and compared byte for byte by the
+// compare-and-delete script, and the node id plus the process incarnation are the
+// whole content. The namespace travels in the key, which is what keeps two
+// namespaces sharing one Redis from claiming each other's client ids.
+//
 // redisFrame is the envelope of one event on a node channel. The node channels
 // carry events only — membership and summaries are keys, not messages — so the
 // envelope is deliberately smaller than the TCP backend's frame.
@@ -208,10 +237,13 @@ type redisPeer struct {
 // Redis under TTL'd keys.
 func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 	return &redisCluster{
-		cfg:       cfg,
-		namespace: cfg.Namespace,
-		local:     newSummarySet(),
-		refreshCh: make(chan struct{}, 1),
+		cfg:          cfg,
+		namespace:    cfg.Namespace,
+		local:        newSummarySet(),
+		refreshCh:    make(chan struct{}, 1),
+		presence:     make(map[string]time.Time),
+		presenceGone: make(map[string]struct{}),
+		presenceCh:   make(chan struct{}, 1),
 	}
 }
 
@@ -229,6 +261,11 @@ func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 //	                          existence is membership, its expiry is eviction
 //	<prefix>:subs:<nodeID>    JSON redisSummaryRecord with the SummaryTTL; its
 //	                          absence means "summary unknown"
+//	<prefix>:client:<key>     presence of one client id, with the PresenceTTL:
+//	                          "<nodeID>\x00<incarnation>", where <key> is
+//	                          namespaceKey(Config.Namespace, ClientID). It is what
+//	                          routes a directed publish to the one node that holds
+//	                          the client.
 //
 // Everything Redis holds is shared state; the process-local cache (`view`) is
 // only a bounded-time copy of it, refreshed from Redis and never used to decide
@@ -275,6 +312,19 @@ type redisCluster struct {
 	// It is buffered and never blocks the SUBSCRIBE/UNSUBSCRIBE path: a change
 	// that arrives while a refresh is queued rides along with it.
 	refreshCh chan struct{}
+
+	// presenceMu guards the local presence view. presence holds the client ids
+	// this node currently holds, with the time their Redis record was last
+	// written (the zero time means "not written yet"); presenceGone holds the ids
+	// whose record still has to be deleted. Both are reconciled by the
+	// housekeeping loop, so a CONNECT never waits for Redis.
+	presenceMu   sync.Mutex
+	presence     map[string]time.Time
+	presenceGone map[string]struct{}
+	// presenceCh wakes the housekeeping loop after a connect or disconnect. It is
+	// buffered and never blocks: a change that arrives while a flush is queued
+	// rides along with it.
+	presenceCh chan struct{}
 
 	healthy atomic.Bool
 	seq     atomic.Uint64
@@ -456,6 +506,12 @@ func (c *redisCluster) Stop(ctx context.Context) error {
 		// the id over.
 		_, _ = rdb.Del(delCtx, c.memberKey(c.nodeID), c.summaryKey(c.nodeID)).Result()
 	}
+	// Directed publishes must stop being routed here now, not after the TTL. The
+	// delete is conditional on this process still owning each record, so a client
+	// that already moved to another node keeps its presence there.
+	clearCtx, clearCancel := context.WithTimeout(context.WithoutCancel(ctx), redisIOTimeout)
+	c.clearPresence(clearCtx)
+	clearCancel()
 	cancel()
 	c.log.Info("gmqx redis cluster stopped", "node", c.nodeID)
 	return rdb.Close()
@@ -503,6 +559,16 @@ func (c *redisCluster) Members() []Member {
 // and a kick names a client id rather than a topic, so only the node holding
 // that session can act on it.
 //
+// A directed publish (ClusterTarget) is routed through the presence view: its
+// client id's record names the node that holds it, and the event is written to
+// that node's channel only. A missing record means no node claims the client id
+// (it is offline, it never connected, or its CONNECT is younger than the presence
+// refresh), and the event is counted and dropped instead of being broadcast —
+// presence routing is the point of the Redis backend, and a broadcast would make
+// every node pay for a message at most one can use. A kick deliberately does not
+// use presence: a stale record must not leave a zombie connection alive on the
+// node the client actually moved to.
+//
 // Delivery is at-most-once: a failed publish is not retried here, because a
 // retry loop would stall the broker's publish path. A locally produced event
 // returns ErrClusterUnavailable so the caller can decide, and the receive loop
@@ -511,7 +577,7 @@ func (c *redisCluster) Spread(ctx context.Context, msg ClusterMessage) error {
 	if !c.isRunning() {
 		return errors.New("gmqx: cluster is not running")
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
 		return fmt.Errorf("gmqx: unknown cluster event type %q", msg.Type)
 	}
 	if msg.Origin != "" && msg.Origin != c.nodeID {
@@ -542,6 +608,10 @@ func (c *redisCluster) Spread(ctx context.Context, msg ClusterMessage) error {
 	ctx, cancel := context.WithTimeout(ctx, redisIOTimeout)
 	defer cancel()
 
+	if msg.Type == ClusterTarget {
+		return c.spreadTarget(ctx, msg, payload)
+	}
+
 	view, err := c.routingView(ctx)
 	if err != nil {
 		c.noteErr(err)
@@ -568,6 +638,216 @@ func (c *redisCluster) Spread(ctx context.Context, msg ClusterMessage) error {
 	}
 	c.noteOK()
 	return nil
+}
+
+// spreadTarget writes one directed publish to the channel of the node that holds
+// the client id, according to Redis presence. It reports nil for a client id no
+// node claims: a directed publish is fire-and-forget, and the drop is counted.
+func (c *redisCluster) spreadTarget(ctx context.Context, msg ClusterMessage, payload []byte) error {
+	rdb := c.client()
+	if rdb == nil {
+		return errors.New("gmqx: cluster is not running")
+	}
+	nodeID, err := c.targetNode(ctx, msg.ClientID)
+	if err != nil {
+		c.noteErr(err)
+		return fmt.Errorf("%w: read client presence: %w", ErrClusterUnavailable, err)
+	}
+	if nodeID == "" {
+		c.recordDrop("target_unknown", "no presence record for the client id")
+		return nil
+	}
+	if nodeID == c.nodeID {
+		// The client reconnected to this node after the caller resolved it as
+		// remote. Writing to this node's own channel would only come back as a
+		// loop, and the caller cannot be told to deliver locally any more, so the
+		// event is counted and dropped: at-most-once delivery.
+		c.recordDrop("target_unknown", "client moved to this node during the spread")
+		return nil
+	}
+	if err := rdb.Publish(ctx, c.nodeChannel(nodeID), payload).Err(); err != nil {
+		c.noteErr(err)
+		return fmt.Errorf("%w: publish to node %q: %w", ErrClusterUnavailable, nodeID, err)
+	}
+	c.noteOK()
+	return nil
+}
+
+// targetNode returns the node id the presence record of clientID names, or "" when
+// no record exists (the TTL elapsed, or no node ever claimed the id).
+func (c *redisCluster) targetNode(ctx context.Context, clientID string) (string, error) {
+	rdb := c.client()
+	if rdb == nil {
+		return "", errors.New("gmqx: redis cluster is not running")
+	}
+	if clientID == "" {
+		return "", nil
+	}
+	raw, err := rdb.Get(ctx, c.presenceKey(c.namespace, clientID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	value := raw
+	if i := strings.IndexByte(value, 0); i >= 0 {
+		value = value[:i]
+	}
+	return value, nil
+}
+
+// clientConnected implements clientPresence: it records that this node holds the
+// client id and wakes the housekeeping loop to write the presence record. Nothing
+// here waits for Redis, because the caller is the CONNECT path of the broker.
+func (c *redisCluster) clientConnected(clientID string) {
+	if clientID == "" {
+		return
+	}
+	c.presenceMu.Lock()
+	if c.presence == nil {
+		c.presence = make(map[string]time.Time)
+	}
+	c.presence[clientID] = time.Time{}
+	delete(c.presenceGone, clientID)
+	c.presenceMu.Unlock()
+	c.signalPresence()
+}
+
+// clientDisconnected implements clientPresence: the client id left this node, so
+// its record is deleted — by the compare-and-delete script, because the client may
+// already have reconnected to another node and its record there must survive.
+func (c *redisCluster) clientDisconnected(clientID string) {
+	if clientID == "" {
+		return
+	}
+	c.presenceMu.Lock()
+	delete(c.presence, clientID)
+	if c.presenceGone == nil {
+		c.presenceGone = make(map[string]struct{})
+	}
+	c.presenceGone[clientID] = struct{}{}
+	c.presenceMu.Unlock()
+	c.signalPresence()
+}
+
+// signalPresence wakes the housekeeping loop without blocking the caller.
+func (c *redisCluster) signalPresence() {
+	if !c.isRunning() {
+		return
+	}
+	select {
+	case c.presenceCh <- struct{}{}:
+	default:
+	}
+}
+
+// presenceValue is the value of this node's presence records: the node id, a NUL
+// separator and the process incarnation. The compare-and-delete script matches it
+// byte for byte, which is what confines a disconnect to the record of the
+// connection that ended.
+func (c *redisCluster) presenceValue() []byte {
+	return []byte(c.nodeID + "\x00" + c.incarnation)
+}
+
+// presenceKey is one client id's presence key. The namespace is part of the key
+// (namespaceKey), so two namespaces sharing one Redis never claim each other's
+// client ids.
+func (c *redisCluster) presenceKey(namespace, clientID string) string {
+	return c.prefix() + ":client:" + namespaceKey(namespace, clientID)
+}
+
+// flushPresence writes the records of the client ids this node holds and deletes
+// the records of the ones that left. A record is rewritten when it has not been
+// written for half the PresenceTTL, which keeps a connected client in the view
+// without rewriting every record on every tick.
+//
+// The reconciliation is deliberately not a per-event transaction: a connect or
+// disconnect only marks the id, and the loop applies the marks. A crash between
+// the two costs one TTL of stale presence, and a publish that races a CONNECT by
+// less than one refresh is counted as target_unknown instead of being broadcast.
+func (c *redisCluster) flushPresence() {
+	rdb := c.client()
+	if rdb == nil || !c.isRunning() {
+		return
+	}
+	now := time.Now()
+	ttl := c.presenceTTL()
+	half := ttl / 2
+	c.presenceMu.Lock()
+	var writes, deletes []string
+	for id, at := range c.presence {
+		if at.IsZero() || now.Sub(at) >= half {
+			writes = append(writes, id)
+		}
+	}
+	for id := range c.presenceGone {
+		if _, live := c.presence[id]; !live {
+			deletes = append(deletes, id)
+		}
+	}
+	c.presenceMu.Unlock()
+	if len(writes) == 0 && len(deletes) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, redisIOTimeout)
+	defer cancel()
+	value := c.presenceValue()
+	pipe := rdb.Pipeline()
+	for _, id := range writes {
+		pipe.Set(ctx, c.presenceKey(c.namespace, id), value, ttl)
+	}
+	for _, id := range deletes {
+		pipe.Eval(ctx, redisPresenceReleaseScript, []string{c.presenceKey(c.namespace, id)}, value)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		c.noteErr(err)
+		c.log.Debug("gmqx redis cluster presence refresh failed", "err", err)
+		return
+	}
+	c.noteOK()
+	c.presenceMu.Lock()
+	for _, id := range writes {
+		if at, ok := c.presence[id]; ok && (at.IsZero() || now.Sub(at) >= half) {
+			c.presence[id] = now
+		}
+	}
+	for _, id := range deletes {
+		if _, live := c.presence[id]; !live {
+			delete(c.presenceGone, id)
+		}
+	}
+	c.presenceMu.Unlock()
+}
+
+// clearPresence deletes the records of the client ids this node holds. Stop uses
+// it so peers stop routing directed publishes here at once instead of after
+// PresenceTTL.
+func (c *redisCluster) clearPresence(ctx context.Context) {
+	rdb := c.client()
+	if rdb == nil {
+		return
+	}
+	c.presenceMu.Lock()
+	ids := make([]string, 0, len(c.presence)+len(c.presenceGone))
+	for id := range c.presence {
+		ids = append(ids, id)
+	}
+	for id := range c.presenceGone {
+		ids = append(ids, id)
+	}
+	c.presence = make(map[string]time.Time)
+	c.presenceGone = make(map[string]struct{})
+	c.presenceMu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	value := c.presenceValue()
+	pipe := rdb.Pipeline()
+	for _, id := range ids {
+		pipe.Eval(ctx, redisPresenceReleaseScript, []string{c.presenceKey(c.namespace, id)}, value)
+	}
+	_, _ = pipe.Exec(ctx)
 }
 
 // routingTargets picks the node channels one event is published to.
@@ -912,9 +1192,12 @@ func (c *redisCluster) housekeeping() {
 			return
 		case <-c.refreshCh:
 			c.refreshKeys()
+		case <-c.presenceCh:
+			c.flushPresence()
 		case <-summary.C:
 			c.refreshKeys()
 			c.refreshView()
+			c.flushPresence()
 		case <-heartbeat.C:
 			c.probe()
 		}
@@ -1158,11 +1441,16 @@ func (c *redisCluster) handlePayload(channel, payload string) {
 // pollute the table and evict the identities of real remote events. A redelivered
 // event is dropped by (Origin, Seq) instead of being applied twice. An event is
 // never forwarded.
+//
+// A directed publish (ClusterTarget) reaches a handler that implements
+// targetHandler — the broker does — and is counted as undeliverable otherwise. It
+// is deduplicated exactly like a publish or a kick, so a presence race that sends
+// the same event twice delivers it once.
 func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
 	if c.handler == nil {
 		return
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
 		return
 	}
 	if msg.Namespace != c.namespace {
@@ -1185,6 +1473,13 @@ func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
 		c.handler.OnRemotePublish(msg)
 	case ClusterKick:
 		c.handler.OnRemoteKick(msg)
+	case ClusterTarget:
+		handler, ok := c.handler.(targetHandler)
+		if !ok {
+			c.recordDrop("target_unknown", "handler cannot receive a directed publish")
+			return
+		}
+		handler.OnRemoteTarget(msg)
 	}
 }
 
@@ -1260,6 +1555,9 @@ func (c *redisCluster) validate(nodeID string) error {
 	if c.cfg.HeartbeatInterval < 0 {
 		return fmt.Errorf("gmqx: redis cluster HeartbeatInterval must not be negative, got %v", c.cfg.HeartbeatInterval)
 	}
+	if c.cfg.PresenceTTL < 0 {
+		return fmt.Errorf("gmqx: redis cluster PresenceTTL must not be negative, got %v", c.cfg.PresenceTTL)
+	}
 	if c.cfg.DedupTTL < 0 {
 		return fmt.Errorf("gmqx: redis cluster DedupTTL must not be negative, got %v", c.cfg.DedupTTL)
 	}
@@ -1277,6 +1575,9 @@ func (c *redisCluster) validate(nodeID string) error {
 	}
 	if ttl := c.summaryTTL(); ttl <= c.summaryInterval() {
 		return fmt.Errorf("gmqx: redis cluster SummaryTTL %v must exceed SummaryInterval %v", ttl, c.summaryInterval())
+	}
+	if ttl := c.presenceTTL(); ttl <= c.summaryInterval() {
+		return fmt.Errorf("gmqx: redis cluster PresenceTTL %v must exceed SummaryInterval %v", ttl, c.summaryInterval())
 	}
 	return nil
 }
@@ -1320,6 +1621,13 @@ func (c *redisCluster) summaryTTL() time.Duration {
 func (c *redisCluster) nodeTTL() time.Duration {
 	if c.cfg.NodeTTL > 0 {
 		return c.cfg.NodeTTL
+	}
+	return redisTTLFactor * c.summaryInterval()
+}
+
+func (c *redisCluster) presenceTTL() time.Duration {
+	if c.cfg.PresenceTTL > 0 {
+		return c.cfg.PresenceTTL
 	}
 	return redisTTLFactor * c.summaryInterval()
 }

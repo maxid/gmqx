@@ -11,6 +11,23 @@ type ClusterEventType string
 const (
 	ClusterPublish ClusterEventType = "publish"
 	ClusterKick    ClusterEventType = "kick"
+	// ClusterTarget is a directed publish: deliver one publication to one client
+	// id, on whichever node holds it (see Broker.PublishToClient). It carries
+	// ClientID plus the publication fields of ClusterPublish. A receiving node
+	// applies it only when the client id is a session of its own
+	// ClusterMessage.Namespace; a node that does not hold the id drops it and
+	// counts it (Metrics.RecordDroppedMessage("target_unknown")).
+	//
+	// Routing a target event is the backend's choice: a backend with a client-id
+	// presence view (the Redis backend) sends it to the one node that holds the
+	// client, and the built-in TCP mesh, which has no presence, broadcasts it to
+	// every peer and lets each node apply it only if it holds that client id (see
+	// the TCP backend's Spread doc comment). Namespace scoping and (Origin, Seq)
+	// deduplication are the ones every cluster event uses. A peer running an older
+	// build that does not know the type drops the frame in its receive path instead
+	// of misapplying it, so a rolling upgrade degrades a directed publish to a lost
+	// one — which is the transport's at-most-once behaviour anyway.
+	ClusterTarget ClusterEventType = "target"
 )
 
 // ClusterMessage is a cross-node cluster event.
@@ -47,10 +64,32 @@ type ClusterMessage struct {
 	Seq uint64
 }
 
-// ClusterHandler receives remote events on a broker.
+// ClusterHandler receives the remote events every backend delivers: a publish and
+// a client-id kick. A directed publish arrives through the optional targetHandler
+// (Broker implements it); a backend that receives a ClusterTarget hands it to that
+// interface when the handler provides it.
 type ClusterHandler interface {
 	OnRemotePublish(msg ClusterMessage)
 	OnRemoteKick(msg ClusterMessage)
+}
+
+// targetHandler is implemented by a ClusterHandler that can receive a directed
+// publish (ClusterTarget). It is an optional interface so the handler contract
+// stays additive: a backend delivers a target event to a handler that implements
+// it, and counts the event as undeliverable otherwise. Broker implements it.
+type targetHandler interface {
+	OnRemoteTarget(msg ClusterMessage)
+}
+
+// clientPresence is implemented by a cluster backend that tracks which node holds
+// a client id, so a directed publish can be sent to that node instead of to every
+// node. The broker tells the backend about every admitted CONNECT and every
+// connection that leaves without a replacement, outside the broker's lock: an
+// implementation must not block, and must tolerate a lost or late notification
+// (presence is a TTL'd hint, refreshed by the backend, not a source of truth).
+type clientPresence interface {
+	clientConnected(clientID string)
+	clientDisconnected(clientID string)
 }
 
 // Cluster is a pluggable cluster backend (e.g. Redis pub/sub, gossip).

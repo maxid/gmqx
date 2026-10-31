@@ -23,7 +23,9 @@
 - [x] Built-in TCP cluster backend (static seeds, cross-node publish/kick, reconnect)
 - [x] Cluster membership (handshake, heartbeats, eviction, duplicate collapse), event dedup, subscription-aware directed routing
 - [x] Redis cluster backend (per-node channels, TTL membership in Redis, directed routing)
-- [ ] Client-id presence routing and a gossip cluster backend
+- [x] Subscription index for local routing (literal filters in a map, wildcard filters per distinct filter; the publish path never calls `SessionStore`)
+- [x] Directed publish to a client id (`PublishToClient`) with Redis client-id presence and the TCP broadcast fallback
+- [ ] A gossip cluster backend
 - [ ] Client library
 - [ ] Core conformance tests (mosquitto/paho clients)
 - [ ] Benchmarks and soak tests

@@ -5,6 +5,64 @@
 
 ## [Unreleased]
 
+- **A subscription index replaces the per-publish scan, and a publication can be
+  directed at one client id (locally or across the cluster).**
+
+  *Routing index.* `LocalTargets` no longer walks every live connection and every
+  stored session per publication. The broker keeps a routing table
+  (`routing_index.go`): literal filters in a map keyed by the filter (one lookup per
+  publication), wildcard filters in a map keyed by the filter (one `matchTopic` per
+  distinct wildcard filter, not per subscription), and one entry per (filter,
+  session) so overlapping filters of a session merge into a single target with the
+  highest matching QoS and the OR of retain-as-published. The broker's global lock is
+  not taken at all on this path, and `SessionStore` is not called: a session is
+  indexed when it is saved and removed when it is taken over, discarded by a clean
+  CONNECT or expired. `New` indexes the sessions a store already held, so a
+  deployment that restores session state before the broker starts keeps routing to
+  them. `matchTopic` no longer splits the filter and the topic into slices, which
+  removes the last per-wildcard allocation from the path. Semantics are unchanged:
+  the `min(publication, subscription)` QoS cap, no-local, retain-as-published, the
+  `$`-topic exclusion of wildcard filters, duplicate-client-id takeover and the
+  presence of offline targets (`LocalTarget.Offline()`). Guarantee: a subscription
+  is routable before its SUBACK is written, an unsubscribe is unroutable before its
+  UNSUBACK, a resumed session's filters are routable before its CONNACK, and a
+  session is never both a live and a stored target, so a publication reaches one
+  session once. `BenchmarkLocalTargets` shows a flat cost from 10 to 10 000
+  subscriptions.
+
+  Behavior note for existing deployments: `SessionStore.Keys` is no longer called by
+  routing (it remains the startup index source and the sweeper's enumeration), and a
+  store that an external process writes while the broker runs is not re-read — such a
+  writer has to preload the store before `New`, as before.
+
+  *Directed publish.* The new `Broker.PublishToClient(ctx, clientID, Publication)`
+  delivers one publication to one client id: a live local connection (through
+  `SendLocal`, at the publication's QoS and with the connection's inflight window
+  respected), a local persistent session with no connection (queued, drained after
+  its next CONNACK, under the existing offline-queue bounds), or the cluster. The new
+  `ClusterTarget` event carries the client id and the publication, is namespace
+  scoped and deduplicated by `(Origin, Seq)` like every other event, and is applied
+  by a `ClusterHandler` that implements the optional `targetHandler` interface — the
+  broker does. The Redis backend keeps a `clientId -> node` presence record under
+  `<prefix>:client:<key>` with the new `RedisClusterConfig.PresenceTTL` (default
+  3×`SummaryInterval`), written when the broker reports a CONNECT, kept while a
+  persistent session stays stored on the node, and deleted with a compare-and-delete
+  when the session really ends or moves to another node (a peer's connect-time kick
+  releases the claim even when the persistent session stays stored, because the queue
+  is node-local), so a disconnect of an old connection cannot erase the record of a
+  client that already moved. A target event is written to that node's
+  channel only; a missing record means no node claims the client id and the event is
+  counted (`RecordDroppedMessage("target_unknown")`) and dropped, never broadcast —
+  the directed publish is at-most-once, and a publish that races a CONNECT by less
+  than one presence refresh is lost. The TCP mesh has no presence: it broadcasts a
+  target event to every peer exactly like a kick, each peer applies it only if it
+  holds that client id (or queues it for its offline persistent session) and counts
+  it otherwise. Kicks keep their broadcast on purpose: a stale presence record must
+  not leave a zombie connection alive. `PublishToClient` returns an error only for a
+  caller mistake (`ErrClientIDRequired`, `ErrNamespaceMismatch`, an invalid topic or
+  QoS) or when the cluster backend refused the event; a directed publish does not run
+  through the ACL, interceptors, `EventSink` or the retained store.
+
 - **CONNECT-phase and authorization deadlines, capability refusals, delayed wills,
   retained expiry and cross-node takeover.** A batch of parity and security fixes.
 

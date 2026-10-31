@@ -50,6 +50,15 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   delivery plus cluster spread (`DefaultDispatcher`), and the broker exposes a
   read-only seam (`LocalTargets`, `SendLocal`, `SpreadPublication`) so a
   dispatcher never re-implements topic matching
+- Subscription index for routing: local matching is one map lookup for a literal
+  filter plus one match per distinct wildcard filter, so a publish no longer
+  enumerates the connections or the stored sessions and never calls
+  `SessionStore` on the publish path
+- Directed publish: `Broker.PublishToClient(ctx, clientID, Publication)` delivers
+  to one client id — the live local connection, the local persistent session
+  (queued, drained on its next CONNECT) or the cluster node that holds it; the
+  Redis backend routes it through a TTL'd client-id presence view, the TCP mesh
+  broadcasts it and each peer applies it only if it holds the id
 - Connection-scoped context for every hook: `ConnInfo` (client id, connection
   id, namespace, remote address, protocol level) through
   `ContextWithConn`/`ConnFromContext`, enriched once at CONNECT by
@@ -205,6 +214,42 @@ is dropped by both built-in backends. The empty string is the default namespace
 (the zero value), so a deployment that does not set it behaves exactly as before,
 including the documented Redis key layout.
 
+## Directed publish
+
+`PublishToClient` delivers one publication to one client id, wherever it lives:
+
+```go
+err := broker.PublishToClient(ctx, "device-42", gmqx.Publication{
+    Topic:   "cmd/reboot",
+    Payload: []byte("now"),
+    QoS:     1,
+})
+```
+
+- A live local connection receives it through the same `SendLocal` path as the
+  local fan-out, at the publication's QoS (there is no subscription to cap it) and
+  with the connection's QoS 1/2 inflight window respected.
+- A local persistent session with no connection is queued for, exactly like a
+  matching publication: it drains after the next CONNACK and obeys
+  `MaxOfflineQueueSize` and `MaxTotalOfflineMessages`.
+- Otherwise the publication becomes a `ClusterTarget` event and the call returns
+  nil once the backend accepted it. The Redis backend routes it to the node that
+  holds the client id; the TCP mesh broadcasts it and each peer applies it only if
+  it holds that client id.
+
+If nobody holds the client id the call still succeeds: delivery is
+fire-and-forget (at-most-once, like the cluster transport) and the miss is counted
+with `RecordDroppedMessage("target_unknown")`. The call returns an error only for a
+caller mistake — an empty client id (`ErrClientIDRequired`), an invalid topic or
+QoS, a publication stamped with another namespace (`ErrNamespaceMismatch`) — or
+when the cluster backend refused the event (for example Redis is unreachable), in
+which case the caller may retry.
+
+A directed publish is a server-side delivery, not a client PUBLISH: it does not run
+through the ACL, the interceptors or the `EventSink` (the caller owns the
+authorization of the call), it does not touch the retained store, and a target
+event a peer receives is not re-dispatched through its `Dispatcher`.
+
 ## Persistent sessions, the offline queue and QoS 1/2 retransmission
 
 A persistent session (Clean Session cleared; on MQTT 5, Clean Start cleared and a
@@ -219,8 +264,12 @@ session state out of process. `New` installs `MemorySessionStore` when
 `Config.SessionStore` is nil, which is exactly the in-memory behavior of earlier
 versions; this package ships no network or disk backend. The broker calls the
 store with its own session lock held, so an implementation must not call back
-into the broker, and `Keys` is required because routing to offline sessions and
-expiring them both need to enumerate the stored keys.
+into the broker. Routing does not read the store at all: the broker indexes a
+session's subscriptions when it saves it and removes them when it takes it over or
+expires it. `Keys` is still required — `New` uses it once to index sessions a
+deployment restored before the broker was created, and the expiry sweeper uses it
+to find the deadlines to enforce. A store written behind a running broker's back
+is not re-read.
 
 **Expiry.** MQTT 5's Session Expiry Interval is a deadline:
 `ConnectInfo.SessionExpiry` is stamped on disconnect as `now + interval`, and a
@@ -462,6 +511,15 @@ everyone. Retained publishes and kicks still go to every peer: retained state mu
 exist on every node for future subscribers, and a kick names a client id rather
 than a topic, so only the node holding that session can act on it.
 
+A directed publish (`Broker.PublishToClient` for a client id this node does not
+hold) takes the kick path instead: it names a client id rather than a topic, and
+this backend keeps no presence, so it is broadcast to every peer. Each peer
+applies it only if it holds that client id in its own namespace, queues it when
+that session is offline and persistent, and counts it with
+`RecordDroppedMessage("target_unknown")` otherwise. That costs one frame per peer
+for a message at most one node can use, and the backend counts the extra frame
+writes internally so the trade-off is measurable.
+
 A node advertises at most `MaxSummaryFilters` filters; when it has more, the
 filters present longest are left out (newer subscriptions keep routing), at the
 cost of not routing publishes that only match an evicted filter.
@@ -524,6 +582,7 @@ Every key and channel sits under one prefix (`ChannelPrefix`, default
 | `<prefix>:owner:<nodeID>` | JSON `{node, inc, since}`: node id ownership lease | `NodeTTL` |
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`: liveness and identity | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`: subscription summary | `SummaryTTL` |
+| `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`: which node holds the client id | `PresenceTTL` |
 
 A node subscribes to its own channel and to nothing else. A publish is one
 `PUBLISH` per interested node, so N nodes cost O(N) Redis operations rather than
@@ -578,6 +637,21 @@ Redis is unreachable). The rules are the TCP backend's rules:
 - a node advertises at most `MaxSummaryFilters` filters, and the filters present
   longest are the ones left out.
 
+A directed publish (`Broker.PublishToClient`) is routed by presence instead: the
+broker reports every CONNECT and every session that really ends, the backend
+writes a `client:<id>` record naming this node, refreshes it while the client
+stays (and while a persistent session stays stored here), and deletes it with a
+compare-and-delete that cannot erase a record another node wrote for the same
+client id — and a connect-time kick from a peer releases this node's claim even
+when a persistent session stays stored here, because the queue is node-local while
+the client itself is connected to the peer. `Spread` then reads that one record and
+writes the event to that node's channel only. A missing record means nobody claims the client id — the event is
+not broadcast, it is counted with `RecordDroppedMessage("target_unknown")` and
+dropped; a directed publish that races a CONNECT by less than one refresh is lost
+the same way, which is the at-most-once trade-off of the whole cluster transport.
+Kicks deliberately keep their broadcast: a stale presence record must not leave a
+zombie connection alive on the node a client actually moved to.
+
 ### Deduplication and loops
 
 Identical to the TCP backend and implemented by the same code: every locally
@@ -609,6 +683,7 @@ reasons.
 | `SummaryInterval` | 1s | key refresh and routing-view refresh period |
 | `SummaryTTL` | 3×`SummaryInterval` | summary key lifetime; expiry means "unknown summary" |
 | `NodeTTL` | 3×`SummaryInterval` | member key lifetime; expiry evicts the node |
+| `PresenceTTL` | 3×`SummaryInterval` | client-id presence record lifetime; expiry means "no node claims this id" |
 | `HeartbeatInterval` | 1s | Redis `PING` period for outage detection and logging |
 | `DedupSize` / `DedupTTL` | 4096 / 30s | duplicate-suppression table bounds |
 | `MaxSummaryFilters` | 256 | advertised and accepted filters per node |

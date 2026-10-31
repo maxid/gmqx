@@ -191,8 +191,11 @@ type EventSink interface {
 // QoS 1/2 PUBLISH, an acknowledgement — hit a full writer queue, so the
 // connection is disconnected), "offline_queue_full" (the per-session cap dropped
 // the oldest message), "offline_queue_total" (the global cap rejected the newest
-// one), "offline_queue_corrupt", "offline_session_missing" and
-// "session_expired".
+// one), "offline_queue_corrupt", "offline_session_missing", "session_expired"
+// and "target_unknown" (a directed publish for a client id nobody holds: no
+// cluster backend is configured, the Redis presence view has no record for it, or
+// a TCP peer received the broadcast without holding the id — a directed publish is
+// fire-and-forget, so this is counted instead of returned as an error).
 // RecordQueueDepth("offline", n) reports the messages currently queued for
 // offline sessions across the broker; RecordOverflow reports a limit that was hit
 // without losing a message ("connections", "inflight" — a delivery was dropped

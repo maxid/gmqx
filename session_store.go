@@ -28,10 +28,14 @@ type SessionStore interface {
 	Save(key string, state SessionState)
 	// Delete removes key. Deleting a missing key is a no-op.
 	Delete(key string)
-	// Keys returns the keys that currently hold a session, in any order. The
-	// broker uses it to route a publication to the persistent sessions that are
-	// offline and to find the ones whose expiry elapsed; a store that could not
-	// enumerate its sessions would make both impossible.
+	// Keys returns the keys that currently hold a session, in any order. Routing
+	// does not use it: the broker indexes the subscriptions of a session when it
+	// saves it, so a publish never calls the store. Keys is used once by New, to
+	// index the sessions a deployment restored into the store before the broker
+	// existed, and by the expiry sweeper, which has to enumerate the deadlines to
+	// enforce; a store that could not enumerate its sessions would make those two
+	// impossible. A store that another process keeps writing while this broker runs
+	// is not re-read.
 	Keys() []string
 }
 

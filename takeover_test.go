@@ -122,6 +122,11 @@ func TestClusterTakeoverClosesZombieInUniqueMode(t *testing.T) {
 	a, b := newClusterBrokerPair(t, Config{})
 
 	zombie, _ := mustConnect(t, a.Addr(), confConnect{version: mqtt.Version5, clientID: "roam", clean: true})
+	// This CONNECT spread a kick for "roam" too. Let the peer apply it before the
+	// second connection exists: a kick carries no epoch, so one that is still in
+	// flight when the new connection is accepted would displace it (the documented
+	// gap of a cross-node kick, which has no presence to compare ages against).
+	time.Sleep(200 * time.Millisecond)
 	// The same client id on another node: node b has no local record for it, so
 	// UNIQUE does not apply and b accepts it. Its CONNECT is spread, and a's
 	// zombie is displaced.

@@ -108,7 +108,9 @@ type TCPClusterConfig struct {
 
 	// Metrics, when set, receives RecordDroppedMessage for events the cluster
 	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward",
-	// "cluster_namespace"). Without it the drops are only counted internally.
+	// "cluster_namespace", and "target_unknown" for a directed publish this node
+	// received but does not hold the client id for). Without it the drops are only
+	// counted internally.
 	Metrics MetricsManager
 	// Logger receives membership decisions such as link rejection and eviction
 	// (default slog.Default()).
@@ -220,6 +222,11 @@ type tcpCluster struct {
 	seq   atomic.Uint64
 	dedup *dedupTable
 	drops atomic.Uint64
+	// targetFanouts counts the peer writes the backend performed for directed
+	// publishes (ClusterTarget). The TCP mesh has no client-id presence, so one
+	// targeted publish costs as many frame writes as there are peers, to nodes that
+	// mostly do not hold the client; the counter makes that trade-off observable.
+	targetFanouts atomic.Uint64
 
 	wg sync.WaitGroup
 }
@@ -347,13 +354,21 @@ func (c *tcpCluster) Members() []Member {
 // exist on every node for future subscribers, and a kick names a client id, not
 // a topic, so only the node holding that session can act on it.
 //
+// A directed publish (ClusterTarget) takes the same path as a kick, for the same
+// reason: it names a client id, not a topic. This backend keeps no client-id
+// presence, so it broadcasts the event to every peer and each peer applies it only
+// if it holds that client id (and drops and counts it otherwise). That costs one
+// frame per peer for a message a single node can use; a presence-routed backend
+// (Redis) sends it to the one node that holds the client instead. The cost is
+// counted: targetFanouts increments by the number of peer writes.
+//
 // Delivery stays best-effort: a failed peer is dropped and its dial loop
 // reconnects.
 func (c *tcpCluster) Spread(_ context.Context, msg ClusterMessage) error {
 	if !c.isRunning() {
 		return errors.New("gmqx: cluster is not running")
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
 		return fmt.Errorf("gmqx: unknown cluster event type %q", msg.Type)
 	}
 	if msg.Origin != "" && msg.Origin != c.nodeID {
@@ -381,6 +396,9 @@ func (c *tcpCluster) Spread(_ context.Context, msg ClusterMessage) error {
 		return err
 	}
 	for _, l := range c.routingTargets(msg) {
+		if msg.Type == ClusterTarget {
+			c.targetFanouts.Add(1)
+		}
 		if err := l.sendFn(data); err != nil {
 			if errors.Is(err, gnety.ErrWriteBusy) {
 				// The peer is saturated: skip this event instead of tearing the
@@ -406,7 +424,10 @@ func (c *tcpCluster) routingTargets(msg ClusterMessage) []*clusterLink {
 			continue
 		}
 		switch {
-		case msg.Type == ClusterKick || msg.Retain:
+		case msg.Type == ClusterKick || msg.Type == ClusterTarget || msg.Retain:
+			// A kick names a client id and a directed publish names one too; this
+			// backend has no presence, so both go to every peer, and each peer
+			// applies the event only if it holds that client id.
 			out = append(out, m.link)
 		case !m.filtersKnown || now.Sub(m.filtersAt) > staleAfter:
 			// Unknown or stale summary: send to this peer only. Falling back to
@@ -677,7 +698,7 @@ func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 	if c.handler == nil {
 		return
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
 		return
 	}
 	if msg.Namespace != c.namespace {
@@ -700,6 +721,13 @@ func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 		c.handler.OnRemotePublish(msg)
 	case ClusterKick:
 		c.handler.OnRemoteKick(msg)
+	case ClusterTarget:
+		handler, ok := c.handler.(targetHandler)
+		if !ok {
+			c.recordDrop("target_unknown", "handler cannot receive a directed publish")
+			return
+		}
+		handler.OnRemoteTarget(msg)
 	}
 }
 
@@ -946,6 +974,10 @@ func (c *tcpCluster) memberSummary(nodeID string) ([]string, bool) {
 
 // dropCount reports dropped events (used by tests).
 func (c *tcpCluster) dropCount() uint64 { return c.drops.Load() }
+
+// targetFanoutCount reports how many peer writes directed publishes caused (used
+// by tests).
+func (c *tcpCluster) targetFanoutCount() uint64 { return c.targetFanouts.Load() }
 
 func (c *tcpCluster) reconnectInterval() time.Duration {
 	if c.cfg.ReconnectInterval > 0 {

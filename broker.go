@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"sort"
 	"sync"
 	"time"
 
@@ -30,6 +29,14 @@ type Broker struct {
 	namespace  string
 	dispatcher Dispatcher
 	store      SessionStore
+	// index is the routing table: which local session (live or stored) is
+	// subscribed to which filter. It is the only structure a publication is
+	// matched against; see routing_index.go for its shape and invariants.
+	index *subscriptionIndex
+	// presence is the optional cluster view of which node holds a client id. The
+	// backend that implements it is told about every connect and disconnect, so a
+	// directed publish can be routed instead of broadcast.
+	presence clientPresence
 
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
@@ -189,13 +196,20 @@ func New(cfg Config) (*Broker, error) {
 		namespace: cfg.Namespace,
 		clients:   make(map[string]*client),
 		store:     cfg.SessionStore,
+		index:     newSubscriptionIndex(),
 		retained:  make(map[string]retainedMessage),
 		wills:     make(map[string]*pendingWill),
 		addrs:     make(map[string]string),
 		done:      make(chan struct{}),
 		nodeID:    cfg.NodeID,
 	}
+	b.presence, _ = cfg.ClusterBackend.(clientPresence)
 	b.dispatcher = newDispatcher(cfg.Dispatcher, b)
+	// A store may have been restored or preloaded before the broker was created;
+	// those sessions are local targets from the first publication on, exactly as
+	// they were when routing scanned the store on every publish. Sessions the
+	// broker saves later are indexed when they are saved.
+	b.loadStoredSessions()
 	if cfg.ConnectionRateLimit > 0 {
 		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
 	}
@@ -590,6 +604,11 @@ func (b *Broker) register(c *client) error {
 	b.clients[key] = c
 	c.registered = true
 	c.connectedAt = time.Now()
+	// The routing table follows the session into the connection: the filters it
+	// restored (or the empty set of a clean session) are routable before the
+	// CONNACK goes out, and the stored entries of a session that was taken over
+	// stop being targets here, under the same lock that moves the session.
+	b.index.setLive(key, c, c.subs)
 	n := len(b.clients)
 	b.mu.Unlock()
 	if len(c.subs) > 0 {
@@ -614,6 +633,13 @@ func (b *Broker) register(c *client) error {
 	// with this node's identity, namespace and sequence number, so their
 	// deduplication and namespace rules apply unchanged (see spreadKick).
 	b.spreadKick(c.context(), c.id)
+	// A backend that tracks client-id presence is told about the connection, so a
+	// directed publish for this id can address this node instead of every node.
+	// The call only enqueues the presence write: no store or network call runs on
+	// the CONNECT path under the broker lock (see clientPresence).
+	if b.presence != nil {
+		b.presence.clientConnected(c.id)
+	}
 
 	b.metrics.IncrementConnections()
 	b.metrics.RecordConnections(n)
@@ -655,15 +681,52 @@ func (b *Broker) unregister(c *client) {
 	n := len(b.clients)
 	c.mu.Lock()
 	hadSubscriptions := len(c.subs) > 0
-	if !c.superseded {
-		if c.persistentSession() {
+	superseded := c.superseded
+	kicked := c.kicked
+	persistent := c.persistentSession()
+	if !superseded {
+		if persistent {
 			b.saveStoredSession(key, c)
 		} else {
 			b.deleteStoredSession(key)
 		}
 	}
 	c.mu.Unlock()
+	if superseded {
+		// A displaced connection whose replacement is not on this node (a peer's
+		// connect-time kick moved the session away) must not leave a live routing
+		// entry behind: nothing here can deliver to it any more. A local take-over
+		// already installed the replacement's entries under this lock, so the entry
+		// is kept in that case.
+		if _, connected := b.clients[key]; !connected {
+			b.index.remove(key)
+		}
+	}
 	b.mu.Unlock()
+
+	// A backend that tracks client-id presence is told that this node no longer
+	// holds the id — but only when it really does not:
+	//
+	//   - a connection that another one displaced on this node (a local take-over)
+	//     leaves the id here, and the replacement already refreshed the record, so
+	//     nothing is reported;
+	//   - a persistent session that merely went offline stays here (its filters and
+	//     its queue do), and keeps its presence so a directed publish is still
+	//     routed to this node and queued;
+	//   - a session that ended (a clean connection) or moved to another node (the
+	//     kick that displaced it) is forgotten, so this node stops refreshing a
+	//     record that would otherwise fight the new owner's. The stored state of a
+	//     kicked persistent session stays behind — a queue is node-local, exactly
+	//     as it is for a normal publish — but the client id itself belongs to the
+	//     node the client is connected to now.
+	if !persistent || superseded || kicked {
+		b.mu.RLock()
+		_, connected := b.clients[key]
+		b.mu.RUnlock()
+		if !connected {
+			b.forgetClientPresence(c.id)
+		}
+	}
 
 	b.metrics.DecrementConnections()
 	b.metrics.IncrementDisconnectEvents()
@@ -698,6 +761,9 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 	}
 	c.subs[filter] = sub
 	c.mu.Unlock()
+	// The subscription is routable before the SUBACK is written: the connection
+	// goroutine updates the index here, and the SUBACK follows in handleSubscribe.
+	b.index.add(namespaceKey(b.namespace, c.id), c, filter, sub)
 	b.metrics.IncrementSubscribeEvents()
 	if !exists {
 		b.subscriptionsChanged()
@@ -722,40 +788,23 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 	delete(c.subs, filter)
 	c.mu.Unlock()
 	if existed {
+		// The filter stops routing before the UNSUBACK is written.
+		b.index.removeFilter(namespaceKey(b.namespace, c.id), c, filter)
 		b.metrics.DecrementSubscribeEvents()
 		b.subscriptionsChanged()
 	}
 }
 
 // subscriptionFilters implements subscriptionProvider: every topic filter a
-// local session of this broker's namespace is subscribed to, sorted and
-// de-duplicated. The built-in TCP cluster advertises it so peers can route a
-// publish only to the nodes that have a matching subscriber; the advertised
-// summary carries the namespace, so peers of another namespace ignore it.
+// live local session of this broker is subscribed to, sorted and de-duplicated.
+// It is read from the routing index, so it costs one pass over the distinct
+// filters and touches no connection; stored sessions are not advertised, because
+// a publication they match is queued by the node that holds them. The built-in
+// TCP cluster advertises the summary so peers can route a publish only to the
+// nodes that have a matching subscriber; the advertised summary carries the
+// namespace, so peers of another namespace ignore it.
 func (b *Broker) subscriptionFilters() []string {
-	b.mu.RLock()
-	clients := make([]*client, 0, len(b.clients))
-	for _, c := range b.clients {
-		if c.namespace == b.namespace {
-			clients = append(clients, c)
-		}
-	}
-	b.mu.RUnlock()
-
-	seen := make(map[string]struct{}, len(clients))
-	for _, c := range clients {
-		c.mu.Lock()
-		for filter := range c.subs {
-			seen[filter] = struct{}{}
-		}
-		c.mu.Unlock()
-	}
-	out := make([]string, 0, len(seen))
-	for filter := range seen {
-		out = append(out, filter)
-	}
-	sort.Strings(out)
-	return out
+	return b.index.liveFilters()
 }
 
 // subscriptionsChanged tells a cluster backend that can push subscription
@@ -1053,106 +1102,25 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, pub Publication) error
 // LocalTargets is the read-only half of the routing seam a Dispatcher uses: the
 // sessions whose subscriptions match pub, with the per-session QoS cap and retain
 // flag already applied, and no-local subscriptions of the publishing connection
-// excluded. It re-reads live subscriptions on every call; it does not cache a
-// routing table. A publication of another namespace has no local target here.
+// excluded. A publication of another namespace has no local target here.
+//
+// It answers from the routing index (see routing_index.go), not by scanning the
+// client table and the store: a literal topic is one map lookup plus one lookup
+// per distinct wildcard filter, and the SessionStore is not consulted at all. The
+// broker's own lock is not taken, so a publish never waits for a connection that
+// is registering or leaving.
 //
 // A persistent session with no live connection is a local target too: its stored
 // subscriptions are matched and SendLocal queues the publication for it (see
-// LocalTarget.Offline). The two halves are disjoint — a session is either in the
-// client table or in the store — so a publication reaches one session once.
+// LocalTarget.Offline). The two halves are disjoint — a session is either live in
+// the index or stored in it — because the index entry of a session is replaced,
+// not duplicated, when the session changes hands. A publication therefore reaches
+// one session once.
 func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
 	if pub.Namespace != b.namespace {
 		return nil
 	}
-	from := ConnectionID(pub.FromConnectionID)
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	targets := make([]LocalTarget, 0)
-	live := make(map[string]struct{}, len(b.clients))
-	for key, c := range b.clients {
-		if c.namespace != pub.Namespace {
-			continue
-		}
-		live[key] = struct{}{}
-		c.mu.Lock()
-		found := false
-		rap := false
-		var maxQoS byte
-		for filter, sub := range c.subs {
-			if !matchTopic(filter, pub.Topic) {
-				continue
-			}
-			if sub.noLocal && c.connID == from {
-				continue
-			}
-			found = true
-			if sub.qos > maxQoS {
-				maxQoS = sub.qos
-			}
-			if sub.retainAsPublished {
-				rap = true
-			}
-		}
-		target := LocalTarget{
-			ClientID:     c.id,
-			ConnectionID: c.connID,
-			QoS:          minQoS(pub.QoS, maxQoS),
-			Retain:       rap && pub.Retain,
-			client:       c,
-		}
-		c.mu.Unlock()
-		if found {
-			// The subscription's QoS is a maximum: a QoS 1 publication on a QoS 0
-			// subscription must go out as QoS 0.
-			targets = append(targets, target)
-		}
-	}
-	for _, key := range b.store.Keys() {
-		if !keyInNamespace(b.namespace, key) {
-			// A store may be shared with a broker of another namespace.
-			continue
-		}
-		if _, connected := live[key]; connected {
-			// A live session was already matched above; a stored copy of it would
-			// be stale.
-			continue
-		}
-		state, ok := b.store.Load(key)
-		if !ok {
-			continue
-		}
-		if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
-			// Expired but not swept yet: nothing is queued for it.
-			continue
-		}
-		found := false
-		rap := false
-		var maxQoS byte
-		for filter, sub := range state.Subscriptions {
-			if !matchTopic(filter, pub.Topic) {
-				continue
-			}
-			// No Local names a connection and an offline session has none, so the
-			// option cannot exclude anything here.
-			found = true
-			if sub.QoS > maxQoS {
-				maxQoS = sub.QoS
-			}
-			if sub.RetainAsPublished {
-				rap = true
-			}
-		}
-		if !found {
-			continue
-		}
-		targets = append(targets, LocalTarget{
-			ClientID:   state.ClientID,
-			QoS:        minQoS(pub.QoS, maxQoS),
-			Retain:     rap && pub.Retain,
-			sessionKey: key,
-		})
-	}
-	return targets
+	return b.index.targets(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain)
 }
 
 // SendLocal is the write half of the routing seam: it writes pub to one target
@@ -1202,6 +1170,136 @@ func (b *Broker) SpreadPublication(ctx context.Context, pub Publication) error {
 	}
 	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
 		return fmt.Errorf("gmqx: cluster spread: %w", err)
+	}
+	return nil
+}
+
+// forgetClientPresence tells a presence-tracking cluster backend that this node no
+// longer holds the client id: the session ended with its connection (a clean
+// session), expired, or moved to another node (the connect-time kick of a peer).
+// Nothing here can deliver a directed publish to the client any more. A persistent
+// session that merely went offline keeps its presence record, because the node
+// still holds its subscriptions and its queue.
+func (b *Broker) forgetClientPresence(clientID string) {
+	if b.presence != nil {
+		b.presence.clientDisconnected(clientID)
+	}
+}
+
+// PublishToClient delivers one publication to a single client id, wherever it
+// lives: on this node (live, or a persistent session with no connection), or on
+// another node of the cluster. It is the directed counterpart of a PUBLISH: it
+// does not go through the ACL, the interceptors or the EventSink, because it is a
+// server-side call rather than a client publication, and it does not touch the
+// retained store — it is a delivery to one session, not a broadcast that a future
+// subscriber should see. The caller owns the authorization of the call.
+//
+// Resolution order:
+//
+//  1. A live local connection receives the publication through the same
+//     SendLocal path the local fan-out uses, at pub.QoS (there is no subscription
+//     to cap it) and with the QoS 1/2 inflight window of the connection respected.
+//  2. A local persistent session with no connection is queued for, exactly like a
+//     matching publication would be: it drains right after the session's next
+//     CONNACK, under the same queue bounds and counters. A queue is node-local, so
+//     a node that kept the stored session of a client which reconnected elsewhere
+//     queues the publication there — the same thing a normal publish does on that
+//     node.
+//  3. Otherwise the event goes to the cluster backend as a ClusterTarget event
+//     and the call returns nil once the backend accepted it. A backend with a
+//     presence view (Redis) addresses the node that holds the client id; the TCP
+//     mesh broadcasts it and every peer applies it only if it holds the id.
+//
+// If nobody holds the client id the call is a successful no-op: delivery is
+// fire-and-forget, at-most-once (the cluster transport is), and the fact that the
+// client id was not found is counted with
+// Metrics.RecordDroppedMessage("target_unknown") — by this broker when it has no
+// cluster backend, by the Redis backend when its presence view has no record, and
+// by each TCP peer that does not hold the id. An error is returned only for a
+// caller mistake (an empty client id, an invalid topic or QoS, a publication of
+// another namespace) or when the cluster backend refused the event (for example
+// Redis is unreachable), in which case the caller may retry.
+//
+// pub.Namespace may be empty (this broker's namespace); a publication explicitly
+// stamped with another namespace is refused, because a client id is only unique
+// inside its namespace and delivering it here would cross the isolation boundary.
+func (b *Broker) PublishToClient(ctx context.Context, clientID string, pub Publication) error {
+	if clientID == "" {
+		return ErrClientIDRequired
+	}
+	if pub.Namespace == "" {
+		pub.Namespace = b.namespace
+	}
+	if pub.Namespace != b.namespace {
+		return fmt.Errorf("%w: publication namespace %q, broker namespace %q",
+			ErrNamespaceMismatch, pub.Namespace, b.namespace)
+	}
+	if !validTopic(pub.Topic) {
+		// A directed publish is a PUBLISH the broker produces itself, so it has to
+		// carry a topic name a subscriber could have subscribed to.
+		return fmt.Errorf("%w: directed publish topic %q", ErrMalformedPacket, pub.Topic)
+	}
+	if pub.QoS > 2 {
+		return fmt.Errorf("%w: directed publish QoS %d", ErrMalformedPacket, pub.QoS)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	delivered, err := b.deliverLocal(ctx, clientID, pub)
+	if delivered {
+		return err
+	}
+	if b.cfg.ClusterBackend == nil {
+		b.metrics.RecordDroppedMessage("target_unknown")
+		return nil
+	}
+	return b.spreadTarget(ctx, clientID, pub)
+}
+
+// deliverLocal is the local half of PublishToClient: it delivers to the live
+// connection of clientID or queues for its stored session, and reports whether
+// the client id is a local session at all. A client id that is not in the routing
+// index is not local, which is what makes the caller hand the publication to the
+// cluster.
+func (b *Broker) deliverLocal(ctx context.Context, clientID string, pub Publication) (bool, error) {
+	s, ok := b.index.session(namespaceKey(b.namespace, clientID))
+	if !ok {
+		return false, nil
+	}
+	target := LocalTarget{
+		ClientID:     s.clientID,
+		ConnectionID: s.connID,
+		QoS:          pub.QoS,
+		Retain:       pub.Retain,
+		client:       s.client,
+	}
+	if s.client == nil {
+		// An offline session has no connection to name: SendLocal queues through
+		// the session key, and its re-check makes a session that reconnected in
+		// the meantime receive the publication live.
+		target.ConnectionID = ""
+		target.sessionKey = s.key
+	}
+	return true, b.SendLocal(ctx, target, pub)
+}
+
+// spreadTarget hands a directed publication to the cluster backend. The event
+// carries the client id and the publication; namespace scoping, the origin/seq
+// stamp and duplicate suppression are the ones every cluster event uses.
+func (b *Broker) spreadTarget(ctx context.Context, clientID string, pub Publication) error {
+	msg := ClusterMessage{
+		Type:      ClusterTarget,
+		NodeID:    b.nodeID,
+		Namespace: pub.Namespace,
+		ClientID:  clientID,
+		Topic:     pub.Topic,
+		Payload:   append([]byte(nil), pub.Payload...),
+		QoS:       pub.QoS,
+		Retain:    pub.Retain,
+		Props:     pub.Props,
+	}
+	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
+		return fmt.Errorf("gmqx: cluster target spread: %w", err)
 	}
 	return nil
 }
@@ -1315,7 +1413,72 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 	c := b.clients[key]
 	b.mu.RUnlock()
 	if c != nil {
+		// The displaced connection's teardown drops the routing entry and the
+		// presence claim of this node (see unregister).
 		c.displace()
+		return
+	}
+	// No connection here holds the id. A stored session of this node stays behind
+	// (its queue is local to the node), but the client id itself belongs to the
+	// peer that just accepted it: this node must stop refreshing a presence record
+	// that would fight the new owner's, or a directed publish would keep being
+	// routed to a node whose session has no connection.
+	b.forgetClientPresence(msg.ClientID)
+}
+
+// OnRemoteTarget implements targetHandler: a peer node handed this node a
+// directed publication (Broker.PublishToClient) for a client id that was not local
+// to it.
+// The publication is delivered exactly like a local directed publish: to the live
+// connection of the client id, or queued for its persistent session when it is
+// offline. Properties travel with the event, so an MQTT 5 subscriber sees the
+// same PUBLISH a local directed publish would produce.
+//
+// The event is applied only when the client id is a session of this node's
+// namespace: a target event carries the namespace of the publication, and one of
+// another namespace never reaches a session — the client id of another scope is an
+// unrelated client. A node that does not hold the id drops the event and counts it
+// with Metrics.RecordDroppedMessage("target_unknown"): the TCP backend broadcasts
+// a target event to every peer, so most receivers are expected not to hold it,
+// while a presence-routed backend (Redis) only sends it to the node that does.
+//
+// The publication was authorized by the caller of PublishToClient, so it is not
+// run through this node's ACL, interceptors or sink, and it is not re-dispatched:
+// it is delivered to one session, not routed again.
+func (b *Broker) OnRemoteTarget(msg ClusterMessage) {
+	if msg.Namespace != b.namespace {
+		b.metrics.RecordDroppedMessage("cluster_namespace")
+		b.log.Debug("gmqx remote target dropped", "namespace", msg.Namespace, "client", msg.ClientID)
+		return
+	}
+	if msg.ClientID == "" {
+		b.metrics.RecordDroppedMessage("target_unknown")
+		return
+	}
+	props, err := decodePropertyBlock(msg.Props)
+	if err != nil {
+		b.log.Warn("gmqx cluster target properties", "err", err)
+		return
+	}
+	pub := Publication{
+		Namespace: msg.Namespace,
+		Topic:     msg.Topic,
+		Payload:   msg.Payload,
+		QoS:       msg.QoS,
+		Retain:    msg.Retain,
+		Props:     msg.Props,
+		props:     props,
+		propsSet:  true,
+	}
+	ctx := b.lifecycleContext()
+	delivered, err := b.deliverLocal(ctx, msg.ClientID, pub)
+	if !delivered {
+		b.metrics.RecordDroppedMessage("target_unknown")
+		b.log.Debug("gmqx cluster target dropped", "client", msg.ClientID, "reason", "no local session")
+		return
+	}
+	if err != nil {
+		b.log.Debug("gmqx cluster target delivery failed", "client", msg.ClientID, "err", err)
 	}
 }
 

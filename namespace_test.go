@@ -424,6 +424,19 @@ func TestRedisClusterNamespaceIsolation(t *testing.T) {
 		t.Fatalf("summary of another namespace was trusted: %v", peer.filters)
 	}
 
+	// Spread routes with a's cached view, which the housekeeping loop refreshes
+	// once per SummaryInterval; an event spread before that cache knows the peer
+	// has no target and is a successful no-op. Wait for the cache, not just for
+	// the member key.
+	waitFor(t, "a to cache the routing view with node b", func() bool {
+		for _, id := range a.viewMembers() {
+			if id == "b" {
+				return true
+			}
+		}
+		return false
+	})
+
 	// a stamps the event with tenant-a; b drops it on the receive path.
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "t/x", Payload: []byte("foreign"),

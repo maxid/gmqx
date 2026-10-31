@@ -51,6 +51,11 @@
 - 限制：最大连接数、最大订阅数、最大保留消息数、每个方向的 inflight 窗口、
   每会话与全局离线队列长度、连接速率限制
 - 优雅关闭与 client-id 会话接管
+- 路由索引：本地匹配对字面量过滤器只需一次 map 查找，每个不同的通配过滤器只匹配一次，
+  publish 不再遍历连接或已存储会话，发布路径也不会调用 `SessionStore`
+- 定向发布：`Broker.PublishToClient(ctx, clientID, Publication)` 投递到指定 client id
+  （本地活连接、本地持久会话的离线队列，或持有该 id 的集群节点）；Redis 后端通过带 TTL 的
+  client-id presence 路由，TCP 网状后端广播、各节点仅在持有该 id 时应用
 - 可插拔的 `Cluster` 接口，提供内置 TCP 后端（静态 seeds、
   带心跳与驱逐的握手式成员关系、事件去重与订阅感知的定向路由、
   跨节点 publish/kick、重连）以及
@@ -175,6 +180,33 @@ context 在连接被接受时创建，在 CONNECT 时由 `Config.ConnContext` �
 都按它划分，两个内置集群后端会丢弃属于其他命名空间的远端事件。空字符串是默认命名空间
 （零值），因此未设置它的部署行为完全不变，包括文档化的 Redis 键布局。
 
+## 定向发布
+
+`PublishToClient` 将一条发布投递到一个 client id，无论它在哪里：
+
+```go
+err := broker.PublishToClient(ctx, "device-42", gmqx.Publication{
+    Topic:   "cmd/reboot",
+    Payload: []byte("now"),
+    QoS:     1,
+})
+```
+
+- 本地活连接通过与本地扇出相同的 `SendLocal` 路径接收，QoS 取发布本身的 QoS（没有订阅可用来
+  封顶），并遵守该连接的 QoS 1/2 inflight 窗口；
+- 本地无连接的持久会话按普通发布的方式入队：在下次 CONNACK 之后排空，并受
+  `MaxOfflineQueueSize` 与 `MaxTotalOfflineMessages` 约束；
+- 否则变成 `ClusterTarget` 事件，集群后端接受后返回 nil。Redis 后端只发给持有该 client id
+  的节点；TCP 网状后端广播，各节点仅在持有该 id 时应用。
+
+没有任何节点持有该 client id 时调用仍然成功：投递是 fire-and-forget（与集群传输一样
+at-most-once），未命中通过 `RecordDroppedMessage("target_unknown")` 计数。只有调用方错误
+（空 client id 的 `ErrClientIDRequired`、非法 topic 或 QoS、其他 namespace 的
+`ErrNamespaceMismatch`）或集群后端拒绝事件（例如 Redis 不可达，可重试）时才返回错误。
+
+定向发布是服务端投递而非客户端 PUBLISH：不经过 ACL、interceptor、`EventSink`（鉴权由调用方
+负责），不写入保留状态；对端收到 target 事件后也不会再交给它的 `Dispatcher`。
+
 ## 持久会话、离线队列与 QoS 1/2 重传
 
 持久会话（Clean Session 清零；MQTT 5 上为 Clean Start 清零且 Session Expiry Interval
@@ -185,7 +217,10 @@ context 在连接被接受时创建，在 CONNECT 时由 `Config.ConnContext` �
 `SessionStore`（`Load`、`Save`、`Delete`、`Keys`）存在的目的是让部署可以把会话状态移出
 进程。当 `Config.SessionStore` 为 nil 时 `New` 安装 `MemorySessionStore`，即早期版本的
 内存行为完全不变；本包不提供网络或磁盘后端。broker 在持有自身会话锁的情况下调用存储，
-因此实现不得回调 broker；`Keys` 是必需的，因为路由到离线会话与清理过期会话都需要枚举键。
+因此实现不得回调 broker。路由完全不读取存储：broker 在保存会话时把其订阅写入路由索引，
+在接管或过期时移除。`Keys` 仍然必需——`New` 用它把部署在 broker 创建之前恢复进存储的会话
+索引一次，过期清扫器用它枚举需要执行的截止时间；运行中的 broker 不会重读被外部进程写入的
+存储。
 
 **过期。** MQTT 5 的 Session Expiry Interval 是一个截止时间：断连时把
 `ConnectInfo.SessionExpiry` 记为 `now + interval`，有界清扫器（`SessionSweepInterval`，
@@ -433,6 +468,7 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 | `<prefix>:owner:<nodeID>` | JSON `{node, inc, since}`：node id 所有权租约 | `NodeTTL` |
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`：存活性与身份 | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`：订阅摘要 | `SummaryTTL` |
+| `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`：client id 由哪个节点持有 | `PresenceTTL` |
 
 一个节点只订阅自己的通道，不订阅其他任何通道。一次 publish 会为每个
 感兴趣的节点各执行一次 `PUBLISH`，因此 N 个节点的代价是 O(N) 次 Redis 操作
@@ -482,6 +518,17 @@ Redis 不可达时使 `Spread` 返回错误）。规则即 TCP 后端的规则�
 - 一个节点最多通告 `MaxSummaryFilters` 个过滤器，存在时间最长
   的过滤器会被排除。
 
+定向发布（`Broker.PublishToClient`）改用 presence 路由：broker 报告每次 CONNECT
+以及真正结束的会话，后端写入 `client:<id>` 记录标明本节点，在客户端仍在线（或持久会话仍
+存储在本节点）期间刷新，并用 compare-and-delete 删除——因此旧连接的断开不会抹掉已经迁移到
+其他节点的 client id 记录；对等节点的 CONNECT 时 kick 也会让本节点放弃声明，即使持久会话
+仍存储在本节点——队列是本地的，而客户端本身已经连接在对端。`Spread` 读取该记录，只写入那个
+节点的通道。没有记录意味着没有
+节点声明该 client id：事件不会广播，而是用 `RecordDroppedMessage("target_unknown")` 计数
+并丢弃；与 CONNECT 竞争且不足一个刷新周期的定向发布会同样丢失，这是整个集群传输的
+at-most-once 取舍。kick 故意保留广播：过期的 presence 记录不能把僵尸连接留在客户端真正
+迁移到的节点之外。
+
 ### 去重与环路
 
 与 TCP 后端完全相同，且由同一份代码实现：每个本地产生的事件都会打上
@@ -512,6 +559,7 @@ TTL 表丢弃重复的 `(Origin, Seq)`，并且从不转发收到的事件。
 | `SummaryInterval` | 1s | 键刷新与路由视图刷新周期 |
 | `SummaryTTL` | 3×`SummaryInterval` | 摘要键的生命周期；过期即表示“摘要未知” |
 | `NodeTTL` | 3×`SummaryInterval` | 成员键的生命周期；过期即驱逐该节点 |
+| `PresenceTTL` | 3×`SummaryInterval` | client-id presence 记录寿命；过期即“无人声明该 id” |
 | `HeartbeatInterval` | 1s | 用于故障检测与日志记录的 Redis `PING` 周期 |
 | `DedupSize` / `DedupTTL` | 4096 / 30s | 重复抑制表的边界 |
 | `MaxSummaryFilters` | 256 | 每个节点通告并接受的过滤器数量 |
