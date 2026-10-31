@@ -56,8 +56,53 @@ type Config struct {
 	MaxPacketSize       int
 
 	// Protocol semantics
-	ConnectMode    ConnectMode
+	ConnectMode ConnectMode
+	// NotKickSeconds is the anti-flap window of a client-id takeover, in
+	// seconds: two ends of one client id cannot displace each other in a loop.
+	// In ConnectModeKick a CONNECT that would displace a live connection is
+	// refused when that connection began less than NotKickSeconds ago, exactly
+	// as the reference implementation of this broker family does it; the refusal
+	// is CONNACK 0x9F (Connection rate exceeded) on MQTT 5 and return code 3
+	// (Server unavailable) on MQTT 3.1.1 — a rate limit on this client id, not an
+	// administrative ban (0x8A) and not a whole-server overload (0x89). Zero
+	// selects the default (30 s) and a negative value disables the window, which
+	// takes the session over on every CONNECT — the behaviour before the window
+	// existed and the one MQTT itself prescribes. The window is enforced on the
+	// node that receives the CONNECT, against the connections that node holds; a
+	// kick spread by a peer is applied without it, because the peer cannot know
+	// how old this node's connection is (that needs a cluster presence view).
 	NotKickSeconds int
+	// ConnectTimeout bounds the CONNECT phase of one connection: a read deadline
+	// is armed before the first packet is read and cleared once the handshake is
+	// through, when the read loop arms the deadline it owns (keep-alive, or none).
+	// A client that opens the socket and sends nothing, or sends its CONNECT too
+	// slowly, is therefore disconnected instead of holding a connection slot, a
+	// goroutine and a session forever. The deadline also covers the authentication
+	// call (see AuthTimeout, which bounds that call on its own). Default 10 s;
+	// a non-positive value selects the default and there is no unlimited setting.
+	ConnectTimeout time.Duration
+	// AuthTimeout bounds one call into the authentication/authorization SPI:
+	// AuthManager.Authenticate at CONNECT, and AclManager.Check for every
+	// SUBSCRIBE and PUBLISH. The hook receives a context carrying the deadline and
+	// is abandoned when it expires; an expired call is a refusal — a failed
+	// authentication or a denied authorization — never a success. The built-in
+	// AllowAll (the default of both SPIs) cannot block and always takes the
+	// synchronous path, so a broker that keeps the defaults pays no goroutine per
+	// check. Default 5 s; a negative value disables the bound and calls the hook
+	// synchronously, which then has to respect its context itself.
+	AuthTimeout time.Duration
+	// MaxWillDelayInterval bounds the MQTT 5 Will Delay Interval this broker
+	// honours. A will that asks for a longer delay is published after this bound
+	// instead and the clamp is counted with Metrics.RecordOverflow("will_delay").
+	// The delay is also cut short by the Session Expiry Interval of the session
+	// that ended, because the will is published when the session ends at the
+	// latest; and it does not apply at all to a session that ends with its
+	// connection (Clean Start / Clean Session set, or a zero Session Expiry
+	// Interval), whose will is published as soon as the connection is gone. The
+	// delay is cancelled by a CONNECT that resumes the session (see the
+	// pending-will scheduling in will.go). Default 5 min; a negative value removes
+	// the bound, leaving the uint32 wire field (about 136 years) as the limit.
+	MaxWillDelayInterval time.Duration
 	// Namespace is the isolation scope of this broker: its session table,
 	// subscription matching, retained store and advertised subscription summaries
 	// only ever hold and match entries of this namespace. A publication produced
@@ -76,12 +121,39 @@ type Config struct {
 	// Outbound delivery. MaxInflightQoS1 bounds the unconfirmed QoS 1 PUBLISHes of
 	// one connection and MaxInflightQoS2 the QoS 2 exchanges of one connection, in
 	// each direction. Zero selects the default (64); a negative value means
-	// unlimited. A QoS 1/2 delivery that would exceed its window is skipped and
-	// counted with Metrics.RecordDroppedMessage("inflight_full") instead of
-	// blocking the publishing goroutine, and an inbound QoS 2 PUBLISH over the
-	// window is answered with PUBREC 0x97 (Quota exceeded) on MQTT 5.
+	// unlimited. A QoS 1/2 delivery that would exceed its window is queued for the
+	// connection — it is not dropped and does not block the publishing goroutine —
+	// and it is sent, in arrival order, as soon as a slot frees (see
+	// MaxInflightQueueSize). An inbound QoS 2 PUBLISH over the window is answered
+	// with PUBREC 0x97 (Quota exceeded) on MQTT 5.
 	MaxInflightQoS1 int
 	MaxInflightQoS2 int
+	// MaxInflightQueueSize bounds the QoS 1/2 deliveries one connection may have
+	// waiting for a free inflight slot (default 256). The queue preserves the
+	// connection's delivery order and is drained by the acknowledgements that free
+	// a slot; it is never unbounded, because a client that never confirms anything
+	// would otherwise cost unbounded broker memory. Only a delivery that finds the
+	// queue full is dropped, and that drop is counted twice
+	// (Metrics.RecordDroppedMessage("inflight_overflow") and
+	// Metrics.RecordOverflow("inflight")) and logged at Warn level with the client
+	// id. A non-positive value selects the default; there is no unlimited setting.
+	MaxInflightQueueSize int
+	// MaxOutboundQueueSize bounds the writer queue of one connection (default 256
+	// packets). Every packet of a live connection — PUBLISH, PUBACK, PUBREC,
+	// PUBREL, PUBCOMP, SUBACK, PINGRESP — is appended to it and written by the
+	// connection's single writer goroutine in that order, so no caller waits on a
+	// socket. Only the CONNACK (written before the writer exists) and a server
+	// DISCONNECT (the last packet, written before close) bypass it. The bound is
+	// in packets, not bytes: the worst case is this many times MaxPacketSize per
+	// connection. A non-positive value selects the default; there is no unlimited
+	// setting.
+	MaxOutboundQueueSize int
+	// WriteTimeout is the write deadline of one packet (default 5 s). A peer that
+	// stops reading therefore cannot hold a connection's writer goroutine, the
+	// publisher that feeds it, the will publish of a closing connection or the
+	// cluster receive goroutine: the write fails, the connection is closed and the
+	// expiry is logged at Warn level. A non-positive value selects the default.
+	WriteTimeout time.Duration
 	// QoSRetryInterval is the base interval of the outbound retransmission timer
 	// (default 5 s): the first retransmission of a QoS 1/2 exchange is sent after
 	// one interval, and every further attempt doubles the wait. QoSMaxRetries caps
@@ -142,4 +214,13 @@ type Config struct {
 	// NodeID identifies this broker in the cluster (default random).
 	NodeID string
 	Logger *slog.Logger
+
+	// unit is the length of one MQTT protocol second for the intervals this
+	// broker turns into timers or deadlines (the Session Expiry Interval, the
+	// Will Delay Interval, the Message Expiry Interval of a retained message and
+	// NotKickSeconds). Production always runs with time.Second; the package's own
+	// tests shorten it so a case about a seconds-resolution interval completes in
+	// milliseconds instead of sleeping. It is unexported because it is not part of
+	// the API.
+	unit time.Duration
 }

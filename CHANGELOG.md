@@ -5,6 +5,119 @@
 
 ## [Unreleased]
 
+- **CONNECT-phase and authorization deadlines, capability refusals, delayed wills,
+  retained expiry and cross-node takeover.** A batch of parity and security fixes.
+
+  *CONNECT and authorization deadlines (security).* A connection now runs its
+  CONNECT phase under a read deadline: `Config.ConnectTimeout` (default 10 s) is
+  armed before the first packet is read and cleared after the CONNACK, and the
+  read loop then arms the keep-alive deadline it owns. A client that opens a
+  socket and sends nothing — or sends its CONNECT too slowly — is disconnected,
+  so it can no longer hold a connection slot, a goroutine and a session forever.
+  `Config.AuthTimeout` (default 5 s) bounds `AuthManager.Authenticate` and
+  `AclManager.Check`: the hook runs in its own goroutine with a context that
+  carries the deadline, and an expired call is a refusal — CONNACK 0x87 for
+  authentication, SUBACK 0x87 or no success PUBACK for authorization — never a
+  success (`RecordDroppedMessage("auth_timeout")`, `"acl_timeout"`). The built-in
+  `AllowAll` hooks keep the synchronous path, so the default publish path spawns
+  no goroutine; a negative `AuthTimeout` disables the bound.
+
+  *Capabilities the CONNACK advertises as unavailable are refused.* A SUBSCRIBE
+  filter starting with `$share/` is no longer stored as a literal filter that can
+  never match: it is answered with SUBACK 0x9E (Shared Subscriptions not
+  supported) per filter on MQTT 5, as §3.9 requires, and with 0x80 on MQTT 3.1.1
+  (`RecordDroppedMessage("shared_subscription")`). A SUBSCRIBE that carries a
+  Subscription Identifier is answered with DISCONNECT 0x9A (Subscription
+  Identifiers not supported) on MQTT 5 and closes the connection on 3.1.1
+  (`RecordDroppedMessage("subscription_identifier")`). An audit of `props.go`
+  found these two to be the only capabilities it advertises as unavailable; Retain
+  Available, Wildcard Subscription Available and Topic Alias Maximum (16) are
+  advertised as available and are implemented. The reason codes are now exported
+  as `ReasonSessionTakenOver`, `ReasonSubscriptionIdentifiersNotSupported`,
+  `ReasonSharedSubscriptionsNotSupported` and `ReasonConnectionRateExceeded`.
+
+  *Will Delay Interval (MQTT 5).* A will with a delay is published when the delay
+  elapses or when the session ends, whichever comes first: a session that ends
+  with its connection (Clean Start, zero Session Expiry) publishes its will
+  immediately; otherwise the wait is `min(delay, Config.MaxWillDelayInterval,
+  remaining Session Expiry)`; a CONNECT that resumes the session cancels the
+  pending will, locally or through the connect-time cluster kick, while a CONNECT
+  with Clean Start set discards the session and publishes that will right away;
+  and `Stop` drops what is still pending. The new `Config.MaxWillDelayInterval` (default
+  5 min, negative: unbounded) clamps a longer request and counts it with
+  `RecordOverflow("will_delay")`. Scheduling is one timer per pending will.
+
+  *Retained message expiry (MQTT 5).* A retained publish now stores its publish
+  time and Message Expiry Interval. A replay advertises what is left of the
+  interval (rounded up, because a zero would mean "never expires" on the wire);
+  an elapsed message is not replayed and is deleted from the store
+  (`RecordDroppedMessage("retained_expired")`). A retained message without an
+  interval still never expires.
+
+  *Cross-node takeover.* Every successful CONNECT now spreads a kick, in both
+  connect modes, instead of only in `KICK`: a client that reconnects to another
+  node would otherwise leave a zombie connection that duplicates every delivery
+  until its keep-alive expires. A displaced connection — locally or by a peer's
+  kick — receives a server DISCONNECT with reason code 0x8E (Session taken over)
+  on MQTT 5 before it is closed, so a client can distinguish a takeover from a
+  network drop, and a delayed will pending for that client id is cancelled.
+
+  *`NotKickSeconds` is now enforced.* The field (default 30 s) is the anti-flap
+  window of a takeover: in `KICK` mode a CONNECT that would displace a connection
+  younger than the window is refused with CONNACK 0x9F (Connection rate exceeded,
+  `RecordDroppedMessage("takeover_rate_limit")`) on MQTT 5 and return code 3
+  (Server unavailable) on 3.1.1, leaving the incumbent session in place. 0x9F is
+  the reason code MQTT 5 reserves for a rate-limited connection; 0x8A would claim
+  an administrative ban and 0x89 a whole-server overload.
+
+  Behavior notes for existing deployments: `KICK` mode no longer displaces a
+  connection that began less than `NotKickSeconds` ago — set `NotKickSeconds` to a
+  negative value to get the previous immediate takeover; `UNIQUE` mode keeps
+  deciding locally (a node cannot see its peers' sessions), but every CONNECT now
+  also closes a duplicate connection of the same client id on other nodes, so a
+  client that roams between nodes no longer receives duplicate deliveries;
+  `AuthTimeout` applies to every subscribe and publish of a custom `AclManager`;
+  and a client whose `Authenticator` does not answer in `AuthTimeout` is refused.
+
+- **No QoS 1/2 delivery is lost to a full inflight window, and no stalled socket
+  blocks the broker.** Two related delivery defects are fixed.
+
+  *Inflight queue.* A QoS 1/2 delivery that finds the connection's inflight window
+  full is now queued for that connection and sent when an acknowledgement frees a
+  slot, in arrival order. The queue is bounded by the new
+  `Config.MaxInflightQueueSize` (default 256); only a delivery that finds it full is
+  dropped, and that drop is counted twice
+  (`RecordDroppedMessage("inflight_overflow")`, `RecordOverflow("inflight")`) and
+  logged at Warn level with the client id. Behavior change: the previous
+  `RecordDroppedMessage("inflight_full")` skip is gone — an acknowledged publish is
+  no longer silently discarded because the subscriber is slow. The offline-queue
+  drain keeps its documented QoS 0 degradation when the window is full.
+
+  *Writer goroutine, bounded outbound queue and write deadline.* Every packet of a
+  connection is now written by one writer goroutine, in enqueue order, from a
+  queue bounded by the new `Config.MaxOutboundQueueSize` (default 256 packets),
+  with a per-packet write deadline from the new `Config.WriteTimeout` (default
+  5 s). `SendLocal`, the will publish inside `close`, the cluster receive path and
+  every acknowledgement no longer write to the socket on the caller's goroutine,
+  so a peer that stops reading cannot hold the publisher's read loop, a closing
+  connection or the node's single cluster receive goroutine. A full queue drops a
+  QoS 0 PUBLISH (`RecordDroppedMessage("outbound_queue_full")`,
+  `RecordOverflow("outbound_queue")`); for a QoS 1/2 PUBLISH or an acknowledgement
+  it disconnects the slow consumer instead (`RecordDroppedMessage("slow_consumer")`
+  plus a Warn log). The queue is bounded in packets, not bytes. The CONNACK of the
+  handshake and a server DISCONNECT are still written synchronously, so both are on
+  the wire before the connection closes. The writer goroutine ends with the
+  connection, is joined by `close` and `serve`, and `Stop` still waits for every
+  broker goroutine.
+
+  Behavior notes for existing deployments: `SendLocal` now returns before the
+  packet is on the wire (an error means the packet was not accepted — the
+  connection is closed, or the message was dropped as QoS 0 at a full queue); a
+  client that does not read its socket is eventually disconnected instead of
+  stalling delivery; and a write that exceeds `WriteTimeout` closes the
+  connection. `MaxInflightQueueSize`, `MaxOutboundQueueSize` and `WriteTimeout`
+  have no unlimited setting: a non-positive value selects the default.
+
 - **Persistent-session storage, bounded offline queue and broker-side QoS 1/2
   retransmission.** Two parity gaps of the reference broker of this family are
   closed together, because a queued offline message is pointless if delivery after
@@ -46,9 +159,10 @@
   not copied); QoS 2 runs PUBLISH → PUBREC → PUBREL → PUBCOMP with the PUBREL
   retried until PUBCOMP. `MaxInflightQoS1` (default 64) bounds the unconfirmed
   QoS 1 deliveries of a connection and `MaxInflightQoS2` (default 64) its QoS 2
-  exchanges in each direction; a delivery over the window is skipped and counted
-  (`inflight_full`) instead of blocking the publisher, and an inbound QoS 2
-  PUBLISH over the window is answered with PUBREC 0x97 Quota exceeded on MQTT 5.
+  exchanges in each direction; a delivery over the window is queued for the
+  connection instead of blocking the publisher (see the entry above, which replaces
+  the `inflight_full` skip this entry introduced), and an inbound QoS 2 PUBLISH
+  over the window is answered with PUBREC 0x97 Quota exceeded on MQTT 5.
   `MaxInflightQoS2` was declared but read by nothing before this change.
 
   Behavior notes: a clean session no longer accumulates anything; the session

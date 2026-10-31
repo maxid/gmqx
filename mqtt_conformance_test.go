@@ -129,6 +129,12 @@ func (c *confClient) write(m mqtt.Message) {
 	}
 }
 
+// ack confirms a QoS 1 delivery so the broker stops retransmitting it.
+func (c *confClient) ack(packetID uint16) {
+	c.t.Helper()
+	c.write(&mqtt.Puback{MessageHeader: mqtt.MessageHeader{Level: c.version}, PacketID: packetID})
+}
+
 func (c *confClient) writeRaw(frame []byte) {
 	c.t.Helper()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(c.timeout))
@@ -834,7 +840,26 @@ func test311PublishQoS1(t *testing.T) {
 	}
 
 	t.Run("broker_retransmission", func(t *testing.T) {
-		t.Skip("broker-side QoS 1 retransmission and inflight tracking are not implemented: README.md says \"broker-side retransmission and inflight limits are still on the roadmap\"")
+		// A short retry interval keeps the case fast; the subscriber withholds
+		// PUBACK so the broker has to retransmit with DUP set.
+		rb := startBroker(t, Config{QoSRetryInterval: 20 * time.Millisecond, QoSMaxRetries: 3})
+		rs, _ := mustConnect(t, rb.Addr(), confConnect{clientID: "retry-sub", clean: true})
+		if codes := subscribe(t, rs, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "retry/x", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
+			t.Fatalf("SUBACK codes %v", codes)
+		}
+		rp, _ := mustConnect(t, rb.Addr(), confConnect{clientID: "retry-pub", clean: true})
+		rp.publish(confPublish{topic: "retry/x", payload: "unacked", qos: 1, pid: 7})
+		expectPuback(t, rp, 7, 0)
+
+		first := expectPublish(t, rs)
+		if first.Dup {
+			t.Fatal("the first delivery must not set DUP")
+		}
+		resent := expectPublish(t, rs)
+		if !resent.Dup || resent.PacketID != first.PacketID || string(resent.Payload) != "unacked" {
+			t.Fatalf("retransmission = dup %v id %d payload %q, want dup with id %d", resent.Dup, resent.PacketID, resent.Payload, first.PacketID)
+		}
+		rs.ack(first.PacketID)
 	})
 }
 

@@ -48,6 +48,11 @@ type Broker struct {
 	// background tracks the broker's own goroutines (the session sweeper) so Stop
 	// returns only once they are gone.
 	background sync.WaitGroup
+	// wills holds the wills whose Will Delay Interval has not elapsed yet, keyed
+	// like clients. willMu is the only lock that guards the map; it is never held
+	// across a publish, so a will timer can publish while a connection connects.
+	wills  map[string]*pendingWill
+	willMu sync.Mutex
 }
 
 type retainedMessage struct {
@@ -56,6 +61,10 @@ type retainedMessage struct {
 	payload   []byte
 	qos       byte
 	props     mqtt.Properties
+	// expiresAt is when the store may drop the message: the time it was stored
+	// plus its MQTT 5 Message Expiry Interval. The zero time means it never
+	// expires — no interval on the publish, or MQTT 3.1.1, which has none.
+	expiresAt time.Time
 }
 
 // copySubscriptions returns a detached copy of a session's subscription map, so
@@ -79,9 +88,16 @@ const (
 	defaultMaxTotalOfflineMessages = 100000
 	defaultMaxInflightQoS1         = 64
 	defaultMaxInflightQoS2         = 64
+	defaultMaxInflightQueueSize    = 256
+	defaultMaxOutboundQueueSize    = 256
+	defaultWriteTimeout            = 5 * time.Second
 	defaultSessionSweepInterval    = 30 * time.Second
 	defaultQoSRetryInterval        = 5 * time.Second
 	defaultQoSMaxRetries           = 5
+	defaultConnectTimeout          = 10 * time.Second
+	defaultAuthTimeout             = 5 * time.Second
+	defaultMaxWillDelayInterval    = 5 * time.Minute
+	defaultNotKickSeconds          = 30
 )
 
 // New creates a Broker. Start must be called to listen.
@@ -99,8 +115,20 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.ConnectMode == "" {
 		cfg.ConnectMode = ConnectModeUnique
 	}
-	if cfg.NotKickSeconds <= 0 {
-		cfg.NotKickSeconds = 30
+	if cfg.NotKickSeconds == 0 {
+		cfg.NotKickSeconds = defaultNotKickSeconds
+	}
+	if cfg.ConnectTimeout <= 0 {
+		cfg.ConnectTimeout = defaultConnectTimeout
+	}
+	if cfg.AuthTimeout == 0 {
+		cfg.AuthTimeout = defaultAuthTimeout
+	}
+	if cfg.MaxWillDelayInterval == 0 {
+		cfg.MaxWillDelayInterval = defaultMaxWillDelayInterval
+	}
+	if cfg.unit <= 0 {
+		cfg.unit = time.Second
 	}
 	if cfg.Auth == nil {
 		cfg.Auth = AllowAll{}
@@ -132,6 +160,15 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.MaxInflightQoS2 == 0 {
 		cfg.MaxInflightQoS2 = defaultMaxInflightQoS2
 	}
+	if cfg.MaxInflightQueueSize <= 0 {
+		cfg.MaxInflightQueueSize = defaultMaxInflightQueueSize
+	}
+	if cfg.MaxOutboundQueueSize <= 0 {
+		cfg.MaxOutboundQueueSize = defaultMaxOutboundQueueSize
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = defaultWriteTimeout
+	}
 	if cfg.SessionSweepInterval == 0 {
 		cfg.SessionSweepInterval = defaultSessionSweepInterval
 	}
@@ -153,6 +190,7 @@ func New(cfg Config) (*Broker, error) {
 		clients:   make(map[string]*client),
 		store:     cfg.SessionStore,
 		retained:  make(map[string]retainedMessage),
+		wills:     make(map[string]*pendingWill),
 		addrs:     make(map[string]string),
 		done:      make(chan struct{}),
 		nodeID:    cfg.NodeID,
@@ -364,6 +402,36 @@ func (b *Broker) WebsocketAddr() string { return b.addr("ws") }
 // WebsocketSecureAddr returns the WSS listen address.
 func (b *Broker) WebsocketSecureAddr() string { return b.addr("wss") }
 
+// second is the length of one MQTT protocol second for the intervals this
+// broker turns into timers (Config.unit, time.Second in production; the
+// package's tests shorten it to keep a seconds-resolution case fast).
+func (b *Broker) second() time.Duration {
+	if unit := b.cfg.unit; unit > 0 {
+		return unit
+	}
+	return time.Second
+}
+
+// connectTimeout is how long the CONNECT phase of a connection may take.
+func (b *Broker) connectTimeout() time.Duration {
+	if timeout := b.cfg.ConnectTimeout; timeout > 0 {
+		return timeout
+	}
+	return defaultConnectTimeout
+}
+
+// willDelayLimit is the longest Will Delay Interval this broker honours, or 0
+// when the configured bound is disabled.
+func (b *Broker) maxWillDelayInterval() time.Duration {
+	if b.cfg.MaxWillDelayInterval < 0 {
+		return 0
+	}
+	if limit := b.cfg.MaxWillDelayInterval; limit > 0 {
+		return limit
+	}
+	return defaultMaxWillDelayInterval
+}
+
 // Addrs returns a copy of all listening addresses by transport.
 func (b *Broker) Addrs() map[string]string {
 	b.mu.RLock()
@@ -412,6 +480,9 @@ func (b *Broker) Stop(ctx context.Context) error {
 	for _, c := range clients {
 		c.close(false)
 	}
+	// The wills whose delay has not elapsed go with the broker: there is nowhere
+	// left to publish them, and their timers must not outlive Stop.
+	b.dropPendingWills()
 	// The sweeper waits on done, which is closed above; waiting here makes Stop
 	// mean "every goroutine this broker started has ended".
 	b.background.Wait()
@@ -423,6 +494,9 @@ func (b *Broker) serve(conn net.Conn) {
 	// A safety net: close cancels the context as soon as the connection is gone,
 	// this covers a connection that failed before close was reached.
 	defer c.stopContext()
+	// The writer goroutine is joined as well: a connection that never reaches
+	// close (a handshake that fails after the CONNACK) still ends it here.
+	defer c.stopWriter()
 	if err := c.handshake(); err != nil {
 		if c.registered {
 			// The connection is gone, so the disconnect hook observes the cancelled
@@ -449,6 +523,13 @@ func (b *Broker) serve(conn net.Conn) {
 // no longer holds the key. That is what keeps a publication from reaching a
 // session twice (once live, once through a stale queue). An expired session is
 // never resumed, even when the sweeper has not deleted it yet.
+//
+// A CONNECT that displaces a live connection is a takeover. In ConnectModeKick it
+// proceeds only outside Config.NotKickSeconds, and the displaced connection gets
+// a DISCONNECT 0x8E (Session taken over) on MQTT 5 before it is closed; in
+// ConnectModeUnique it is refused. Either way the connection that wins the client
+// id spreads a kick to the cluster, so a duplicate connection on another node is
+// closed instead of surviving until its keep-alive expires (see spreadKick).
 func (b *Broker) register(c *client) error {
 	key := namespaceKey(b.namespace, c.id)
 	b.mu.Lock()
@@ -457,6 +538,11 @@ func (b *Broker) register(c *client) error {
 		if b.cfg.ConnectMode == ConnectModeUnique {
 			b.mu.Unlock()
 			return ErrClientIDInUse
+		}
+		if !b.takeoverAllowed(old) {
+			b.mu.Unlock()
+			b.metrics.RecordDroppedMessage("takeover_rate_limit")
+			return ErrTakeoverRateExceeded
 		}
 		delete(b.clients, key)
 		// In KICK mode the replacement takes the old session over. The old
@@ -474,7 +560,7 @@ func (b *Broker) register(c *client) error {
 		}
 		old.mu.Unlock()
 		b.mu.Unlock()
-		old.close(false)
+		old.displace()
 		b.mu.Lock()
 	}
 	if b.cfg.MaxConnections > 0 && len(b.clients) >= b.cfg.MaxConnections {
@@ -503,17 +589,31 @@ func (b *Broker) register(c *client) error {
 
 	b.clients[key] = c
 	c.registered = true
+	c.connectedAt = time.Now()
 	n := len(b.clients)
 	b.mu.Unlock()
 	if len(c.subs) > 0 {
 		b.subscriptionsChanged()
 	}
 
-	// KICK mode: tell peer nodes to drop any session with the same client id.
-	// This makes client-id takeover work across nodes, not just locally.
-	if b.cfg.ConnectMode == ConnectModeKick {
-		b.spreadKick(c.context(), c.id)
+	// A new connection to this session cancels the will its previous connection
+	// asked to delay: MQTT 5 forbids publishing it once the session is resumed. A
+	// CONNECT that discards the session instead (Clean Start set) ends it right
+	// here, so the pending will of that session goes out now.
+	if c.resumesSession() {
+		b.cancelPendingWill(key)
+	} else {
+		b.flushPendingWill(key)
 	}
+
+	// Every successful connect is spread to the cluster, in both connect modes:
+	// a client that reconnects to another node leaves a connection behind on the
+	// old one, and that connection must go now instead of surviving until its
+	// keep-alive expires and duplicating every delivery in the meantime. The
+	// event names a client id, not a topic, and the built-in backends stamp it
+	// with this node's identity, namespace and sequence number, so their
+	// deduplication and namespace rules apply unchanged (see spreadKick).
+	b.spreadKick(c.context(), c.id)
 
 	b.metrics.IncrementConnections()
 	b.metrics.RecordConnections(n)
@@ -521,6 +621,25 @@ func (b *Broker) register(c *client) error {
 		b.cfg.Sink.OnConnect(c.context(), c.info)
 	}
 	return nil
+}
+
+// takeoverAllowed reports whether a KICK-mode CONNECT may displace the live
+// connection old, which is how Config.NotKickSeconds works as the anti-flap
+// window it is meant to be: the session a client id just installed is protected
+// for that long, so two ends of one client id cannot displace each other in a
+// loop. The caller holds b.mu, which is what orders the write of connectedAt in
+// register with this read.
+func (b *Broker) takeoverAllowed(old *client) bool {
+	window := b.cfg.NotKickSeconds
+	if window < 0 {
+		// The window is disabled: every CONNECT takes the session over, which is
+		// what MQTT prescribes and what this broker did before the window existed.
+		return true
+	}
+	if window == 0 {
+		window = defaultNotKickSeconds
+	}
+	return time.Since(old.connectedAt) > time.Duration(window)*b.second()
 }
 
 func (b *Broker) unregister(c *client) {
@@ -566,16 +685,16 @@ func (b *Broker) unregister(c *client) {
 }
 
 func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bool) {
-	if !b.cfg.ACL.Check(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
+	if !b.checkACL(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, filter, AclSubscribe) {
 		b.metrics.RecordDroppedMessage("acl_subscribe")
-		return subscribeFailure(c.version, 0x87), false
+		return subscribeFailure(c.version, ReasonNotAuthorized), false
 	}
 	c.mu.Lock()
 	_, exists := c.subs[filter]
 	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions && !exists {
 		c.mu.Unlock()
 		b.metrics.RecordDroppedMessage("max_subscriptions")
-		return subscribeFailure(c.version, 0x97), exists
+		return subscribeFailure(c.version, ReasonQuotaExceeded), exists
 	}
 	c.subs[filter] = sub
 	c.mu.Unlock()
@@ -587,8 +706,9 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 }
 
 // subscribeFailure maps a subscription refusal onto the protocol level: MQTT 5
-// names the reason (0x87 not authorized, 0x97 quota exceeded), while MQTT 3.1.1
-// has the single 0x80 failure code.
+// names the reason (0x87 Not authorized, 0x97 Quota exceeded, 0x9E Shared
+// Subscriptions not supported), while MQTT 3.1.1 has the single 0x80 failure
+// code.
 func subscribeFailure(version, reason byte) byte {
 	if version == mqtt.Version5 {
 		return reason
@@ -654,6 +774,14 @@ func (b *Broker) subscriptionsChanged() {
 // many topics are stored (a full store still accepts a new value for a topic it
 // already holds). The QoS and the typed property set travel with the message,
 // so a retained delivery later reproduces the publish that set it.
+//
+// The MQTT 5 Message Expiry Interval is stored as a deadline, not as a value:
+// the interval counts from the moment the message was published, so a replay has
+// to subtract the time the message spent in the store. A retained message
+// without an interval never expires. A message replicated from a peer node is
+// stamped with its arrival here, because the cluster event does not carry the
+// origin's publish time (its age is the peer transport latency, which the
+// one-second resolution of the property already dwarfs).
 func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte, props mqtt.Properties) {
 	key := namespaceKey(namespace, topic)
 	b.mu.Lock()
@@ -666,24 +794,71 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 		b.metrics.RecordDroppedMessage("max_retain")
 		return
 	}
-	b.retained[key] = retainedMessage{namespace: namespace, topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
+	m := retainedMessage{namespace: namespace, topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
+	if expiry := props.MessageExpiryInterval; expiry > 0 {
+		m.expiresAt = time.Now().Add(time.Duration(expiry) * b.second())
+	}
+	b.retained[key] = m
 }
 
+// sendRetained replays the retained messages a new subscription matches, in its
+// own namespace only.
+//
+// A message whose Message Expiry Interval has elapsed is not replayed: it is
+// deleted from the store on the way, because that is the only moment the broker
+// learns it has become stale (a retained message nobody subscribes to costs one
+// map entry, not a timer). A message still inside its interval is replayed with
+// the interval it has left, rounded up: the property counts from the publish and
+// the subscriber has to see the time the message may still live here, and a
+// rounding down to zero would mean "never expires" on the wire.
 func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool) {
-	b.mu.RLock()
-	var msgs []retainedMessage
-	for _, m := range b.retained {
+	now := time.Now()
+	type replay struct {
+		topic   string
+		payload []byte
+		qos     byte
+		props   mqtt.Properties
+	}
+	var msgs []replay
+	b.mu.Lock()
+	for key, m := range b.retained {
 		if m.namespace != c.namespace {
 			continue
 		}
-		if matchTopic(filter, m.topic) {
-			msgs = append(msgs, m)
+		if !matchTopic(filter, m.topic) {
+			continue
 		}
+		props := m.props
+		if !m.expiresAt.IsZero() {
+			remaining := m.expiresAt.Sub(now)
+			if remaining <= 0 {
+				delete(b.retained, key)
+				b.metrics.RecordDroppedMessage("retained_expired")
+				continue
+			}
+			props.MessageExpiryInterval = b.expiryInterval(remaining)
+		}
+		msgs = append(msgs, replay{topic: m.topic, payload: m.payload, qos: m.qos, props: props})
 	}
-	b.mu.RUnlock()
+	b.mu.Unlock()
 	for _, m := range msgs {
 		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true, m.props)
 	}
+}
+
+// expiryInterval converts the time a message has left into the value its MQTT 5
+// Message Expiry Interval carries: whole protocol seconds, rounded up and never 0
+// (0 on the wire means "no expiry at all").
+func (b *Broker) expiryInterval(remaining time.Duration) uint32 {
+	unit := b.second()
+	seconds := uint64((remaining + unit - 1) / unit)
+	if seconds == 0 {
+		seconds = 1
+	}
+	if seconds > uint64(^uint32(0)) {
+		seconds = uint64(^uint32(0))
+	}
+	return uint32(seconds)
 }
 
 // publish authorizes, hands the message to the sink and only then routes it.
@@ -694,20 +869,21 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 // no length prefix); props is the same set in typed form, which is what routing,
 // retained state and outgoing packets use.
 //
-// Every hook that runs here receives the connection-scoped context of from, so a
-// hook can read the ConnInfo and is cancelled when the connection ends. Retained
-// state is written here, before routing: a Dispatcher decides where an accepted
-// publication goes, not what is retained.
-func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) PublishResult {
-	ctx := from.context()
+// Every hook that runs here receives the context of the publication's origin, so
+// a hook can read the ConnInfo and is cancelled when the connection ends. A will
+// whose connection is long gone brings the context its scheduler captured
+// instead (see will.go). Retained state is written here, before routing: a
+// Dispatcher decides where an accepted publication goes, not what is retained.
+func (b *Broker) publish(from origin, ev PublishEvent, props mqtt.Properties) PublishResult {
+	ctx := from.ctx
 	ev.ConnectionID = from.connID
-	ev.ClientID = from.id
-	if !b.cfg.ACL.Check(ctx, SessionInfo{ClientID: from.id, Username: from.username}, ev.Topic, AclPublish) {
+	ev.ClientID = from.clientID
+	if !b.checkACL(ctx, SessionInfo{ClientID: from.clientID, Username: from.username}, ev.Topic, AclPublish) {
 		b.metrics.RecordDroppedMessage("acl_publish")
 		return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 	}
 	for _, it := range b.cfg.Interceptors {
-		if !it.OnPublish(ctx, from.id, ev.Topic, ev.Payload, ev.QoS) {
+		if !it.OnPublish(ctx, from.clientID, ev.Topic, ev.Payload, ev.QoS) {
 			b.metrics.RecordDroppedMessage("interceptor")
 			return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 		}
@@ -734,7 +910,7 @@ func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) P
 		QoS:              ev.QoS,
 		Retain:           ev.Retain,
 		Dup:              ev.Dup,
-		FromClientID:     from.id,
+		FromClientID:     from.clientID,
 		FromConnectionID: string(from.connID),
 		Props:            ev.Properties,
 		props:            props,
@@ -744,6 +920,81 @@ func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) P
 		b.log.Warn("gmqx dispatch failed", "err", err)
 	}
 	return PublishResult{Disposition: PublishAccepted}
+}
+
+// origin is the identity a publication is made on behalf of: a live connection
+// hands in its own (client.origin), and a will that outlived its connection hands
+// in the one captured when it was scheduled, because the connection context is
+// cancelled by then.
+type origin struct {
+	ctx       context.Context
+	clientID  string
+	connID    ConnectionID
+	username  string
+	namespace string
+}
+
+// checkACL runs the ACL hook of an authorization decision under Config.AuthTimeout.
+// An expired call is a denial: a client whose ACL cannot answer in time is not
+// given the benefit of the doubt. The built-in AllowAll cannot block, so it takes
+// the synchronous path and keeps the hot publish path free of a goroutine.
+func (b *Broker) checkACL(ctx context.Context, session SessionInfo, topic string, action AclAction) bool {
+	if _, builtin := b.cfg.ACL.(AllowAll); builtin {
+		return b.cfg.ACL.Check(ctx, session, topic, action)
+	}
+	timeout := b.cfg.AuthTimeout
+	if timeout <= 0 {
+		return b.cfg.ACL.Check(ctx, session, topic, action)
+	}
+	aclCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() { done <- b.cfg.ACL.Check(aclCtx, session, topic, action) }()
+	select {
+	case allowed := <-done:
+		return allowed
+	case <-aclCtx.Done():
+		if errors.Is(aclCtx.Err(), context.DeadlineExceeded) {
+			if b.log != nil {
+				b.log.Warn("gmqx ACL check deadline exceeded", "client", session.ClientID,
+					"topic", topic, "action", action, "timeout", timeout)
+			}
+			b.metrics.RecordDroppedMessage("acl_timeout")
+		}
+		return false
+	}
+}
+
+// authenticate calls the authentication hook under Config.AuthTimeout. An expired
+// call is an authentication failure: a client whose Authenticator does not answer
+// in time is refused, never admitted.
+func (b *Broker) authenticate(ctx context.Context, info ConnectInfo) error {
+	switch b.cfg.Auth.(type) {
+	case AllowAll, DenyAll:
+		return b.cfg.Auth.Authenticate(ctx, info)
+	}
+	timeout := b.cfg.AuthTimeout
+	if timeout <= 0 {
+		return b.cfg.Auth.Authenticate(ctx, info)
+	}
+	authCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.cfg.Auth.Authenticate(authCtx, info) }()
+	select {
+	case err := <-done:
+		return err
+	case <-authCtx.Done():
+		if errors.Is(authCtx.Err(), context.DeadlineExceeded) {
+			if b.log != nil {
+				b.log.Warn("gmqx authentication deadline exceeded", "client", info.ClientID,
+					"remote", info.RemoteAddr, "timeout", timeout)
+			}
+			b.metrics.RecordDroppedMessage("auth_timeout")
+			return fmt.Errorf("%w: authentication timeout after %v", ErrUnauthorized, timeout)
+		}
+		return fmt.Errorf("%w: connection closed during authentication", ErrUnauthorized)
+	}
 }
 
 // callSink runs the sink, optionally with a bounded wait. Without a configured
@@ -955,7 +1206,21 @@ func (b *Broker) SpreadPublication(ctx context.Context, pub Publication) error {
 	return nil
 }
 
-// spreadKick tells peer nodes of this namespace to drop a kicked client.
+// spreadKick tells peer nodes of this namespace to drop the connection they hold
+// for clientID. Every successful CONNECT spreads one, in both connect modes: the
+// session a client takes over may live on another node, and there it has to be
+// closed now — the reference implementation of this broker family spreads a
+// CLOSE on connect for exactly this reason. Without it a reconnect to a different
+// node leaves a zombie connection behind until its keep-alive expires, and every
+// delivery is duplicated until then.
+//
+// The event names a client id, not a topic, so it goes to every peer rather than
+// only to the nodes with a matching subscription summary. Namespace and
+// deduplication are the ones every cluster event uses: the namespace travels with
+// the event and a backend refuses to produce it for another scope; the built-in
+// backends stamp Origin and Seq on locally produced events and drop an event
+// whose origin is the receiving node, so a re-broadcast topology cannot loop and
+// a redelivered kick is applied once.
 func (b *Broker) spreadKick(ctx context.Context, clientID string) {
 	if b.cfg.ClusterBackend == nil || clientID == "" {
 		return
@@ -1023,20 +1288,34 @@ func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 	}
 }
 
-// OnRemoteKick implements ClusterHandler. A kick for another namespace is
-// dropped: a client id is only unique inside its namespace, so applying it would
-// close an unrelated session that happens to share the id.
+// OnRemoteKick implements ClusterHandler. A peer node reports that a client id it
+// accepted is connected elsewhere (every successful CONNECT spreads one, see
+// spreadKick), so a connection this node holds for that id is a zombie and is
+// displaced: an MQTT 5 client gets DISCONNECT 0x8E (Session taken over) and the
+// socket, then the will is not published (the session moved, it did not die).
+// Config.NotKickSeconds is not applied here: this node cannot know whether the
+// peer's connection is older than the window, and a kick that is refused would
+// reintroduce the zombie this event exists to remove.
+//
+// A kick for another namespace is dropped: a client id is only unique inside its
+// namespace, so applying it would close an unrelated session that happens to
+// share the id.
 func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 	if msg.Namespace != b.namespace {
 		b.metrics.RecordDroppedMessage("cluster_namespace")
 		b.log.Debug("gmqx remote kick dropped", "namespace", msg.Namespace, "client", msg.ClientID)
 		return
 	}
+	key := namespaceKey(b.namespace, msg.ClientID)
+	// The peer accepted this client id, so its session is alive: a will this node
+	// was still holding for it (from the connection a previous take-over ended)
+	// belongs to a session that has come back.
+	b.cancelPendingWill(key)
 	b.mu.RLock()
-	c := b.clients[namespaceKey(b.namespace, msg.ClientID)]
+	c := b.clients[key]
 	b.mu.RUnlock()
 	if c != nil {
-		c.close(false)
+		c.displace()
 	}
 }
 

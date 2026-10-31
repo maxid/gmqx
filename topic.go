@@ -33,6 +33,20 @@ func validFilter(filter string) bool {
 	return true
 }
 
+// sharedSubscriptionPrefix introduces a shared subscription filter
+// ("$share/<group>/<filter>", MQTT 5 §4.8.2).
+const sharedSubscriptionPrefix = "$share/"
+
+// isSharedSubscription reports whether filter is a shared subscription filter.
+// This broker does not implement shared subscriptions — its CONNACK advertises
+// Shared Subscription Available 0 — so the caller refuses such a filter instead
+// of storing it as a literal that can never match: it is not a topic name a
+// publisher could use, so the subscription would be accepted and then stay
+// silent forever.
+func isSharedSubscription(filter string) bool {
+	return strings.HasPrefix(filter, sharedSubscriptionPrefix)
+}
+
 // matchTopic reports whether an MQTT topic filter matches a topic.
 func matchTopic(filter, topic string) bool {
 	fs := strings.Split(filter, "/")

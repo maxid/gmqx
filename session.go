@@ -179,12 +179,13 @@ func (b *Broker) saveStoredSession(key string, c *client) {
 // now + Session Expiry Interval; a zero interval does not reach this point
 // because such a session is not persistent at all — the session ends with the
 // connection, which is also why a CONNECT with a zero interval can resume a
-// stored session but never creates one.
+// stored session but never creates one. The interval is counted in the broker's
+// protocol second (Config.unit), which is time.Second outside the tests.
 func (c *client) sessionExpiryDeadline() time.Time {
 	if c.version != mqtt.Version5 || c.info.SessionExpiry == 0 {
 		return time.Time{}
 	}
-	return time.Now().Add(time.Duration(c.info.SessionExpiry) * time.Second)
+	return time.Now().Add(time.Duration(c.info.SessionExpiry) * c.broker.second())
 }
 
 // maxSessionSweepPerTick bounds how many stored sessions one sweep tick examines,

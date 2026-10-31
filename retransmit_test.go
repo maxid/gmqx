@@ -135,10 +135,18 @@ func TestOutboundQoS2HandshakeRetransmitsPubrel(t *testing.T) {
 	expectNoMessage(t, sub, 6*interval)
 }
 
-// TestInflightWindowSkipsInsteadOfBlocking pins the window rule: an outbound
-// QoS 1 delivery that would exceed MaxInflightQoS1 is skipped and counted, and the
-// publishing goroutine is never blocked by a subscriber that does not confirm.
-func TestInflightWindowSkipsInsteadOfBlocking(t *testing.T) {
+// TestInflightWindowQueuesInsteadOfDropping pins the window rule: an outbound
+// QoS 1 delivery that would exceed MaxInflightQoS1 waits in the connection's
+// inflight queue instead of being skipped, the publishing goroutine is never
+// blocked by a subscriber that does not confirm, and the acknowledgement that
+// frees the slot delivers the queued message.
+//
+// This is the case that used to assert the defect: it required the second
+// delivery to be dropped and counted as "inflight_full" even though the
+// publisher had already been acknowledged. A dropped QoS 1 delivery is lost with
+// nobody noticing, so the case now asserts that the delivery is queued and sent
+// when the window opens.
+func TestInflightWindowQueuesInsteadOfDropping(t *testing.T) {
 	metrics := newDeliveryMetrics()
 	b := startBroker(t, Config{Metrics: metrics, MaxInflightQoS1: 1})
 
@@ -146,8 +154,8 @@ func TestInflightWindowSkipsInsteadOfBlocking(t *testing.T) {
 	subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "window/x", QoS: 1})
 	pub, _ := mustConnect(t, b.Addr(), confConnect{clientID: "window-pub", clean: true})
 
-	// Both publishes are acknowledged to the publisher: the second one is skipped
-	// for the subscriber, not stalled.
+	// Both publishes are acknowledged to the publisher: the second one waits in the
+	// subscriber's inflight queue, it is not lost.
 	pub.mustPublish(t, confPublish{topic: "window/x", payload: "one", qos: 1, pid: 1})
 	pub.mustPublish(t, confPublish{topic: "window/x", payload: "two", qos: 1, pid: 2})
 
@@ -155,15 +163,32 @@ func TestInflightWindowSkipsInsteadOfBlocking(t *testing.T) {
 	if string(first.Payload) != "one" {
 		t.Fatalf("delivered payload = %q, want the first message", first.Payload)
 	}
+	// The window is full, so nothing else goes out — and nothing is dropped.
 	expectNoMessage(t, sub, 100*time.Millisecond)
-	waitFor(t, "the skipped delivery to be counted", func() bool { return metrics.count("inflight_full") == 1 })
+	if n := metrics.count("inflight_overflow"); n != 0 {
+		t.Fatalf("inflight_overflow drops = %d, want 0: a full window queues", n)
+	}
+	if n := metrics.count("inflight_full"); n != 0 {
+		t.Fatalf("inflight_full drops = %d, want 0: the old skip is gone", n)
+	}
 
-	// Confirming the first message frees the window, so the next one is delivered.
+	// Confirming the first message frees the window: the queued delivery goes out
+	// by itself, still at QoS 1 and still in order.
 	sub.write(&mqtt.Puback{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}, PacketID: first.PacketID})
+	second := expectPublish(t, sub)
+	if string(second.Payload) != "two" {
+		t.Fatalf("delivery after the window opened = %q, want \"two\"", second.Payload)
+	}
+	if second.QoS != 1 || second.PacketID == 0 || second.Dup {
+		t.Fatalf("queued delivery = qos%d pid%d dup%v, want a fresh QoS 1 PUBLISH", second.QoS, second.PacketID, second.Dup)
+	}
+	sub.write(&mqtt.Puback{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}, PacketID: second.PacketID})
+
+	// The queue is empty again, so a new publish is delivered without delay.
 	waitInflightEmpty(t, b, "window-sub")
 	pub.mustPublish(t, confPublish{topic: "window/x", payload: "three", qos: 1, pid: 3})
 	if got := expectPublish(t, sub); string(got.Payload) != "three" {
-		t.Fatalf("delivery after the window opened = %q, want \"three\"", got.Payload)
+		t.Fatalf("delivery after the queue drained = %q, want \"three\"", got.Payload)
 	}
 }
 

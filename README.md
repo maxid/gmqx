@@ -26,11 +26,22 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   whose default is the in-memory store of earlier versions.
 - QoS 0/1/2 flows with per-subscription QoS capping, broker-side outbound QoS 1/2
   retransmission (DUP on PUBLISH retries, PUBREL retries until PUBCOMP, one timer
-  per connection, capped exponential backoff) and inflight windows that skip
-  instead of blocking. An inbound QoS 2 handshake suppresses duplicates and is
+  per connection, capped exponential backoff) and inflight windows backed by a
+  bounded per-connection queue that delivers FIFO as slots free, instead of
+  blocking or dropping. An inbound QoS 2 handshake suppresses duplicates and is
   held to `MaxInflightQoS2` with PUBREC 0x97.
-- Retained messages, wildcard subscriptions (`+`/`#`), will messages with their
-  QoS, retain flag and properties, keepalive
+- One writer goroutine per connection with a bounded outbound queue and a write
+  deadline per packet (`MaxOutboundQueueSize`, `WriteTimeout`), so a peer that
+  stops reading cannot hold the publisher, a will publish or the cluster receive
+  goroutine.
+- Retained messages with MQTT 5 Message Expiry Interval (a replayed message
+  carries what is left of it, an elapsed one is not replayed and is deleted),
+  wildcard subscriptions (`+`/`#`), will messages with their QoS, retain flag and
+  properties, and MQTT 5 Will Delay Interval (published after the delay, cancelled
+  by a reconnect, cut short by session expiry), keepalive
+- CONNECT-phase and authorization deadlines: `ConnectTimeout` closes a socket
+  that never completes its CONNECT, `AuthTimeout` bounds `Authenticate` and
+  `ACL.Check` and treats an expired call as a refusal
 - Wire-level MQTT 3.1.1/5 conformance suite (`TestConformance`)
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
   `MetricsManager`, `Interceptor`
@@ -47,7 +58,12 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   matching, retained state and the cluster subscription summaries/events, so a
   publish of one namespace never reaches a session of another; the default empty
   namespace keeps single-namespace deployments unchanged
-- Connect modes: `UNIQUE` / `KICK` (client id takeover)
+- Connect modes: `UNIQUE` / `KICK` (client id takeover, DISCONNECT 0x8E for the
+  displaced MQTT 5 client, `NotKickSeconds` anti-flap window, and a connect-time
+  kick that closes a duplicate connection on another node in both modes)
+- Capabilities the CONNACK advertises as unavailable are refused, not silently
+  ignored: a `$share/...` filter gets SUBACK 0x9E (0x80 on MQTT 3.1.1) and a
+  SUBSCRIBE carrying a Subscription Identifier gets DISCONNECT 0x9A
 - Limits: max connections, max subscriptions, max retained messages, inflight
   windows per direction, offline queue size per session and globally, connection
   rate limiting
@@ -112,12 +128,19 @@ Broker and client share one process, so no third-party MQTT client is needed.
 | `TLS` | disabled | `Enabled`, `Cert`, `Key`, `CA`, `RequireClientCert` |
 | `MaxPacketSize` | 4 MiB | inbound packet limit |
 | `ConnectMode` | `UNIQUE` | reject or kick an existing client id |
+| `NotKickSeconds` | 30 | anti-flap window of a takeover in `KICK` mode (negative: no window) |
+| `ConnectTimeout` | 10 s | CONNECT-phase read deadline; a socket that says nothing is closed |
+| `AuthTimeout` | 5 s | bound on `Authenticate` and `ACL.Check`; an expiry is a refusal (negative: no bound) |
+| `MaxWillDelayInterval` | 5 min | largest MQTT 5 Will Delay Interval honoured (negative: unbounded) |
 | `MaxConnections` | 0 (unlimited) | concurrent connection limit |
 | `MaxTopicSubscriptions` | 0 | per-session subscription limit |
 | `MaxRetainMessages` | 0 | retained message count limit |
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
 | `MaxInflightQoS1` | 64 | unconfirmed QoS 1 PUBLISHes per connection (negative: unlimited) |
 | `MaxInflightQoS2` | 64 | QoS 2 exchanges per connection and direction (negative: unlimited) |
+| `MaxInflightQueueSize` | 256 | QoS 1/2 deliveries per connection waiting for a free inflight slot |
+| `MaxOutboundQueueSize` | 256 | packets queued for a connection's writer goroutine |
+| `WriteTimeout` | 5 s | write deadline of one packet; a wedged socket is closed |
 | `QoSRetryInterval` | 5 s | base retransmission interval, doubled per attempt |
 | `QoSMaxRetries` | 5 | retransmissions per exchange before giving up (negative: none) |
 | `MaxOfflineQueueSize` | 1000 | messages queued per offline session; the oldest is dropped |
@@ -135,6 +158,11 @@ unbounded queue and an unbounded window both turn a slow client into unbounded
 broker memory. A negative value means unlimited (`MaxInflightQoS1`,
 `MaxInflightQoS2`, `MaxOfflineQueueSize`, `MaxTotalOfflineMessages`), no
 retransmission (`QoSMaxRetries`) or no sweeper (`SessionSweepInterval`).
+`MaxInflightQueueSize`, `MaxOutboundQueueSize`, `WriteTimeout` and
+`ConnectTimeout` have no unlimited setting: a non-positive value selects the
+default, because those four are the guards that keep one slow or silent client
+from costing the broker unbounded memory, a stalled goroutine or a connection slot
+that never completes its CONNECT.
 
 Remaining MQTT 5 properties/semantics (receive maximum, packet limits), QoS 2 state
 across a reconnect and the client library are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
@@ -230,19 +258,123 @@ DUP — not copied). QoS 2 runs PUBLISH → PUBREC → PUBREL → PUBCOMP, and t
 is retried until the PUBCOMP arrives. `MaxInflightQoS1` bounds the unconfirmed
 QoS 1 PUBLISHes of a connection; `MaxInflightQoS2` bounds its QoS 2 exchanges in
 each direction (an inbound QoS 2 PUBLISH over the window is answered with PUBREC
-0x97 Quota exceeded on MQTT 5). A delivery that would exceed its window is
-skipped and counted (`RecordDroppedMessage("inflight_full")`): a slow or absent
-client never blocks the publishing goroutine or the cluster fan-out. Every timer
-and goroutine ends with its connection; the session sweeper is waited for by
-`Stop`.
+0x97 Quota exceeded on MQTT 5).
+
+**Inflight queue.** A QoS 1/2 delivery that would exceed its window waits in the
+connection's inflight queue, in arrival order, and is sent when the
+acknowledgement of an older message frees a slot — a slow subscriber costs memory,
+not messages, and the publisher is never blocked. The queue is bounded
+(`MaxInflightQueueSize`, default 256): only a delivery that finds it full is
+dropped, and that drop is counted twice
+(`RecordDroppedMessage("inflight_overflow")`, `RecordOverflow("inflight")`) and
+logged at Warn level with the client id, because the publisher's PUBACK has
+already promised the message to the sink. The queue is per connection, so it ends
+with the connection; its messages are not stored in the session like the offline
+queue.
+
+**Writer.** Every packet leaves through one writer goroutine per connection, in
+the order it was queued: PUBLISHes, PUBACK/PUBREC/PUBREL/PUBCOMP, SUBACK, PINGRESP.
+The queue behind it is bounded (`MaxOutboundQueueSize`, default 256 packets) and
+every write carries a deadline (`WriteTimeout`, default 5 s), so a peer that stops
+reading cannot hold the publisher's read loop, the will publish of a closing
+connection or the single cluster receive goroutine of the node. A full queue drops
+a QoS 0 PUBLISH and counts it (`RecordDroppedMessage("outbound_queue_full")`,
+`RecordOverflow("outbound_queue")`); for a QoS 1/2 PUBLISH or an acknowledgement it
+disconnects the slow consumer instead (`RecordDroppedMessage("slow_consumer")` and
+a Warn log), which is the trade-off that prefers a visible reconnect over an
+invisible loss. The queue is bounded in packets, not in bytes, so one connection
+holds at most `MaxOutboundQueueSize` packets of at most `MaxPacketSize` bytes.
+Both goroutines and the retransmission timer end with the connection and are
+joined by `close`; the session sweeper is waited for by `Stop`.
 
 Deliberate limitations, all documented above with their reason: an inflight
-exchange is per connection, so a reconnect resumes the offline queue but not the
-unconfirmed deliveries of the previous connection; an inbound QoS 2 exchange is
-dropped when the connection closes (as in the reference); the queue is local to
-the node that received the publication, and the subscription summary a cluster
-peer advertises covers live sessions only, so a publication on another node does
-not queue for an offline session here.
+exchange and the inflight queue behind it are per connection, so a reconnect
+resumes the offline queue but not the unconfirmed or queued deliveries of the
+previous connection; an inbound QoS 2 exchange is dropped when the connection
+closes (as in the reference); the queue is local to the node that received the
+publication, and the subscription summary a cluster peer advertises covers live
+sessions only, so a publication on another node does not queue for an offline
+session here.
+
+## Takeover, delayed wills and retained expiry
+
+**Takeover.** A CONNECT with a client id that is already connected is a takeover.
+In `UNIQUE` mode the new connection is refused (CONNACK 0x85 on MQTT 5, return
+code 2 on 3.1.1). In `KICK` mode it takes the session over: the displaced
+connection gets a server `DISCONNECT` with reason code 0x8E (Session taken over)
+on MQTT 5 and is closed — MQTT 3.1.1 has no server DISCONNECT and only sees the
+close — and its session state moves to the new connection.
+
+`NotKickSeconds` (default 30) is the anti-flap window of that displacement: a
+takeover of a connection that began less than the window ago is refused with
+CONNACK 0x9F (Connection rate exceeded) on MQTT 5 and return code 3 (Server
+unavailable) on 3.1.1, so two ends of one client id cannot displace each other in
+a loop. 0x9F is the reason code MQTT 5 keeps for a rate-limited connection; 0x8A
+(Banned) would claim an administrative ban, 0x89 (Server busy) a whole-server
+overload and 0x9C (Use another server) a redirection this broker cannot offer. A
+negative `NotKickSeconds` disables the window and makes every CONNECT take the
+session over immediately — the behavior before the window existed, and the one
+MQTT itself prescribes.
+
+**Takeover across nodes.** Every successful CONNECT spreads a kick to the
+cluster, in both connect modes: a client that reconnects to another node
+otherwise leaves a connection behind that duplicates every delivery until its
+keep-alive expires. The receiving node displaces its copy exactly as a local
+takeover does (DISCONNECT 0x8E on MQTT 5) and cancels a delayed will it was
+holding for that client id. The event names a client id, not a topic, so it goes
+to every peer, and the usual namespace and `(Origin, Seq)` deduplication rules
+apply. `NotKickSeconds` is enforced on the node that receives the CONNECT only:
+the peer side cannot know how old this node's connection is, which would need a
+cluster presence view (see [ROADMAP.md](ROADMAP.md)).
+
+**Will Delay Interval.** MQTT 5 lets the WILL of a connection ask for a delay. The
+will is published when the earlier of two things happens: the delay elapses, or
+the session ends.
+
+- A session that ends with its connection (Clean Start set, or a zero Session
+  Expiry Interval) publishes its will immediately, because the delay cannot
+  outlive the session it belongs to.
+- Otherwise the will is scheduled for `min(Will Delay Interval,
+  MaxWillDelayInterval, remaining Session Expiry Interval)`: a session that
+  expires inside the delay publishes its will at the expiry.
+- A CONNECT that resumes the session cancels the pending will, locally or — via
+  the connect-time kick — on the node that still holds it. A CONNECT with Clean
+  Start set discards the session instead of resuming it, so the will of the
+  previous connection is published at that CONNECT.
+- A broker that stops drops what is still pending: there is nowhere left to
+  publish it and no timer may outlive `Stop`.
+
+Scheduling is one timer per pending will (not a broker-wide ticker) and it exists
+only while the will waits. A delay longer than `MaxWillDelayInterval` (default
+5 min) is clamped to the bound and counted with `RecordOverflow("will_delay")`.
+The wire value is whole seconds, so a millisecond-scale test shortens the broker's
+protocol second (`Config.unit`, unexported, `time.Second` in production).
+
+**Retained message expiry.** The MQTT 5 Message Expiry Interval of a retained
+publish is stored as a deadline (publish time plus the interval), not as a value.
+On replay the broker skips and deletes a message whose deadline passed
+(`RecordDroppedMessage("retained_expired")`) and advertises what is left of the
+interval — rounded up, because a rounded-down zero would mean "never expires" on
+the wire — instead of replaying the stale published value. A retained message
+without an interval never expires. Deletion happens when the broker looks at the
+message (the replay of a matching SUBSCRIBE), so a stale retained message nobody
+subscribes to costs one map entry until the next matching subscription. A
+replicated retained publish is stamped with its arrival on the receiving node,
+because the cluster event does not carry the origin's publish time.
+
+**CONNECT and authorization deadlines.** `ConnectTimeout` (default 10 s) arms a
+read deadline before the first packet is read and clears it once the CONNACK is
+written; the read loop then arms the keep-alive deadline it owns. A client that
+opens the socket and sends nothing, or sends its CONNECT too slowly, is therefore
+disconnected instead of holding a connection slot, a goroutine and a session
+forever. `AuthTimeout` (default 5 s) bounds `AuthManager.Authenticate` and
+`AclManager.Check`: the hook runs in its own goroutine with a context that carries
+the deadline, and an expired call is a refusal — a failed authentication
+(CONNACK 0x87) or a denied authorization (SUBACK 0x87 / no success PUBACK) —
+never a success. The built-in `AllowAll` hooks take the synchronous path, so a
+broker that keeps the defaults pays no goroutine per publish; a negative
+`AuthTimeout` disables the bound and calls the hook synchronously, which then has
+to honour its context itself.
 
 ## Transport layering
 
@@ -354,8 +486,11 @@ broker does not replay the value to a session that is already connected.
 | `MaxSummaryFilters` | 256 | advertised filters per node |
 | `Metrics` / `Logger` | none / `slog.Default()` | drop counters / membership log |
 
-With `ConnectModeKick`, each successful connect broadcasts a kick, so client-id
-takeover drops the old session even when it lives on another node.
+Every successful connect broadcasts a kick, in both connect modes, so a client-id
+takeover drops the old session even when it lives on another node (`UNIQUE`
+decides locally only, because a node cannot see its peers' sessions). The
+displaced connection gets a DISCONNECT 0x8E on MQTT 5, and a delayed will the
+peer was holding for that client id is cancelled. See the takeover section above.
 
 Delivery between nodes stays best-effort: a publish that arrives while a peer's
 summary is unknown is sent to that peer, but a subscriber whose subscription is

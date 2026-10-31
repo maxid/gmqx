@@ -205,7 +205,10 @@ func TestConnectModeUniqueRejectsSecondClient(t *testing.T) {
 }
 
 func TestConnectModeKickAcceptsSecondClient(t *testing.T) {
-	b := startBroker(t, Config{ConnectMode: ConnectModeKick})
+	// NotKickSeconds -1 disables the anti-flap window, so the second CONNECT
+	// takes the session over immediately — the behavior this test pins. The
+	// window itself is covered by TestTakeoverAntiFlapWindow.
+	b := startBroker(t, Config{ConnectMode: ConnectModeKick, NotKickSeconds: -1})
 	old := dialTestClient(t, b.Addr(), "dup")
 	if code := dialRawConnack(t, b.Addr(), "dup"); code != 0 {
 		t.Fatalf("expected CONNACK 0 in KICK mode, got %d", code)

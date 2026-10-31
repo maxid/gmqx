@@ -22,9 +22,16 @@
   投递，并在过期间隔到达后由有界清扫器删除。状态位于 `SessionStore` 接缝之后
   （`Load`/`Save`/`Delete`/`Keys`），默认即为早期版本的内存存储。
 - QoS 0/1/2 流程（按订阅 QoS 降级）、broker 侧出站 QoS 1/2 重传（PUBLISH 重传带 DUP、
-  PUBREL 重传到 PUBCOMP、每连接一个定时器、有上限的指数退避）以及“跳过而不阻塞”的
-  inflight 窗口。入站 QoS 2 握手抑制重复，并受 `MaxInflightQoS2` 约束（PUBREC 0x97）。
-- 保留消息、通配符订阅（`+`/`#`）、带 QoS/retain/属性的遗嘱消息、keepalive
+  PUBREL 重传到 PUBCOMP、每连接一个定时器、有上限的指数退避）以及由每连接有界队列支撑的
+  inflight 窗口：窗口满时按 FIFO 排队、腾出位置后再投递，既不阻塞也不丢弃。入站 QoS 2
+  握手抑制重复，并受 `MaxInflightQoS2` 约束（PUBREC 0x97）。
+- 每连接一个写协程，配上有界出站队列与每包写超时（`MaxOutboundQueueSize`、`WriteTimeout`），
+  因此停止读取的对端无法拖住发布方、遗嘱发布或集群接收协程。
+- 保留消息（含 MQTT 5 Message Expiry Interval：回放时携带剩余间隔，已过期的不再回放并删除）、
+  通配符订阅（`+`/`#`）、带 QoS/retain/属性的遗嘱消息、MQTT 5 Will Delay Interval
+  （延迟到期发布、被重连取消、被会话过期提前触发）、keepalive
+- CONNECT 阶段与鉴权时限：`ConnectTimeout` 关闭永远不完成 CONNECT 的连接，
+  `AuthTimeout` 限制 `Authenticate` 与 `ACL.Check`，超时视为拒绝
 - 线级 MQTT 3.1.1/5 一致性测试套件（`TestConformance`）
 - 可插拔钩子：`AuthManager`、`AclManager`、`EventSink`（生命周期/消息）、
   `MetricsManager`、`Interceptor`
@@ -37,7 +44,10 @@
 - 命名空间隔离：`Config.Namespace` 划分会话表、订阅匹配、保留状态以及集群订阅摘要/事件，
   一个命名空间的 publish 永远不会到达另一命名空间的会话；默认空命名空间
   保持单命名空间部署的行为不变
-- 连接模式：`UNIQUE` / `KICK`（client id 接管）
+- 连接模式：`UNIQUE` / `KICK`（client id 接管；MQTT 5 上被顶掉的连接收到 DISCONNECT 0x8E，
+  `NotKickSeconds` 防抖窗口，以及两种模式下都会关闭其他节点上重复连接的 CONNECT 时 kick）
+- CONNACK 宣告为不可用的能力会被显式拒绝而不是静默忽略：`$share/...` 过滤器回 SUBACK 0x9E
+  （MQTT 3.1.1 回 0x80），带 Subscription Identifier 的 SUBSCRIBE 回 DISCONNECT 0x9A
 - 限制：最大连接数、最大订阅数、最大保留消息数、每个方向的 inflight 窗口、
   每会话与全局离线队列长度、连接速率限制
 - 优雅关闭与 client-id 会话接管
@@ -100,12 +110,19 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 | `TLS` | 禁用 | `Enabled`、`Cert`、`Key`、`CA`、`RequireClientCert` |
 | `MaxPacketSize` | 4 MiB | 入站数据包上限 |
 | `ConnectMode` | `UNIQUE` | 拒绝或踢掉已存在的 client id |
+| `NotKickSeconds` | 30 | `KICK` 模式下接管的防抖窗口（负值：不设窗口） |
+| `ConnectTimeout` | 10 s | CONNECT 阶段读超时；只建连不发 CONNECT 的连接会被关闭 |
+| `AuthTimeout` | 5 s | `Authenticate` 与 `ACL.Check` 的时限；超时即拒绝（负值：不限） |
+| `MaxWillDelayInterval` | 5 min | 允许的最长 MQTT 5 Will Delay Interval（负值：不限） |
 | `MaxConnections` | 0（不限） | 并发连接数限制 |
 | `MaxTopicSubscriptions` | 0 | 每会话订阅数限制 |
 | `MaxRetainMessages` | 0 | 保留消息数量限制 |
 | `ConnectionRateLimit` | 0 | 连接数/秒的令牌桶 |
 | `MaxInflightQoS1` | 64 | 每连接未确认的 QoS 1 PUBLISH 数（负值：不限） |
 | `MaxInflightQoS2` | 64 | 每连接每个方向的 QoS 2 交换数（负值：不限） |
+| `MaxInflightQueueSize` | 256 | 每连接等待空闲 inflight 位置的 QoS 1/2 投递数 |
+| `MaxOutboundQueueSize` | 256 | 每连接写协程的出站队列长度（包数） |
+| `WriteTimeout` | 5 s | 单个数据包的写超时；超时即关闭卡住的连接 |
 | `QoSRetryInterval` | 5 s | 重传基准间隔，每次尝试翻倍 |
 | `QoSMaxRetries` | 5 | 每个交换放弃前的重传次数（负值：不重传） |
 | `MaxOfflineQueueSize` | 1000 | 每个离线会话的队列上限；满时丢弃最旧的 |
@@ -120,7 +137,10 @@ broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
 随离线队列与 inflight 窗口新增的投递限制刻意有界：未设置时取文档中的默认值，因为无界
 队列与无界窗口都会把慢速客户端变成无界的 broker 内存。负值表示不限
 （`MaxInflightQoS1`、`MaxInflightQoS2`、`MaxOfflineQueueSize`、`MaxTotalOfflineMessages`）、
-不重传（`QoSMaxRetries`）或不做清理（`SessionSweepInterval`）。
+不重传（`QoSMaxRetries`）或不做清理（`SessionSweepInterval`）。`MaxInflightQueueSize`、
+`MaxOutboundQueueSize`、`WriteTimeout` 与 `ConnectTimeout` 没有“不限”设置：非正值一律
+取默认值，因为这四项正是防止单个慢速或沉默客户端占掉无界内存、卡住协程、或长期占用一个
+永远不完成 CONNECT 的连接槽的护栏。
 
 其余 MQTT 5 属性/语义（receive maximum、数据包上限）、跨重连的 QoS 2 状态与客户端库
 都在路线图中（见 [ROADMAP.md](ROADMAP.md)）。
@@ -192,14 +212,83 @@ DUP 标志与原始 packet id（参考实现从不设置 DUP——不复制该�
 PUBLISH → PUBREC → PUBREL → PUBCOMP，PUBREL 会重传直到收到 PUBCOMP。
 `MaxInflightQoS1` 限制连接的未确认 QoS 1 PUBLISH 数；`MaxInflightQoS2` 限制其每个方向的
 QoS 2 交换数（入站 QoS 2 PUBLISH 超出窗口时在 MQTT 5 上回复 PUBREC 0x97 Quota exceeded）。
-会超出窗口的投递被跳过并计数（`RecordDroppedMessage("inflight_full")`）：慢速或离线的
-客户端永远不会阻塞发布协程或集群扇出。所有定时器与协程都随连接结束；会话清扫器由 `Stop`
-等待（不留下 goroutine 与定时器）。
 
-有意保留的限制（上文均给出原因）：inflight 交换属于连接，因此重连会恢复离线队列但不会
-恢复上一次连接中未确认的投递；入站 QoS 2 交换在连接关闭时丢弃（与参考实现一致）；队列
-位于收到该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，因此其他节点上的
-publish 不会在此处为离线会话排队。
+**inflight 队列。** 会超出窗口的 QoS 1/2 投递按到达顺序进入该连接的 inflight 队列，并在
+更早消息的确认腾出位置后发送：慢速订阅者只花内存，不丢消息，发布方也不会被阻塞。队列有界
+（`MaxInflightQueueSize`，默认 256）：只有队列本身已满时才丢弃，而该丢弃会被计数两次
+（`RecordDroppedMessage("inflight_overflow")`、`RecordOverflow("inflight")`）并以 Warn
+级别带 client id 记录日志——发布方收到的 PUBACK 已经代表 sink 接受了这条消息，丢失必须
+可见。队列属于连接，随连接结束，不会像离线队列那样写入会话。
+
+**写协程。** 每个连接的所有数据包都由同一写协程按入队顺序发出：PUBLISH、PUBACK/PUBREC/
+PUBREL/PUBCOMP、SUBACK、PINGRESP。其队列有界（`MaxOutboundQueueSize`，默认 256 个包），
+每次写都带超时（`WriteTimeout`，默认 5 秒），因此停止读取的对端无法拖住发布方读循环、
+关闭连接时的遗嘱发布，或节点唯一的集群接收协程。队列满时 QoS 0 PUBLISH 被丢弃并计数
+（`RecordDroppedMessage("outbound_queue_full")`、`RecordOverflow("outbound_queue")`）；
+对 QoS 1/2 PUBLISH 或确认包则改为断开慢速消费者（`RecordDroppedMessage("slow_consumer")`
+并记录 Warn 日志）——这一取舍宁可让重连可见，也不让消息无声丢失。队列按包数而非字节数
+有界，因此单个连接最多占用 `MaxOutboundQueueSize` 个、每个不超过 `MaxPacketSize` 字节的
+数据包。两个协程与重传定时器都随连接结束，并由 `close` 等待；会话清扫器由 `Stop` 等待。
+
+有意保留的限制（上文均给出原因）：inflight 交换及其队列属于连接，因此重连会恢复离线队列
+但不会恢复上一次连接中未确认或已排队的投递；入站 QoS 2 交换在连接关闭时丢弃（与参考
+实现一致）；队列位于收到该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，
+因此其他节点上的 publish 不会在此处为离线会话排队。
+
+## 接管、延迟 will 与保留消息过期
+
+**接管（takeover）。** 用一个已在线的 client id 发 CONNECT 就是一次接管。`UNIQUE` 模式下
+新连接被拒绝（MQTT 5 回 CONNACK 0x85，3.1.1 回返回码 2）。`KICK` 模式下新连接接管会话：
+被顶掉的连接在 MQTT 5 上先收到服务端 `DISCONNECT` 0x8E（Session taken over）再被关闭——
+MQTT 3.1.1 没有服务端 DISCONNECT，只能看到连接断开——会话状态转移到新连接。
+
+`NotKickSeconds`（默认 30）是这次顶替的防抖窗口：如果被顶替的连接建立不足该窗口，接管被
+拒绝，MQTT 5 回 CONNACK 0x9F（Connection rate exceeded），3.1.1 回返回码 3（Server
+unavailable），因此同一个 client id 的两端不会互相循环顶替。0x9F 正是 MQTT 5 为“连接被限速”
+保留的返回码；0x8A（Banned）会被理解为管理封禁，0x89（Server busy）是整机过载，0x9C（Use
+another server）是本 broker 无法给出的重定向。`NotKickSeconds` 取负值即取消窗口，每次
+CONNECT 都立即接管——这是窗口出现之前的行为，也是 MQTT 本身规定的行为。
+
+**跨节点接管。** 每次成功 CONNECT 都会向集群广播一次 kick，两种连接模式都一样：客户端重连到
+另一个节点时，旧节点上的连接否则会一直存活到 keepalive 过期，并在这段时间里重复投递每条
+消息。收到 kick 的节点和自己的本地接管一样处理（MQTT 5 上先发 DISCONNECT 0x8E），并取消它
+为该 client id 挂着的延迟 will。事件携带的是 client id 而不是 topic，所以发往所有对等节点，
+命名空间与 `(Origin, Seq)` 去重规则照旧。`NotKickSeconds` 只在收到 CONNECT 的节点上执行：
+对端无法知道本节点连接的年龄，那需要集群 presence 视图（见 [ROADMAP.md](ROADMAP.md)）。
+
+**Will Delay Interval。** MQTT 5 允许 WILL 指定延迟。will 在两件事中较早的一件发生时发布：
+延迟到期，或会话结束。
+
+- 会话随连接一起结束（Clean Start 置位，或 Session Expiry Interval 为 0）时 will 立即发布，
+  因为延迟不能长于它所依附的会话。
+- 其余情况按 `min(Will Delay Interval, MaxWillDelayInterval, 剩余 Session Expiry Interval)`
+  排期：在延迟之内过期的会话，其 will 在过期时刻发布。
+- 恢复该会话的 CONNECT 会取消待发布的 will，本地直接取消，在其他节点上则通过 CONNECT 时
+  广播的 kick 取消。带 Clean Start 的 CONNECT 不是恢复而是丢弃会话，此时上一连接的 will
+  在这次 CONNECT 时立即发布。
+- broker 停止时丢弃仍然挂着的 will：已经没有地方可发布，也不允许定时器活过 `Stop`。
+
+排期是“每个待发布 will 一个定时器”（不是全 broker 的 ticker），只在 will 等待期间存在。
+超过 `MaxWillDelayInterval`（默认 5 分钟）的延迟会被截断，并计入
+`RecordOverflow("will_delay")`。线格式上的延迟是整秒，所以毫秒级的测试会缩短 broker 的
+“协议秒”（`Config.unit`，非导出，生产环境恒为 `time.Second`）。
+
+**保留消息过期。** 保留发布带的 MQTT 5 Message Expiry Interval 以“截止时间”（发布时间加
+间隔）存储，而不是原样保存。回放时，已过截止时间的消息不再投递并从存储中删除（计入
+`RecordDroppedMessage("retained_expired")`）；仍在有效期内的消息回放的是“剩下的间隔”（向上
+取整，因为在线格式上取整成 0 意味着“永不过期”），而不是发布时的旧值。不带间隔的保留消息
+永不过期。删除发生在 broker 真正查看该消息时（匹配的 SUBSCRIBE 回放），因此一条没人订阅的
+过期保留消息会占用一个 map 条目，直到下一次匹配的订阅。从对等节点复制来的保留发布以到达
+本节点的时刻计时，因为集群事件不携带源节点的发布时刻。
+
+**CONNECT 与鉴权时限。** `ConnectTimeout`（默认 10 s）在读取第一个数据包之前设置读截止时间，
+在 CONNACK 写出后清除；随后由读循环设置它自己负责的 keepalive 截止时间。因此只建连不说话、
+或 CONNECT 发得太慢的客户端会被断开，而不是永久占用一个连接槽、一个协程和一个会话。
+`AuthTimeout`（默认 5 s）限制 `AuthManager.Authenticate` 与 `AclManager.Check`：钩子在自己的
+协程里运行，收到的 context 携带该截止时间；超时的调用一律视为拒绝——认证失败（CONNACK
+0x87）或授权不通过（SUBACK 0x87 / 不返回成功 PUBACK）——绝不视为成功。内建的 `AllowAll`
+走同步路径，所以保持默认配置的 broker 不会为每次发布多起一个协程；`AuthTimeout` 取负值即
+取消时限，此时钩子必须自己遵守 context。
 
 ## 传输分层
 
@@ -308,8 +397,10 @@ broker 不会向已经连接的会话重放该值。
 | `MaxSummaryFilters` | 256 | 每个节点通告的过滤器数量 |
 | `Metrics` / `Logger` | 无 / `slog.Default()` | 丢弃计数器 / 成员关系日志 |
 
-在 `ConnectModeKick` 下，每次成功连接都会广播一次 kick，因此 client-id
-接管即使在旧会话位于另一个节点时也会将其断开。
+每次成功连接都会广播一次 kick（两种连接模式都是），因此 client-id 接管即使在旧会话位于
+另一个节点时也会将其断开（`UNIQUE` 只在本地裁决，因为节点看不到对端会话）。被顶掉的连接在
+MQTT 5 上收到 DISCONNECT 0x8E，对端为该 client id 挂着的延迟 will 也会被取消。详见上面的
+接管一节。
 
 节点之间的投递始终保持尽力而为：某个对等节点摘要未知时到达的 publish
 仍会发送给该节点，但订阅尚未对发布节点可见（最多

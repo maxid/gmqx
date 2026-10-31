@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
-	github.com/maxid/gnety v0.0.0-20261030131557-4d99ac3c8ca6
+	github.com/maxid/gnety v0.0.0-20261031080901-7d8021d3c664
 	github.com/redis/go-redis/v9 v9.23.0
 )
 

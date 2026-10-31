@@ -251,8 +251,20 @@ func test5SubscriptionIdentifiers(t *testing.T) {
 	if ack.Properties.SubscriptionIdentifierAvailable == nil || *ack.Properties.SubscriptionIdentifierAvailable {
 		t.Fatalf("CONNACK subscription identifier available = %v, want false", ack.Properties.SubscriptionIdentifierAvailable)
 	}
+	t.Run("refused_because_unavailable", func(t *testing.T) {
+		// The capability is advertised as unavailable, so a SUBSCRIBE that asks
+		// for it is a protocol error (MQTT 5 §3.9.2.1.2): DISCONNECT 0x9A.
+		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-sub-id-request", clean: true})
+		c.write(&mqtt.Subscribe{
+			MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5},
+			PacketID:      1,
+			Properties:    mqtt.Properties{SubscriptionIdentifiers: []uint32{1}},
+			Subscriptions: []mqtt.Subscription{{Filter: "si/x", QoS: 0}},
+		})
+		expectDisconnect(t, c, 0x9A)
+	})
 	t.Run("association_round_trip", func(t *testing.T) {
-		t.Skip("subscription identifiers are not implemented: CONNACK advertises Subscription Identifier Available 0 (props.go connackProperties); README.md: \"Full MQTT 5 properties/semantics, full QoS 2 and the client library are on the roadmap\"")
+		t.Skip("no publication is tagged with a subscription identifier: CONNACK advertises Subscription Identifier Available 0 (props.go connackProperties) and a SUBSCRIBE carrying one is refused")
 	})
 }
 
@@ -540,13 +552,30 @@ func test5SharedSubscriptions(t *testing.T) {
 	if ack.Properties.SharedSubscriptionAvailable == nil || *ack.Properties.SharedSubscriptionAvailable {
 		t.Fatalf("CONNACK shared subscription available = %v, want false", ack.Properties.SharedSubscriptionAvailable)
 	}
+	t.Run("refused_because_unavailable", func(t *testing.T) {
+		// A "$share/..." filter must not be accepted as a literal filter: the
+		// refusal is per filter in the SUBACK (MQTT 5 §3.9), and the connection
+		// stays usable.
+		c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-shared-request", clean: true})
+		if codes := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "$share/g/t", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 0x9E {
+			t.Fatalf("SUBACK codes %v for \"$share/g/t\", want [0x9E]", codes)
+		}
+		c.write(&mqtt.Pingreq{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
+		readConf[*mqtt.Pingresp](t, c)
+	})
 	t.Run("round_robin", func(t *testing.T) {
-		t.Skip("shared subscriptions are not implemented: CONNACK advertises Shared Subscription Available 0 (props.go connackProperties)")
+		t.Skip("shared subscriptions are not implemented: CONNACK advertises Shared Subscription Available 0 (props.go connackProperties) and a \"$share/...\" filter is refused with SUBACK 0x9E")
 	})
 }
 
 func test5Auth(t *testing.T) {
-	t.Skip("AUTH is not implemented: CONNACK advertises no Authentication Method and gnety/codec/mqtt models no AUTH packet type (its Message types end at DISCONNECT)")
+	// Enhanced authentication is not negotiated: the CONNACK carries no
+	// Authentication Method, so an AUTH packet is a protocol error (MQTT 5
+	// 3.15.2) and the broker must say so rather than ignore the packet.
+	b := startBroker(t, Config{})
+	c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-auth", clean: true})
+	c.write(&mqtt.Auth{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}})
+	expectDisconnect(t, c, 0x82)
 }
 
 func test5ProtocolErrorDisconnect(t *testing.T) {
@@ -630,4 +659,14 @@ func test5QoS2Flow(t *testing.T) {
 	expectNoMessage(t, sub, 100*time.Millisecond)
 	pub.write(&mqtt.Pubrel{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}, PacketID: 31})
 	expectPubcomp(t, pub, 31)
+}
+
+// TestConformanceAuthNotNegotiated pins the enhanced-authentication rule: the
+// broker negotiates no Authentication Method, so an AUTH packet is a protocol
+// error and must be answered with DISCONNECT 0x82 rather than ignored.
+func TestConformanceAuthNotNegotiated(t *testing.T) {
+	b := startBroker(t, Config{})
+	c, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-auth-rule", clean: true})
+	c.write(&mqtt.Auth{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}, ReasonCode: 0x18})
+	expectDisconnect(t, c, 0x82)
 }

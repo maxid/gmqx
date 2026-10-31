@@ -20,6 +20,13 @@ var (
 	ErrClientIDInUse = errors.New("gmqx: client id already in use")
 	// ErrMaxConnections is returned when the configured connection limit is reached.
 	ErrMaxConnections = errors.New("gmqx: max connections reached")
+	// ErrTakeoverRateExceeded is returned in ConnectModeKick when a CONNECT would
+	// displace a live connection that began less than Config.NotKickSeconds ago:
+	// the anti-flap window refuses the take-over instead of letting two ends of one
+	// client id displace each other in a loop. The CONNACK that accompanies it is
+	// 0x9F (Connection rate exceeded) on MQTT 5 and return code 3 (Server
+	// unavailable) on MQTT 3.1.1.
+	ErrTakeoverRateExceeded = errors.New("gmqx: takeover inside the NotKickSeconds window")
 	// ErrClusterUnavailable reports that a cluster backend cannot reach the
 	// transport it fans out on (for example Redis). It is a retryable condition:
 	// the backend keeps its own loops running and recovers by itself, so a caller

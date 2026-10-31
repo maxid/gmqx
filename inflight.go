@@ -19,6 +19,17 @@ package gmqx
 // one. The goroutine ends with the connection context, which close cancels, so a
 // closed connection leaves neither a goroutine nor a timer behind.
 //
+// The window of a connection is a promise and a budget: MaxInflightQoS1/2 bound
+// how many exchanges may be unconfirmed at once. A delivery that would exceed its
+// window waits in the connection's pending queue (pending, bounded by
+// Config.MaxInflightQueueSize) instead of blocking the publishing goroutine — a
+// publisher has already been acknowledged by the sink and must not be stalled by
+// a slow subscriber — or being skipped: an acknowledgement that frees a slot
+// drains the queue in arrival order. Only a full pending queue drops a delivery,
+// and that drop is counted twice and logged with the client id (see sendPublish).
+// The pending queue belongs to the live connection, unlike the stored offline
+// queue of a persistent session, and it ends with the connection.
+//
 // The reference broker of this family retries every unacked PUBLISH but never
 // sets DUP and has no window at all; both are defects this implementation does
 // not copy. What is deliberately not carried over either: an inbound QoS 2
@@ -35,8 +46,8 @@ import (
 var (
 	// errClientClosed reports a write to a connection that is already gone.
 	errClientClosed = errors.New("gmqx: connection closed")
-	// errInflightFull reports an outbound QoS 1/2 delivery that was skipped
-	// because the connection's inflight window is full.
+	// errInflightFull reports an outbound QoS 1/2 delivery that was dropped: the
+	// connection's inflight window and the queue waiting behind it are both full.
 	errInflightFull = errors.New("gmqx: inflight window full")
 )
 
@@ -68,6 +79,19 @@ type inflightMessage struct {
 	// disabled, or the attempt cap was reached).
 	attempts int
 	due      time.Time
+}
+
+// pendingMessage is one outbound QoS 1/2 delivery that found no free slot in the
+// connection's inflight window. It keeps what a later PUBLISH needs — topic, QoS,
+// payload, retain flag, MQTT 5 properties — but no packet id: the id is assigned
+// when the delivery finally enters the window, so a queued message can never
+// collide with an exchange that is already retransmitting.
+type pendingMessage struct {
+	topic   string
+	payload []byte
+	qos     byte
+	retain  bool
+	props   mqtt.Properties
 }
 
 // retryDelay is the wait before retransmission number attempt (1-based): the base
@@ -111,6 +135,16 @@ func (c *client) inflightLimit(qos byte) int {
 		return c.broker.cfg.MaxInflightQoS2
 	}
 	return c.broker.cfg.MaxInflightQoS1
+}
+
+// inflightQueueLimit is how many deliveries of this connection may wait for a
+// free inflight slot. It is always bounded: a non-positive configuration (or a
+// broker built without the Config defaulting) selects the documented default.
+func (c *client) inflightQueueLimit() int {
+	if limit := c.broker.cfg.MaxInflightQueueSize; limit > 0 {
+		return limit
+	}
+	return defaultMaxInflightQueueSize
 }
 
 // windowFullLocked reports whether an outbound exchange of qos would exceed its
@@ -262,10 +296,10 @@ func (c *client) retransmitDue() {
 	}
 	for _, r := range batch {
 		if r.state == awaitPubcomp {
-			_ = c.writeMessage(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: r.packetID})
+			_ = c.send(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: r.packetID})
 			continue
 		}
-		_ = c.writeMessage(&mqtt.Publish{
+		_ = c.sendPublishFrame(&mqtt.Publish{
 			MessageHeader: c.header(),
 			Topic:         r.topic,
 			Payload:       r.payload,
@@ -285,10 +319,17 @@ func (c *client) retransmitDue() {
 // dropped, which is also what the reference broker does when its ids run out.
 func (c *client) writePublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.closed || c.writeClosed.Load() {
 		return errClientClosed
 	}
+	return c.writePublishLocked(topic, payload, qos, retain, props)
+}
+
+// writePublishLocked is writePublish with the connection lock already held, so the
+// window check and the registration of the exchange are one step and a delivery
+// can never slip past a window that is full. The caller holds c.mu.
+func (c *client) writePublishLocked(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	packetID := uint16(0)
 	var registered *inflightMessage
 	if qos > 0 {
@@ -316,9 +357,8 @@ func (c *client) writePublish(topic string, payload []byte, qos byte, retain boo
 			c.inflight[id] = registered
 		}
 	}
-	c.mu.Unlock()
 
-	err := c.writeMessage(&mqtt.Publish{
+	err := c.sendPublishFrame(&mqtt.Publish{
 		MessageHeader: c.header(),
 		Topic:         topic,
 		Payload:       payload,
@@ -328,12 +368,8 @@ func (c *client) writePublish(topic string, payload []byte, qos byte, retain boo
 		Properties:    props,
 	})
 	if err != nil {
-		if registered != nil {
-			c.mu.Lock()
-			if c.inflight[packetID] == registered {
-				delete(c.inflight, packetID)
-			}
-			c.mu.Unlock()
+		if registered != nil && c.inflight[packetID] == registered {
+			delete(c.inflight, packetID)
 		}
 		return err
 	}
@@ -343,29 +379,70 @@ func (c *client) writePublish(topic string, payload []byte, qos byte, retain boo
 	return nil
 }
 
-// sendPublish is the outbound delivery path of a live session: a QoS 1/2 delivery
-// that would exceed the connection's inflight window is skipped and counted
-// instead of blocking the publishing goroutine or the cluster's fan-out.
+// sendPublish is the outbound delivery path of a live session. A QoS 1/2 delivery
+// that would exceed the connection's inflight window is queued for the connection
+// and sent, in arrival order, as soon as an acknowledgement frees a slot: the
+// publisher is never blocked and the message is never lost. Only a queue that is
+// full drops the delivery, and that drop is counted twice and logged with the
+// client id — a publisher's successful PUBACK is a promise about the sink, so a
+// delivery the broker cannot keep has to be visible.
 func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
-	if qos > 0 {
-		c.mu.Lock()
-		full := c.windowFullLocked(qos)
-		c.mu.Unlock()
-		if full {
-			c.broker.metrics.RecordDroppedMessage("inflight_full")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// writeClosed also covers a connection that is closing, whose socket failed or
+	// which is being disconnected as a slow consumer: its queue is not growing any
+	// more, so a delivery is refused instead of parked in it.
+	if c.closed || c.writeClosed.Load() {
+		return errClientClosed
+	}
+	if qos > 0 && c.windowFullLocked(qos) {
+		limit := c.inflightQueueLimit()
+		if len(c.pending) >= limit {
+			c.broker.metrics.RecordDroppedMessage("inflight_overflow")
 			c.broker.metrics.RecordOverflow("inflight")
+			c.warn("gmqx dropped a delivery at a full inflight queue",
+				"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow",
+				"qos", qos, "topic", topic, "queue", limit)
 			return errInflightFull
 		}
+		c.pending = append(c.pending, pendingMessage{topic: topic, payload: payload, qos: qos, retain: retain, props: props})
+		return nil
 	}
-	return c.writePublish(topic, payload, qos, retain, props)
+	return c.writePublishLocked(topic, payload, qos, retain, props)
 }
 
-// handlePuback completes an outbound QoS 1 exchange: the packet id is free again
-// and no retransmission follows.
+// drainPendingLocked sends the queued deliveries whose window has room, in the
+// order they were queued, and stops at the first message that still has no slot:
+// the connection never reorders its QoS 1/2 deliveries, not even when the QoS 1
+// and QoS 2 windows free slots at different times. The caller holds c.mu and has
+// just released an inflight slot.
+//
+// A delivery that cannot be queued for the writer (the connection is closing, or
+// the writer queue is full and the connection is being disconnected as a slow
+// consumer) ends the drain: the rest stays in the queue and ends with the
+// connection, exactly like the unconfirmed exchanges of the inflight table.
+func (c *client) drainPendingLocked() {
+	for len(c.pending) > 0 {
+		msg := c.pending[0]
+		if c.windowFullLocked(msg.qos) {
+			return
+		}
+		c.pending[0] = pendingMessage{}
+		c.pending = c.pending[1:]
+		if err := c.writePublishLocked(msg.topic, msg.payload, msg.qos, msg.retain, msg.props); err != nil {
+			return
+		}
+	}
+}
+
+// handlePuback completes an outbound QoS 1 exchange: the packet id is free again,
+// no retransmission follows, and the queue of deliveries that waited for the
+// window moves on.
 func (c *client) handlePuback(m *mqtt.Puback) {
 	c.mu.Lock()
 	if entry, ok := c.inflight[m.PacketID]; ok && entry.state == awaitPuback {
 		delete(c.inflight, m.PacketID)
+		c.drainPendingLocked()
 	}
 	c.mu.Unlock()
 }
@@ -383,6 +460,7 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 	}
 	if m.ReasonCode >= 0x80 {
 		delete(c.inflight, m.PacketID)
+		c.drainPendingLocked()
 		c.mu.Unlock()
 		return
 	}
@@ -395,15 +473,17 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 	}
 	c.mu.Unlock()
 
-	_ = c.writeMessage(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: m.PacketID})
+	_ = c.send(&mqtt.Pubrel{MessageHeader: c.header(), PacketID: m.PacketID})
 	c.wakeRetransmitter()
 }
 
-// handlePubcomp completes an outbound QoS 2 exchange and frees its packet id.
+// handlePubcomp completes an outbound QoS 2 exchange and frees its packet id,
+// which also lets the queue of waiting deliveries move on.
 func (c *client) handlePubcomp(m *mqtt.Pubcomp) {
 	c.mu.Lock()
 	if entry, ok := c.inflight[m.PacketID]; ok && entry.state == awaitPubcomp {
 		delete(c.inflight, m.PacketID)
+		c.drainPendingLocked()
 	}
 	c.mu.Unlock()
 }

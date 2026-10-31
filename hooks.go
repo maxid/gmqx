@@ -115,7 +115,21 @@ const (
 const (
 	ReasonUnspecified   byte = 0x80
 	ReasonNotAuthorized byte = 0x87
-	ReasonQuotaExceeded byte = 0x97
+	// ReasonSessionTakenOver is the DISCONNECT a server sends to the connection a
+	// new CONNECT displaced (MQTT 5 §3.1.2.5, 4.13).
+	ReasonSessionTakenOver byte = 0x8E
+	ReasonQuotaExceeded    byte = 0x97
+	// ReasonSubscriptionIdentifiersNotSupported is the DISCONNECT a SUBSCRIBE
+	// carrying a Subscription Identifier gets, because the CONNACK advertised
+	// Subscription Identifier Available 0.
+	ReasonSubscriptionIdentifiersNotSupported byte = 0x9A
+	// ReasonSharedSubscriptionsNotSupported is the per-filter SUBACK code of a
+	// "$share/..." filter, because the CONNACK advertised Shared Subscription
+	// Available 0 (MQTT 5 §3.9.3).
+	ReasonSharedSubscriptionsNotSupported byte = 0x9E
+	// ReasonConnectionRateExceeded is the CONNACK of a CONNECT refused by the
+	// Config.NotKickSeconds anti-flap window (MQTT 5 §3.2.2.2).
+	ReasonConnectionRateExceeded byte = 0x9F
 )
 
 // PublishResult is what the sink hands back. ReasonCode 0 lets the broker choose
@@ -159,18 +173,33 @@ type EventSink interface {
 //
 // RecordDroppedMessage observes something the broker refused to deliver or keep.
 // The reasons this package records are "acl_publish", "acl_subscribe",
-// "interceptor", "sink_rejected", "sink_retryable", "max_retain",
+// "acl_timeout" (an AclManager.Check call exceeded Config.AuthTimeout and counts
+// as a denial), "auth_timeout" (an AuthManager.Authenticate call exceeded it and
+// counts as a failed authentication), "interceptor", "sink_rejected",
+// "sink_retryable", "max_retain", "retained_expired" (a retained message was not
+// replayed because its Message Expiry Interval elapsed, and it was deleted),
 // "max_connections", "max_subscriptions", "connection_rate_limit",
-// "cluster_namespace", "inflight_full" (a QoS 1/2 delivery was skipped because the
-// connection's inflight window was full), "inflight_qos2_full" (an inbound QoS 2
-// PUBLISH over the window), "retry_exhausted" (an outbound exchange used up its
-// retransmissions), "offline_queue_full" (the per-session cap dropped the oldest
-// message), "offline_queue_total" (the global cap rejected the newest one),
-// "offline_queue_corrupt", "offline_session_missing" and "session_expired".
+// "takeover_rate_limit" (a CONNECT inside the Config.NotKickSeconds window would
+// have displaced a live connection), "shared_subscription" (a "$share/..."
+// filter was refused), "subscription_identifier" (a SUBSCRIBE carrying one was
+// rejected), "cluster_namespace", "inflight_overflow" (a QoS 1/2 delivery found
+// the connection's inflight window and the queue behind it both full, so it was
+// dropped), "inflight_qos2_full" (an inbound QoS 2 PUBLISH over the window),
+// "retry_exhausted" (an outbound exchange used up its retransmissions),
+// "outbound_queue_full" (a QoS 0 PUBLISH was dropped because the connection's
+// writer queue was full), "slow_consumer" (a packet that must not be dropped — a
+// QoS 1/2 PUBLISH, an acknowledgement — hit a full writer queue, so the
+// connection is disconnected), "offline_queue_full" (the per-session cap dropped
+// the oldest message), "offline_queue_total" (the global cap rejected the newest
+// one), "offline_queue_corrupt", "offline_session_missing" and
+// "session_expired".
 // RecordQueueDepth("offline", n) reports the messages currently queued for
 // offline sessions across the broker; RecordOverflow reports a limit that was hit
-// without losing a message ("connections", "inflight", "inflight_qos2", and
-// "packet_ids" — a delivery degraded to QoS 0 because no packet id was free).
+// without losing a message ("connections", "inflight" — a delivery was dropped
+// as well, see "inflight_overflow" —, "inflight_qos2", "outbound_queue",
+// "will_delay" — a Will Delay Interval was clamped to Config.MaxWillDelayInterval
+// — and "packet_ids" — a delivery degraded to QoS 0 because no packet id was
+// free).
 type MetricsManager interface {
 	IncrementConnections()
 	DecrementConnections()

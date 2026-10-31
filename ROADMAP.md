@@ -10,6 +10,13 @@
 - [x] MQTT 5: CONNACK capabilities, Topic Alias, User Property forwarding, subscription options
 - [x] Persistent-session storage behind the `SessionStore` seam, bounded offline queue, MQTT 5 session expiry and a bounded sweeper
 - [x] Outbound QoS 1/2 retransmission (DUP, PUBREL retries, one timer per connection) and inflight windows in both directions
+- [x] Bounded per-connection inflight queue (a window-full delivery waits instead of being dropped)
+- [x] One writer goroutine per connection, bounded outbound queue and a write deadline per packet
+- [x] CONNECT-phase read deadline and authorization timeouts (`ConnectTimeout`, `AuthTimeout`)
+- [x] Refuse the capabilities the CONNACK advertises as unavailable (`$share/...` -> SUBACK 0x9E, Subscription Identifier -> DISCONNECT 0x9A)
+- [x] MQTT 5 Will Delay Interval (cancelled by resume, cut short by session expiry, bounded by `MaxWillDelayInterval`)
+- [x] Retained message expiry (MQTT 5 Message Expiry Interval, replayed decremented, deleted when elapsed)
+- [x] Takeover parity across nodes (connect-time kick in both connect modes, DISCONNECT 0x8E) and the `NotKickSeconds` anti-flap window
 - [ ] Remaining MQTT 5 properties/semantics (receive maximum, packet limits)
 - [ ] QoS 2 state across a reconnect
 - [x] Cluster interface + cross-node publish/kick hooks (in-memory)
