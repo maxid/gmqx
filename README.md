@@ -55,6 +55,21 @@ broker, _ := gmqx.New(gmqx.Config{
 })
 ```
 
+## Examples
+
+[`examples/broker-demo`](examples/broker-demo/main.go) starts a broker on an
+ephemeral loopback port, connects one client and completes a publish/subscribe
+round trip. gmqx ships no client API, so the demo acts as an MQTT 3.1.1 client
+through the gnety MQTT codec (the wire layer the broker itself uses) and prints
+the PUBLISH the broker delivers back:
+
+```sh
+go run ./examples/broker-demo
+go run ./examples/broker-demo -addr 127.0.0.1:1883 -topic demo/hello
+```
+
+Broker and client share one process, so no third-party MQTT client is needed.
+
 ## Configuration (selected)
 
 | Field | Default | Description |

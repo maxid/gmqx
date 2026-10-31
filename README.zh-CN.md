@@ -55,6 +55,20 @@ broker, _ := gmqx.New(gmqx.Config{
 })
 ```
 
+## 示例
+
+[`examples/broker-demo`](examples/broker-demo/main.go) 在回环地址的临时端口上启动 broker，
+连接一个客户端并完成一次发布/订阅往返。gmqx 不提供客户端 API，因此示例借助
+gnety 的 MQTT 编解码器（broker 自身使用的线格式层）充当 MQTT 3.1.1 客户端，
+并打印 broker 回送的 PUBLISH：
+
+```sh
+go run ./examples/broker-demo
+go run ./examples/broker-demo -addr 127.0.0.1:1883 -topic demo/hello
+```
+
+broker 与客户端运行在同一进程内，无需第三方 MQTT 客户端。
+
 ## 配置（部分）
 
 | 字段 | 默认值 | 说明 |
