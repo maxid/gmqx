@@ -5,6 +5,40 @@
 
 ## [Unreleased]
 
+- **Cluster: retained replication and node id ownership.** Two defects in the
+  shared cluster path are fixed.
+
+  *Retained replication.* A retained publish received from a peer is now applied
+  to the receiving node's retained store with the rules of a local retained
+  publish (empty payload deletes, `MaxRetainMessages` bounds the store, QoS and
+  properties are kept) instead of being delivered as a live message only. The
+  broadcast both backends already performed is therefore useful: a subscriber
+  that connects to another node later receives the retained value from that
+  node's store. The guarantee is eventual presence in the store; a subscriber
+  already admitted when the remote retained publish arrives is not replayed the
+  value. Both backends are affected; the store update is shared by the broker,
+  and a duplicate `(Origin, Seq)` is still dropped by the backend before it
+  reaches the store.
+
+  *Node id ownership.* The Redis backend now enforces one live owner per node id.
+  `Start` takes `<ChannelPrefix>:owner:<nodeID>` with `SET NX` and `NodeTTL`
+  before it subscribes to the node channel, renews the lease with the member key,
+  and releases it on `Stop` (compare-and-delete, so a process that lost the lease
+  cannot release a newer owner's id). A second live process with the same id
+  fails `Start` with the new `ErrNodeIDInUse`, naming the holding incarnation,
+  instead of sharing the channel, applying every event twice and collapsing into
+  one `Members()` entry. Because the lease is a TTL, a process that died without
+  releasing it blocks a restart only until `NodeTTL` expires. The TCP backend is
+  unchanged: its handshake already keeps exactly one member per node id and it
+  has no shared store in which to arbitrate a lease.
+
+  *Behavior changes.* `RedisClusterConfig.NodeTTL` now also governs the ownership
+  key. A Redis cluster whose node id is already held by a live process no longer
+  starts; callers can match the refusal with `errors.Is(err, ErrNodeIDInUse)`.
+  A process that loses its lease (for example after a pause longer than
+  `NodeTTL`) stops refreshing its member key and logs the loss instead of
+  overwriting the new owner's membership.
+
 - **Redis cluster backend.** `NewRedisCluster` adds a centralized alternative to
   the O(N²) TCP mesh: nodes share Redis instead of dialing each other, and
   membership, routing and directed delivery live in Redis.

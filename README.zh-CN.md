@@ -178,6 +178,13 @@ publish 和 kick 仍然发给每个对等节点：保留状态
 存在时间最长的过滤器会被排除（较新的订阅继续保持路由），
 代价是无法路由仅匹配被排除过滤器的 publish。
 
+从对等节点收到的保留消息会按本地保留消息的规则写入接收节点自己的
+保留存储：空载荷删除该主题，`MaxRetainMessages` 限制存储数量，
+消息携带的 QoS 与属性一并保留。这正是广播的意义所在——之后连接到
+该节点的订阅者可以从其存储中收到该值。保证的是状态最终存在于
+存储中：远程保留消息可能在本地订阅者已被接纳之后才到达，
+broker 不会向已经连接的会话重放该值。
+
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `Addr` / `Seeds` | — | 通告的监听地址 / 要拨号的对等节点 |
@@ -220,6 +227,7 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 | 键 / 通道 | 内容 | TTL |
 |---|---|---|
 | `<prefix>:node:<nodeID>` | 某个节点的 pub/sub 通道 | — |
+| `<prefix>:owner:<nodeID>` | JSON `{node, inc, since}`：node id 所有权租约 | `NodeTTL` |
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`：存活性与身份 | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`：订阅摘要 | `SummaryTTL` |
 
@@ -243,6 +251,15 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 任何对等节点，而不是给出过时视图。重启的节点会以新化身重新出现；
 停止节点会删除其键，因此对等节点会立即移除它，而不是在 `NodeTTL` 之后。
 
+node id 的所有权与成员关系分开强制。`Start` 以 `SET NX` 和 `NodeTTL`
+获取 `<prefix>:owner:<nodeID>`，随成员键一起续期，并在 `Stop` 时释放。
+第二个使用同一 id 的存活进程会以 `gmqx.ErrNodeIDInUse` 失败（错误中
+给出持有该 id 的化身），而不是订阅同一通道、重复应用每个事件并在
+`Members()` 中折叠为一条记录。租约是一个 TTL，因此未释放就死亡的
+进程最多阻塞重启直到 `NodeTTL` 过期。TCP 后端没有这样的键：
+它的握手已经保证每个 node id 恰好一个成员，也没有可用于仲裁租约的
+共享存储。
+
 ### 定向路由
 
 每个节点将其订阅摘要写入 `<prefix>:subs:<nodeID>`，对等节点在构建
@@ -255,7 +272,10 @@ Redis 不可达时使 `Spread` 返回错误）。规则即 TCP 后端的规则�
   缺少摘要不应导致投递失败；
 - 保留消息的 publish 和 kick 会发往每个已知节点的通道：保留状态
   必须存在于每个节点上，以供其未来的订阅者使用；而 kick 指定的是 client id
-  而不是主题，因此只有持有该会话的节点才能对其生效；
+  而不是主题，因此只有持有该会话的节点才能对其生效；接收节点按与
+  本地保留消息相同的规则存储该保留消息（空载荷删除、`MaxRetainMessages`
+  限制存储数量、保留 QoS 与属性），保证的是状态最终存在于存储中，
+  而不是向已经连接的会话重放；
 - 一个节点最多通告 `MaxSummaryFilters` 个过滤器，存在时间最长
   的过滤器会被排除。
 
@@ -271,7 +291,8 @@ TTL 表丢弃重复的 `(Origin, Seq)`，并且从不转发收到的事件。
 ### 故障行为
 
 - 当 `Addr` 为空、某个 TTL/尺寸为负数、某个 TTL
-  无法长于 `SummaryInterval`，或 Redis 无法到达时，`Start` 返回错误。
+  无法长于 `SummaryInterval`、node id 被另一个存活进程持有
+  （`gmqx.ErrNodeIDInUse`），或 Redis 无法到达时，`Start` 返回错误。
 - 运行时，本地产生的 `Spread` 会返回 `gmqx.ErrClusterUnavailable`
   （包装底层原因），而不是就地重试；broker 会记录日志并继续。
   收到的事件永远不会重发，因此没有任何东西会重试远程事件。
@@ -294,8 +315,10 @@ TTL 表丢弃重复的 `(Origin, Seq)`，并且从不转发收到的事件。
 | `Metrics` / `Logger` | 无 / `slog.Default()` | 丢弃计数器 / 成员关系日志 |
 
 Redis 投递是至多一次的，与 TCP 投递完全一样：在对等节点处于两次化身之间时
-发布的事件会丢失，而不是排队。node id 在每个集群中必须唯一；
-两个进程共用同一个 node id 会共用同一个通道，并都会应用每个事件。
+发布的事件会丢失，而不是排队。node id 在每个集群中必须唯一：
+Redis 后端会拒绝使用已被持有 id 启动的第二个存活进程
+（`ErrNodeIDInUse`），TCP 网状结构则把重复链路折叠为每个 node id
+一个成员。
 
 ## 版本管理
 

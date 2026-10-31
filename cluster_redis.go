@@ -44,6 +44,37 @@ const (
 	redisMaxBackoff = time.Second
 )
 
+// redisOwnerRenewScript renews this node's ownership lease, or takes the key
+// when nobody holds it. KEYS[1] is the ownership key, ARGV[1] the value this
+// process writes and ARGV[2] the TTL in milliseconds. It returns 1 when this
+// process owns the key afterwards and 0 when another live process holds it.
+//
+// The compare-and-set is what keeps a paused process from stealing an id back:
+// only the current holder may extend the lease, and an absent key is taken with
+// SET NX, which lets a restart succeed once the previous owner's TTL expired.
+const redisOwnerRenewScript = `
+local cur = redis.call('GET', KEYS[1])
+if cur == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+if cur == false then
+  if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return 1
+  end
+end
+return 0
+`
+
+// redisOwnerReleaseScript deletes the ownership key only when this process still
+// holds it, so a Stop that races a new owner cannot release an id it no longer
+// owns.
+const redisOwnerReleaseScript = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`
+
 // RedisClusterConfig configures the Redis cluster backend, the centralized
 // alternative to the TCP mesh: a node publishes an event once per target node to
 // that node's own channel, so N nodes need one Redis connection each instead of
@@ -77,11 +108,13 @@ type RedisClusterConfig struct {
 	// expired summary is unknown, and a node whose summary is unknown receives
 	// every publish.
 	SummaryTTL time.Duration
-	// NodeTTL is how long a node's member key survives without a refresh
-	// (default 3×SummaryInterval; it must exceed SummaryInterval). The TTL is the
-	// membership authority: a node that stops refreshing leaves the view on its
-	// own, with no eviction protocol and no assumption that it shut down
-	// cleanly.
+	// NodeTTL is how long a node's member key and its node id ownership key
+	// survive without a refresh (default 3×SummaryInterval; it must exceed
+	// SummaryInterval). The TTL is the membership authority: a node that stops
+	// refreshing leaves the view on its own, with no eviction protocol and no
+	// assumption that it shut down cleanly. It is also the escape hatch for a
+	// node id whose owner died: the ownership key expires NodeTTL after the last
+	// renewal, so a restart with the same id succeeds once it is gone.
 	NodeTTL time.Duration
 	// HeartbeatInterval is how often a node PINGs Redis to notice a lost
 	// connection and log the transition (default 1s). It extends no key: the two
@@ -121,6 +154,17 @@ type redisMemberRecord struct {
 	NodeID      string `json:"node"`
 	Incarnation string `json:"inc"`
 	Since       int64  `json:"since"` // when this incarnation joined, unix nanoseconds
+}
+
+// redisOwnerRecord is the value of a node id's ownership key. The key is a
+// lease, not a membership record: it exists to keep two live processes from
+// using the same node id, is taken with SET NX at Start and renewed with the
+// member key. The value names the process that holds it, so a refused Start and
+// an operator can see which incarnation owns the id.
+type redisOwnerRecord struct {
+	NodeID      string `json:"node"`
+	Incarnation string `json:"inc"`
+	Since       int64  `json:"since"` // when this incarnation took the id, unix nanoseconds
 }
 
 // redisSummaryRecord is the value of a node's subscription summary key. An
@@ -168,6 +212,9 @@ func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 //	<prefix>:node:<nodeID>    pub/sub channel of one node; the only channel a
 //	                          node subscribes to and the only one its peers
 //	                          publish to
+//	<prefix>:owner:<nodeID>   JSON redisOwnerRecord with the NodeTTL: the node
+//	                          id's ownership lease, so two live processes cannot
+//	                          use the same id
 //	<prefix>:member:<nodeID>  JSON redisMemberRecord with the NodeTTL; its
 //	                          existence is membership, its expiry is eviction
 //	<prefix>:subs:<nodeID>    JSON redisSummaryRecord with the SummaryTTL; its
@@ -186,6 +233,16 @@ type redisCluster struct {
 	incarnation string
 	since       time.Time
 	handler     ClusterHandler
+
+	// ownerValue is the value this Start writes to the node id's ownership key;
+	// every renewal and the release compare against it. It is set before any
+	// goroutine starts and never changes afterwards.
+	ownerValue []byte
+	// owned reports whether this process currently holds the ownership key. It
+	// only gates the logging of lease transitions: losing and regaining the lease
+	// are logged once each instead of once per refresh. The member key refresh
+	// itself is gated by the result of the renewal, not by this flag.
+	owned atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -216,9 +273,15 @@ type redisCluster struct {
 	wg sync.WaitGroup
 }
 
-// Start implements Cluster. It connects to Redis, subscribes to this node's
-// channel and only then registers the node, so a peer that sees the member key
-// can already reach a live subscription.
+// Start implements Cluster. It connects to Redis, takes ownership of the node
+// id, subscribes to this node's channel and only then registers the node, so a
+// peer that sees the member key can already reach a live subscription.
+//
+// Ownership is a lease: the node id's key is taken with SET NX and carries
+// NodeTTL, so a second live process with the same id is refused with
+// ErrNodeIDInUse instead of silently sharing the channel and applying every
+// event twice. A process that died without releasing the key blocks the id only
+// until the lease expires.
 func (c *redisCluster) Start(ctx context.Context, nodeID string, handler ClusterHandler) error {
 	if err := c.validate(nodeID); err != nil {
 		return err
@@ -235,6 +298,7 @@ func (c *redisCluster) Start(ctx context.Context, nodeID string, handler Cluster
 	c.nodeID, c.handler = nodeID, handler
 	c.incarnation = randomIncarnation()
 	c.since = time.Now()
+	c.ownerValue = nil
 	c.dedup = newDedupTable(c.cfg.DedupSize, c.cfg.DedupTTL)
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.rdb = redis.NewClient(c.options())
@@ -256,6 +320,27 @@ func (c *redisCluster) Start(ctx context.Context, nodeID string, handler Cluster
 		return fmt.Errorf("gmqx: redis cluster %s: %w", c.cfg.Addr, err)
 	}
 	c.healthy.Store(true)
+
+	// Take the node id before subscribing: a process that lost the ownership
+	// race must never have applied an event from the channel it was about to
+	// share. Two live processes with the same id would both apply every event and
+	// Members() would collapse them into one entry; only an ownership key can see
+	// both processes.
+	owner, err := c.ownerRecord()
+	if err != nil {
+		c.abort()
+		return fmt.Errorf("gmqx: redis cluster ownership record %s: %w", c.nodeID, err)
+	}
+	c.mu.Lock()
+	c.ownerValue = owner
+	c.mu.Unlock()
+	acquireCtx, acquireCancel := context.WithTimeout(c.ctx, redisIOTimeout)
+	err = c.acquireOwnership(acquireCtx)
+	acquireCancel()
+	if err != nil {
+		c.abort()
+		return err
+	}
 
 	// Subscribe before registering. The member key is what makes peers route to
 	// this node, so it must not exist before the subscription is live; the other
@@ -297,13 +382,20 @@ func (c *redisCluster) abort() {
 		_ = sub.Close()
 	}
 	if rdb != nil {
+		// Give the id back before closing the client: a retry of Start must not
+		// have to wait for NodeTTL. The release is a compare-and-delete, so a
+		// failed Start can never release an id another process now owns.
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), redisIOTimeout)
+		_, _ = c.releaseOwnership(releaseCtx)
+		releaseCancel()
 		_ = rdb.Close()
 	}
 }
 
 // Stop implements Cluster. It is idempotent, leaves no goroutine behind and
 // deregisters the node so peers stop routing to it immediately instead of after
-// NodeTTL.
+// NodeTTL. It also releases the node id's ownership lease, so a restart with the
+// same id does not have to wait for the TTL.
 func (c *redisCluster) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -337,7 +429,18 @@ func (c *redisCluster) Stop(ctx context.Context) error {
 	// Deregister with a context that outlives the caller's cancellation: Stop has
 	// to finish the teardown even when it is called from a cancelled context.
 	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), redisIOTimeout)
-	_, _ = rdb.Del(delCtx, c.memberKey(c.nodeID), c.summaryKey(c.nodeID)).Result()
+	owned, err := c.releaseOwnership(delCtx)
+	if err != nil {
+		// The release could not be confirmed; fall back to the unconditional
+		// deregistration, which is what Stop did before the ownership key existed.
+		owned = true
+	}
+	if owned {
+		// Only the process that still owns the id deregisters it: when the lease
+		// was lost, the member and summary keys belong to the process that took
+		// the id over.
+		_, _ = rdb.Del(delCtx, c.memberKey(c.nodeID), c.summaryKey(c.nodeID)).Result()
+	}
 	cancel()
 	c.log.Info("gmqx redis cluster stopped", "node", c.nodeID)
 	return rdb.Close()
@@ -578,9 +681,107 @@ func (c *redisCluster) memberKeys(ctx context.Context, rdb *redis.Client) ([]str
 	}
 }
 
-// refreshLocal writes this node's membership and subscription summary to Redis
-// with their TTLs. It is the heartbeat of the node's presence: as long as it
-// succeeds, peers see the node and route to it.
+// acquireOwnership takes or renews this node id's ownership lease and returns a
+// classified error when another live process holds it.
+func (c *redisCluster) acquireOwnership(ctx context.Context) error {
+	owned, err := c.renewOwnership(ctx)
+	if err != nil {
+		return fmt.Errorf("gmqx: redis cluster node %q: take ownership: %w", c.nodeID, err)
+	}
+	if owned {
+		c.owned.Store(true)
+		return nil
+	}
+	holder, err := c.readOwner(ctx)
+	if err == nil && holder.Incarnation != "" {
+		return fmt.Errorf("gmqx: redis cluster node %q: %w (held by incarnation %q since %s)",
+			c.nodeID, ErrNodeIDInUse, holder.Incarnation,
+			time.Unix(0, holder.Since).UTC().Format(time.RFC3339Nano))
+	}
+	return fmt.Errorf("gmqx: redis cluster node %q: %w", c.nodeID, ErrNodeIDInUse)
+}
+
+// renewOwnership extends this node id's ownership lease, taking the key when it
+// is absent. It reports whether this process owns the key afterwards; false
+// means another live process holds it.
+func (c *redisCluster) renewOwnership(ctx context.Context) (bool, error) {
+	rdb := c.client()
+	if rdb == nil {
+		return false, errors.New("gmqx: redis cluster is not running")
+	}
+	value := c.ownershipValue()
+	if len(value) == 0 {
+		return false, errors.New("gmqx: redis cluster ownership value is not set")
+	}
+	n, err := rdb.Eval(ctx, redisOwnerRenewScript, []string{c.ownerKey(c.nodeID)},
+		string(value), c.nodeTTL().Milliseconds()).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// releaseOwnership deletes the ownership key when this process still holds it.
+// It reports whether the key was ours, so Stop only deregisters keys it still
+// owns.
+func (c *redisCluster) releaseOwnership(ctx context.Context) (bool, error) {
+	rdb := c.client()
+	value := c.ownershipValue()
+	if rdb == nil || len(value) == 0 {
+		return false, nil
+	}
+	n, err := rdb.Eval(ctx, redisOwnerReleaseScript, []string{c.ownerKey(c.nodeID)}, string(value)).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ownershipValue returns the value this Start wrote to the ownership key. Start
+// sets it before the backend starts any goroutine; the mutex keeps a concurrent
+// Stop from observing a half-updated field.
+func (c *redisCluster) ownershipValue() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ownerValue
+}
+
+// ownerRecord is the value of this Start's ownership key: the same identity as
+// the member record, so an operator or a refused Start can name the process that
+// holds the node id.
+func (c *redisCluster) ownerRecord() ([]byte, error) {
+	return json.Marshal(redisOwnerRecord{
+		NodeID:      c.nodeID,
+		Incarnation: c.incarnation,
+		Since:       c.since.UnixNano(),
+	})
+}
+
+// readOwner reads the current ownership record, for the error a refused Start
+// reports. A missing or unreadable record is reported as the zero record.
+func (c *redisCluster) readOwner(ctx context.Context) (redisOwnerRecord, error) {
+	rdb := c.client()
+	if rdb == nil {
+		return redisOwnerRecord{}, errors.New("gmqx: redis cluster is not running")
+	}
+	raw, err := rdb.Get(ctx, c.ownerKey(c.nodeID)).Result()
+	if err != nil {
+		return redisOwnerRecord{}, err
+	}
+	var rec redisOwnerRecord
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		return redisOwnerRecord{}, err
+	}
+	return rec, nil
+}
+
+// refreshLocal renews this node's ownership lease and writes its membership and
+// subscription summary to Redis with their TTLs. It is the heartbeat of the
+// node's presence: as long as it succeeds, peers see the node and route to it.
+//
+// The lease is renewed first, and the member key is not written when it cannot
+// be renewed: at that point another live process holds the id, so the member and
+// summary keys belong to that process, not to this one.
 func (c *redisCluster) refreshLocal(ctx context.Context) error {
 	rdb := c.client()
 	if rdb == nil {
@@ -588,6 +789,20 @@ func (c *redisCluster) refreshLocal(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, redisIOTimeout)
 	defer cancel()
+
+	owned, err := c.renewOwnership(ctx)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		if c.owned.CompareAndSwap(true, false) {
+			c.log.Warn("gmqx redis cluster node id ownership lost", "node", c.nodeID, "key", c.ownerKey(c.nodeID))
+		}
+		return fmt.Errorf("gmqx: redis cluster node %q: %w", c.nodeID, ErrNodeIDInUse)
+	}
+	if c.owned.CompareAndSwap(false, true) {
+		c.log.Info("gmqx redis cluster node id ownership regained", "node", c.nodeID)
+	}
 
 	member, err := json.Marshal(redisMemberRecord{
 		NodeID:      c.nodeID,
@@ -675,10 +890,14 @@ func (c *redisCluster) housekeeping() {
 }
 
 // refreshKeys rewrites the local keys and logs a failure instead of returning it:
-// the caller is a background loop that keeps retrying.
+// the caller is a background loop that keeps retrying. A lost ownership lease is
+// already logged as a transition by refreshLocal, so it is not reported as a
+// Redis outage.
 func (c *redisCluster) refreshKeys() {
 	if err := c.refreshLocal(c.ctx); err != nil {
-		c.noteErr(err)
+		if !errors.Is(err, ErrNodeIDInUse) {
+			c.noteErr(err)
+		}
 		c.log.Debug("gmqx redis cluster refresh failed", "err", err)
 		return
 	}
@@ -1023,6 +1242,9 @@ func (c *redisCluster) validate(nodeID string) error {
 
 // nodeChannel is one node's private event channel.
 func (c *redisCluster) nodeChannel(nodeID string) string { return c.prefix() + ":node:" + nodeID }
+
+// ownerKey holds one node id's ownership lease.
+func (c *redisCluster) ownerKey(nodeID string) string { return c.prefix() + ":owner:" + nodeID }
 
 // summaryKey holds one node's advertised subscription summary.
 func (c *redisCluster) summaryKey(nodeID string) string { return c.prefix() + ":subs:" + nodeID }

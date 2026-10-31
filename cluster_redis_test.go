@@ -526,6 +526,7 @@ func TestRedisClusterKeyLayout(t *testing.T) {
 		{c.nodeChannel("n1"), "gmqx:cluster:node:n1"},
 		{c.summaryKey("n1"), "gmqx:cluster:subs:n1"},
 		{c.memberKey("n1"), "gmqx:cluster:member:n1"},
+		{c.ownerKey("n1"), "gmqx:cluster:owner:n1"},
 		{c.memberPattern(), "gmqx:cluster:member:*"},
 	} {
 		if tc.got != tc.want {
@@ -553,8 +554,14 @@ func TestRedisClusterKeyLayout(t *testing.T) {
 	if !mr.Exists(c1.summaryKey("n1")) {
 		t.Fatalf("summary key %s was not written", c1.summaryKey("n1"))
 	}
+	if !mr.Exists(c1.ownerKey("n1")) {
+		t.Fatalf("ownership key %s was not written", c1.ownerKey("n1"))
+	}
 	if ttl := mr.TTL(c1.memberKey("n1")); ttl <= 0 || ttl > cfg.NodeTTL {
 		t.Fatalf("member key TTL = %v, want (0, %v]", ttl, cfg.NodeTTL)
+	}
+	if ttl := mr.TTL(c1.ownerKey("n1")); ttl <= 0 || ttl > cfg.NodeTTL {
+		t.Fatalf("ownership key TTL = %v, want (0, %v]", ttl, cfg.NodeTTL)
 	}
 	if ttl := mr.TTL(c1.summaryKey("n1")); ttl <= 0 || ttl > cfg.SummaryTTL {
 		t.Fatalf("summary key TTL = %v, want (0, %v]", ttl, cfg.SummaryTTL)

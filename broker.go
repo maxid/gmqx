@@ -479,6 +479,26 @@ func (b *Broker) subscriptionsChanged() {
 	notifier.subscriptionsChanged()
 }
 
+// storeRetained applies one retained publish to the retained store, whether it
+// came from a local session or from a peer node. Both paths obey the same
+// rules: an empty payload removes the topic, and MaxRetainMessages bounds how
+// many topics are stored (a full store still accepts a new value for a topic it
+// already holds). The QoS and the typed property set travel with the message,
+// so a retained delivery later reproduces the publish that set it.
+func (b *Broker) storeRetained(topic string, payload []byte, qos byte, props mqtt.Properties) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(payload) == 0 {
+		delete(b.retained, topic)
+		return
+	}
+	if _, exists := b.retained[topic]; !exists && b.cfg.MaxRetainMessages > 0 && int64(len(b.retained)) >= b.cfg.MaxRetainMessages {
+		b.metrics.RecordDroppedMessage("max_retain")
+		return
+	}
+	b.retained[topic] = retainedMessage{topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
+}
+
 func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool) {
 	b.mu.RLock()
 	var msgs []retainedMessage
@@ -524,18 +544,7 @@ func (b *Broker) publish(from *client, ev PublishEvent, props mqtt.Properties) P
 	// Retain is stored only for accepted publishes: a rejected message must not
 	// become the retained value new subscribers receive.
 	if ev.Retain {
-		b.mu.Lock()
-		if len(ev.Payload) == 0 {
-			delete(b.retained, ev.Topic)
-		} else {
-			_, exists := b.retained[ev.Topic]
-			if b.cfg.MaxRetainMessages <= 0 || exists || int64(len(b.retained)) < b.cfg.MaxRetainMessages {
-				b.retained[ev.Topic] = retainedMessage{topic: ev.Topic, payload: append([]byte(nil), ev.Payload...), qos: ev.QoS, props: props}
-			} else {
-				b.metrics.RecordDroppedMessage("max_retain")
-			}
-		}
-		b.mu.Unlock()
+		b.storeRetained(ev.Topic, ev.Payload, ev.QoS, props)
 	}
 	b.metrics.IncrementPublishedMessages()
 
@@ -637,11 +646,34 @@ func (b *Broker) spreadKick(clientID string) {
 }
 
 // OnRemotePublish implements ClusterHandler.
+//
+// A remote retained publish updates the retained store before it is delivered
+// locally, with the same rules as a local retained publish: an empty payload
+// removes the topic, MaxRetainMessages bounds the store, and the QoS and
+// properties carried by the message are kept. That is what makes the cluster's
+// broadcast of retained publishes useful: a subscriber that connects to this
+// node later receives the value from the store even though the publish happened
+// on another node. The publish was already authorized and accepted by the node
+// that produced it, so it is not run through this node's ACL, interceptors or
+// sink again.
+//
+// The store update is applied once per event: a backend drops a duplicate
+// (Origin, Seq) before calling this method, and replaying the same retained
+// value would converge on the same state anyway.
+//
+// Ordering: a remote retained publish can arrive after a local subscriber was
+// admitted, so that subscriber may have missed it — sendRetained ran at
+// SUBSCRIBE time, before the event arrived. The guarantee is that the state is
+// eventually present in the store, not that a session already connected is
+// replayed the value.
 func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 	props, err := decodePropertyBlock(msg.Props)
 	if err != nil {
 		b.log.Warn("gmqx cluster publish properties", "err", err)
 		return
+	}
+	if msg.Retain {
+		b.storeRetained(msg.Topic, msg.Payload, msg.QoS, props)
 	}
 	b.deliverLocal(msg.Topic, msg.Payload, msg.QoS, nil, props, msg.Retain)
 }

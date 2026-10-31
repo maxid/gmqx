@@ -180,6 +180,15 @@ A node advertises at most `MaxSummaryFilters` filters; when it has more, the
 filters present longest are left out (newer subscriptions keep routing), at the
 cost of not routing publishes that only match an evicted filter.
 
+A retained publish received from a peer is applied to the receiving node's own
+retained store with the rules of a local retained publish: an empty payload
+deletes the topic, `MaxRetainMessages` bounds the store, and the QoS and
+properties carried by the message are kept. That is what makes the broadcast
+useful — a subscriber that connects to that node later receives the value from
+its store. The guarantee is eventual presence in the store: a remote retained
+publish can arrive after a subscriber on that node was already admitted, and the
+broker does not replay the value to a session that is already connected.
+
 | Field | Default | Description |
 |---|---|---|
 | `Addr` / `Seeds` | — | advertised listen address / peers to dial |
@@ -223,6 +232,7 @@ Every key and channel sits under one prefix (`ChannelPrefix`, default
 | Key / channel | Contents | TTL |
 |---|---|---|
 | `<prefix>:node:<nodeID>` | pub/sub channel of one node | — |
+| `<prefix>:owner:<nodeID>` | JSON `{node, inc, since}`: node id ownership lease | `NodeTTL` |
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`: liveness and identity | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`: subscription summary | `SummaryTTL` |
 
@@ -248,6 +258,16 @@ peers when Redis cannot be read, rather than a stale view. A restarted node
 reappears as a new incarnation; stopping a node deletes its keys so peers drop it
 immediately instead of after `NodeTTL`.
 
+Node id ownership is enforced separately from membership. `Start` takes
+`<prefix>:owner:<nodeID>` with `SET NX` and `NodeTTL`, renews it with the member
+key, and releases it on `Stop`. A second live process that starts with the same
+id fails with `gmqx.ErrNodeIDInUse` (naming the incarnation that holds it)
+instead of subscribing to the same channel, applying every event twice and
+collapsing into one `Members()` entry. The lease is a TTL, so a process that died
+without releasing it blocks a restart only until `NodeTTL` expires. The TCP
+backend has no such key: its handshake already keeps exactly one member per node
+id and it has no shared store in which to arbitrate a lease.
+
 ### Directed routing
 
 Each node writes its subscription summary to `<prefix>:subs:<nodeID>` and peers
@@ -261,7 +281,11 @@ Redis is unreachable). The rules are the TCP backend's rules:
   a missing summary must not cost a delivery;
 - retained publishes and kicks go to every known node channel: retained state has
   to exist on every node for its future subscribers, and a kick names a client id
-  rather than a topic, so only the node holding that session can act on it;
+  rather than a topic, so only the node holding that session can act on it. A
+  receiving node stores the retained publish with the same rules as a local one
+  (empty payload deletes, `MaxRetainMessages` bounds the store, QoS and properties
+  are kept); the guarantee is eventual presence in the store, not a replay to a
+  session already connected;
 - a node advertises at most `MaxSummaryFilters` filters, and the filters present
   longest are the ones left out.
 
@@ -278,7 +302,8 @@ reasons.
 ### Failure behaviour
 
 - `Start` returns an error when `Addr` is empty, a TTL/size is negative, a TTL
-  cannot outlive `SummaryInterval`, or Redis cannot be reached.
+  cannot outlive `SummaryInterval`, the node id is owned by another live process
+  (`gmqx.ErrNodeIDInUse`), or Redis cannot be reached.
 - At runtime a locally produced `Spread` returns `gmqx.ErrClusterUnavailable`
   (wrapping the cause) instead of retrying in place; the broker logs it and moves
   on. A received event is never re-sent, so nothing retries a remote event.
@@ -302,8 +327,9 @@ reasons.
 
 Redis delivery is at-most-once, exactly like TCP delivery: an event published
 while a peer is between incarnations is lost, not queued. Node ids must be unique
-per cluster; two processes sharing a node id would share a channel and both apply
-every event.
+per cluster: the Redis backend refuses a second live process that starts with an
+already-held id (`ErrNodeIDInUse`), and the TCP mesh collapses duplicate links
+into one member per node id.
 
 ## Versioning
 

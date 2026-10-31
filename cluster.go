@@ -51,6 +51,11 @@ type ClusterHandler interface {
 //
 // Spread must only be called with locally produced events: a backend may drop
 // an event whose Origin belongs to another node instead of forwarding it.
+//
+// Start may refuse a nodeID that another live process already owns by returning
+// an error that wraps ErrNodeIDInUse: two processes sharing an id would apply
+// every event twice. A backend without shared state (the built-in TCP mesh)
+// cannot arbitrate that and collapses duplicate links into one member instead.
 type Cluster interface {
 	Start(ctx context.Context, nodeID string, handler ClusterHandler) error
 	Stop(ctx context.Context) error
