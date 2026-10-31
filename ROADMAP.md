@@ -34,6 +34,6 @@
 - [x] Directed publish to a client id (`PublishToClient`) with Redis client-id presence and the TCP broadcast fallback
 - [x] Gossip cluster backend (SWIM membership, epidemic dissemination, gossiped summaries and client-id presence) and it is the default backend
 - [x] MQTT client library (`client/`): MQTT 3.1.1/5, QoS 1/2 state machines in both directions with DUP/PUBREL retransmission and inflight windows, reconnection with backoff and subscription restore, keepalive, MQTT 5 properties, bounded ordered writer/delivery queues
-- [ ] Core conformance tests (mosquitto/paho clients)
-- [ ] Benchmarks and soak tests
+- [x] Core conformance tests: in-repo MQTT 3.1.1/5 suite, paho against the broker, and a docker-based mosquitto matrix in both directions (`interop/`)
+- [x] Benchmarks and soak tests (`bench_test.go`, `soak_test.go`, `docs/PERFORMANCE.md`)
 - [ ] v1.0 API stabilization

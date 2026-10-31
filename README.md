@@ -11,6 +11,9 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 ## Features
 
 - MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
+- A benchmark and soak harness (`go test -bench .`, `GMQX_SOAK=1 go test -run TestSoak`)
+  with a recorded baseline, and an interoperability matrix in `interop/` that runs a
+  third-party client against this broker and this client against a reference broker
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
 - Persistent sessions (Clean Session / Clean Start, Session Present); the
   subscriptions of a persistent session survive a disconnect and a clean

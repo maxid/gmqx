@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+- Interoperability matrix in `interop/`, its own module so the library keeps zero
+  third-party dependencies: a third-party client against this broker, this client
+  against a reference broker in docker, and reference command-line clients against
+  this broker. Skips cleanly when docker is unavailable.
+
+- Benchmarks and a soak test with a recorded baseline (`docs/PERFORMANCE.md`):
+  publish throughput for QoS 0/1, fanout to 10 and 100 subscribers, 10k
+  subscriptions, retained replay and a client round trip, plus a churn soak that
+  asserts empty tables, a bounded goroutine count and a delivery ledger.
+
+
 - **The MQTT client library is here: `github.com/maxid/gmqx/client`.**
 
   *New package.* `client/` is a full MQTT 3.1.1/5 client built on the standard

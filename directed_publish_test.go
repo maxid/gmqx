@@ -27,7 +27,10 @@ func directPublication(b *Broker, topic, payload string, qos byte) Publication {
 // the publication without holding any subscription, at the publication's QoS, and
 // the acknowledgement path works as for any other delivery.
 func TestPublishToClientLocalOnline(t *testing.T) {
-	b := startBroker(t, Config{})
+	// A retry interval far beyond the test's lifetime keeps the assertion below
+	// deterministic: under load a retransmitted QoS 1 delivery could otherwise
+	// arrive between the ack and the next expectation.
+	b := startBroker(t, Config{QoSRetryInterval: time.Minute})
 	target, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "direct-target", clean: true})
 
 	if err := b.PublishToClient(context.Background(), "direct-target", directPublication(b, "direct/x", "hello", 1)); err != nil {
