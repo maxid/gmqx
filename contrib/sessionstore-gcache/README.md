@@ -185,6 +185,14 @@ metrics, at-most-once degradation, and no panic.
 
 ## Testing
 
+The logic runs on an embedded Redis. `redis_container_test.go` repeats the two
+cases only a real server can prove — that `SCAN` really pages, and that a key
+expires on its own — against a `redis:7-alpine` container started by
+testcontainers, together with a cross-node resume over that container. Docker is
+required for those; without it they skip with the reason.
+
+## Testing
+
 The tests run against miniredis and a real broker, and cover the cross-node
 resume (a persistent client subscribes on broker A, disconnects, messages are
 published while it is away, and it reconnects on broker B with the same store and
