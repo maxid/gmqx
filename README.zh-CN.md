@@ -736,9 +736,12 @@ context。
 
 TCP/TLS/WebSocket/WSS 监听器由
 [`gnety`](https://github.com/maxid/gnety) 传输框架提供（`RawHandler`
-模式）。MQTT 线格式位于 `gnety/codec/mqtt`：每个数据包都用其类型化的 `Decoder`
+模式）。MQTT 线格式位于 `gnety/codec/mqtt`：每个数据包都用其 codec
 读取、用 `mqtt.Encode` 写出，因此 gmqx 拥有 broker
-状态机，而不拥有任何自己的数据包布局。
+状态机，而不拥有任何自己的数据包布局。PUBLISH（发布者成千上万次发送的报文）走 codec
+的复用路径（`mqtt.ReadPublishInto`）：它被解码进每连接一份、只增长的缓冲区，并且从
+`client.handlePublish` 起发布持有载荷的一份复制，因此下游任何路径都观察不到被复用的
+字节。其余报文仍走类型化的 `Decoder`。
 
 监听端口已被占用时，`Start` 不会直接失败：它会继续尝试后续 `PortFallback` 个端口
 （默认 16，负值关闭），并保持配置的传输方式不变。每次尝试都是真实 bind——bind 本身就是

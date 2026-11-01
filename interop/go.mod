@@ -9,7 +9,7 @@ go 1.27
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/maxid/gmqx v0.0.0
-	github.com/maxid/gnety v0.0.0-20261031140716-cf189e47d917
+	github.com/maxid/gnety v0.0.0-20261101055410-7fc85d35bd1c
 )
 
 require (

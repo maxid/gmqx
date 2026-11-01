@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+- **The inbound PUBLISH no longer allocates a packet, a topic string and a payload
+  per publish.** The read loop decodes a PUBLISH with `codec/mqtt`'s
+  `ReadPublishInto` into one grow-only buffer per connection (`client.readBuf`,
+  bounded by the broker's `MaxPacketSize`), and hands everything else — PUBACK,
+  SUBSCRIBE, PINGREQ, a read error — to the typed decoder exactly as before. The
+  buffer is reused by the next packet, so the publication owns one copy of the
+  payload: `client.handlePublish` copies it once, immediately before
+  `Broker.publish`, and that is the only place it is copied on the hot path (the
+  retained store, the offline queue and the cluster spread keep their own copies,
+  as they always did). Everything the publication carries is what it was: the
+  same validation and the same DISCONNECT reason codes (an oversize packet is still
+  0x95 because the size check still happens before any body byte is read), the same
+  topic-alias handling, the same inflight and queueing behaviour, the same
+  `PublishEvent` a sink sees, with a payload that outlives the call. Measured on
+  the sequential benchmarks: `BenchmarkPublishQoS0` 928 B/op and 9 allocs/op →
+  528 B/op and 6 allocs/op, `BenchmarkPublishQoS1` 1,667/13 → 1,264/9,
+  `BenchmarkClientPublishQoS1` 3,121/22 → 2,721/18; `ns/op` and the 200-connection
+  delivered rate stayed inside their run-to-run noise bands, because at that load
+  the profile is syscall-bound, not decode-bound (see `docs/PERFORMANCE.md`).
+
 - **A full inflight queue no longer drops an acknowledged QoS 1/2 delivery of a
   persistent session.** The delivery joins the connection's pending queue and the
   session is taken offline: the connection is closed the way a lost one is (no

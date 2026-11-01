@@ -327,11 +327,13 @@ by the pending/inflight tables copying it.
 
 **Remaining top costs** (in order):
 
-1. **The inbound read path.** Every publisher frame costs a `read(2)`-backed
-   `bufio` fill plus the codec's decode, which allocates the payload and the
-   topic per packet. This is now the largest single cost and the next lever: a
-   broker-side decoder that reads a PUBLISH body into a reusable buffer would
-   remove the codec's per-packet allocations.
+1. **The inbound read path.** Every publisher frame still costs a `read(2)`-backed
+   `bufio` fill. The codec's per-packet allocations are gone — the broker now
+   decodes a PUBLISH into one reusable buffer per connection — but the syscall is
+   what dominates: the profile puts read and write syscalls at 45 % and 37 % of
+   the time. What is left per inbound PUBLISH is one payload copy, one topic
+   string and the encode of the delivery (see
+   [The inbound decode](#the-inbound-decode-measured-before-and-after)).
 2. **Allocation of the delivery tables.** A pending or inflight delivery copies
    the codec's `mqtt.Properties` value (~400 B) even though MQTT 3.1.1 traffic
    never carries one. A pointer-sized property block cut the bytes by ~45 % but
@@ -361,6 +363,7 @@ per connection).
 | **Compact acknowledgements.** A PUBACK/PUBREC/PUBREL/PUBCOMP with a zero reason code and no properties travels as its packet id: the writer builds the four-byte frame, no typed packet and no allocation. | The PUBACK path was 2.52 GB (27 %) of the window's allocations before and is ~0 after; no throughput change outside the noise band once the window scan was gone. |
 | **Reused retransmission timer.** One timer per connection, reset only when the earliest retransmission deadline moves; a delivery no longer wakes the loop, scans the whole inflight table and allocates a `time.Timer`. | No throughput change outside the noise band (79.7k → 80k delivered in the harness of that step), but it removes one timer allocation and one whole-table scan per delivery, both under the connection lock. |
 | **No routing allocation.** The built-in dispatcher collects targets into a stack array instead of a new slice per publish, and a topic that matches exactly one wildcard filter skips the per-session merge map. The targets are still collected under the index read lock and delivered after it is released (a delivery can close a connection and unregister its session, which takes that lock for writing). | Routing's share of CPU fell 4.3 % → 0.7 %; its allocation 1.15 GB → 0.1 % of the profile. `BenchmarkLocalTargets` is unchanged (the public `LocalTargets` still returns a slice, one allocation); `BenchmarkFanout/subscribers=100` went 345 µs → 203 µs (41 %) from the coalesced writes. |
+| **Inbound PUBLISH into a reusable buffer.** The read loop decodes a PUBLISH with `codec/mqtt`'s `ReadPublishInto` into one grow-only buffer per connection (`client.readBuf`, bounded by `MaxPacketSize`) instead of `Decode`'s per-packet payload, topic string and `Properties` value, and copies the payload exactly once, where the publication stops being a view of that buffer (`Broker.publish` in `client.handlePublish`). Every other packet still goes through the typed decoder. | `BenchmarkPublishQoS0` 928 B/op, 9 allocs/op → 528 B/op, 6 allocs/op; `BenchmarkPublishQoS1` 1,667, 13 → 1,264, 9; `BenchmarkClientPublishQoS1` 3,121, 22 → 2,721, 18. The delivered rate moved inside the run-to-run noise band (see below): the remaining cost of a publication is the two loopback syscalls, not the decode. |
 
 The sequential benchmarks changed in allocations, which are reproducible, while
 their `ns/op` stayed inside the run-to-run noise this machine shows (the same
@@ -382,6 +385,52 @@ round trip — is flat. The concurrent harness is where the changes are visible:
 200 connections publish continuously, so a per-packet write or a per-delivery
 map scan is paid millions of times per second instead of once per `ns/op`.
 
+### The inbound decode: measured before and after
+
+`codec/mqtt.ReadPublishInto` reads a PUBLISH into caller storage: the topic and
+the payload are slices of the caller's buffer, the validation is the one
+`Decoder.Decode` applies (the codec keeps a corpus of frames that both decoders
+must accept or reject identically), and an MQTT 3.1.1 packet — which is what a
+broker reads almost always — decodes without allocating. The broker keeps one
+such buffer per connection, grows it to the largest packet the connection sends
+and never shrinks it, and hands the typed decoder only the packets that are not
+PUBLISH.
+
+The payload is still copied once per publication, because every consumer of it
+may outlive the next read: the sink (which a configured
+`PublishCallbackTimeout` calls on its own goroutine), the retained store, the
+offline queue, the cluster spread, and each target connection's writer queue and
+QoS 1/2 inflight table. `client.handlePublish` documents that as the one place
+the copy happens; a publish refused before it (an unknown topic alias, a wildcard
+topic name, a full inbound window) is not copied at all.
+
+Measurements on this machine, same command, before = the broker without the
+reader, after = with it. `-count=3 -benchtime=2s`:
+
+| Benchmark | before | after |
+|---|---|---|
+| `BenchmarkPublishQoS0` | 928 B/op, 9 allocs/op (2.68–2.93 µs) | 528 B/op, 6 allocs/op (2.87–3.16 µs) |
+| `BenchmarkPublishQoS1` | 1,667 B/op, 13 allocs/op (28.4–33.6 µs) | 1,264 B/op, 9 allocs/op (28.1–35.5 µs) |
+| `BenchmarkClientPublishQoS1` | 3,121 B/op, 22 allocs/op (33.9–40.5 µs) | 2,721 B/op, 18 allocs/op (33.3–36.6 µs) |
+
+The allocation drop is deterministic (400 B and three to four objects per
+publication: the `Properties` value embedded in the decoded packet, the topic
+string and the payload). The concurrent harness, three runs of each side at 200
+publishers × 4 subscribers, 64 B, 5 s:
+
+| Case | before (delivered/s) | after (delivered/s) |
+|---|---|---|
+| QoS 0, 64 B | 1,791,234 / 1,543,832 / 1,783,194 (median 1,783,194) | 1,850,853 / 1,949,694 / 1,478,418 (median 1,850,853) |
+| QoS 1, 64 B | 623,503 / 838,996 / 751,856 (median 751,856) | 811,454 / 743,136 / 774,253 (median 774,253) |
+
+Both medians moved by under 4 % while the individual runs span ±20 %, so the
+honest reading is that **the rate does not move**: at 200 publishers the profile
+is 82 % read and write syscalls, and one allocation fewer per publication does
+not change how many `read(2)`/`write(2)` calls the window needs. The allocation
+count is the reproducible signal here — it is also what keeps the garbage
+collector out of the delivery path — and the next lever is the syscall side, not
+the decode.
+
 Tried, measured and reverted or rejected:
 
 - **Pointer-sized property block in the pending queue.** The pending table's
@@ -399,6 +448,12 @@ Tried, measured and reverted or rejected:
 - **More subscriber shards.** 8 and 50 subscriber connections on the same 200
   publishers do not raise the delivered total (the machine is syscall- and
   lock-bound); 4 is kept as the default and matches the sharded topic space.
+- **Delivering a view of the read buffer instead of an owned payload.** It would
+  remove the one remaining copy per publication, but every target connection's
+  writer goroutine encodes its packet after the publisher's read loop has moved
+  on, so the delivery would have to be encoded synchronously on the publisher's
+  goroutine — which breaks the single-writer FIFO order and the coalesced
+  writes. Not adopted; the copy is the boundary that keeps those properties.
 
 One defect was found by the harness while doing this and fixed before the
 numbers above: the batch drain loop treated a compact acknowledgement (whose

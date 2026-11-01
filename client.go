@@ -153,6 +153,16 @@ type client struct {
 	// connection's goroutine only.
 	queue []queuedMessage
 
+	// readBuf is this connection's inbound PUBLISH buffer: the topic bytes and the
+	// payload of the packet being handled are slices of it, so a packet costs no
+	// allocation for them (see mqtt.ReadPublishInto). It is owned by the read loop
+	// and grows only: a packet larger than the buffer reallocates it once, and it
+	// can never exceed the broker's MaxPacketSize, because the codec rejects a
+	// larger remaining length before reading the body. Anything that keeps the
+	// payload past the end of handlePublish copies it — exactly once, just before
+	// the publication is routed (see handlePublish).
+	readBuf []byte
+
 	// version is the protocol level of the connection: mqtt.Version311 or
 	// mqtt.Version5. MQTT 3.1 clients decode and encode with the 3.1.1 layout,
 	// which is byte-identical for everything except CONNECT.
@@ -293,6 +303,19 @@ func (c *client) header() mqtt.MessageHeader {
 func (c *client) readMessage() (mqtt.Message, error) {
 	d := mqtt.Decoder{Version: c.version, MaxPacketSize: c.broker.cfg.MaxPacketSize}
 	return d.Decode(c.r)
+}
+
+// readPublish reads one PUBLISH into the connection's reusable buffer, so the
+// topic and the payload of the packet cost no allocation. ErrNotPublish means
+// the next packet is something else: the call consumed nothing and readMessage
+// reads it.
+func (c *client) readPublish() (mqtt.PublishView, error) {
+	view, err := mqtt.ReadPublishInto(c.r, c.version, c.broker.cfg.MaxPacketSize, c.readBuf)
+	if err != nil {
+		return mqtt.PublishView{}, err
+	}
+	c.readBuf = view.Buffer
+	return view, nil
 }
 
 // writeMessage encodes one packet and writes it to the socket on the calling
@@ -984,18 +1007,29 @@ func (c *client) loop() {
 		c.mu.Unlock()
 		_ = c.conn.SetReadDeadline(deadline)
 
-		msg, err := c.readMessage()
-		if err != nil {
-			c.mu.Lock()
-			c.lost = true
-			c.mu.Unlock()
-			c.failProtocol(err)
-			c.close(true)
+		// PUBLISH has its own read path: it is the packet a publisher sends by the
+		// thousand, and it decodes into the connection's reusable buffer instead of
+		// allocating a topic string, a payload and a Properties value per packet.
+		// Every other packet — and every read error, PUBLISH or not — is handled
+		// exactly as before, by the typed decoder below.
+		view, pubErr := c.readPublish()
+		if pubErr == nil {
+			c.handlePublish(view)
+			continue
+		}
+		if !errors.Is(pubErr, mqtt.ErrNotPublish) {
+			c.readFailed(pubErr)
 			return
 		}
+
+		msg, err := c.readMessage()
+		if err != nil {
+			c.readFailed(err)
+			return
+		}
+		// No PUBLISH reaches this switch: readPublish above has already read every
+		// one of them.
 		switch m := msg.(type) {
-		case *mqtt.Publish:
-			c.handlePublish(m)
 		case *mqtt.Puback:
 			c.handlePuback(m)
 		case *mqtt.Pubrec:
@@ -1034,6 +1068,17 @@ func (c *client) loop() {
 			c.broker.log.Debug("gmqx ignoring packet type", "type", msg.Type())
 		}
 	}
+}
+
+// readFailed ends the connection after a read that did not produce a packet: it
+// marks the connection lost (so the will is published), tells an MQTT 5 client why
+// when the error is a protocol violation, and closes.
+func (c *client) readFailed(err error) {
+	c.mu.Lock()
+	c.lost = true
+	c.mu.Unlock()
+	c.failProtocol(err)
+	c.close(true)
 }
 
 // failProtocol tells an MQTT 5 client why the connection is being closed. An
@@ -1092,9 +1137,21 @@ func (c *client) handlePubrel(m *mqtt.Pubrel) {
 	_ = c.enqueueAck(outboundPubcomp, m.PacketID)
 }
 
-func (c *client) handlePublish(m *mqtt.Publish) {
-	topic := m.Topic
-	props := m.Properties
+// handlePublish routes one inbound PUBLISH.
+//
+// The packet arrives as an mqtt.PublishView: its topic and payload are slices of
+// the connection's reusable read buffer (c.readBuf), valid only until the read
+// loop reads the next packet. Everything before the publication below only reads
+// them — the topic name becomes a string (which is what routing indexes on) and
+// the MQTT 5 properties are already owned by the view — so the payload the
+// publication is given is the one copy this path makes: see the call to
+// Broker.publish.
+func (c *client) handlePublish(v mqtt.PublishView) {
+	topic := string(v.Topic)
+	var props mqtt.Properties
+	if v.Properties != nil {
+		props = *v.Properties
+	}
 	// Topic Alias and Subscription Identifier are hop-local: the alias resolves
 	// (and records) the topic name, and neither property is forwarded.
 	alias := props.TopicAlias
@@ -1137,16 +1194,16 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 		c.protocolError(0x90)
 		return
 	}
-	if m.QoS == 2 {
+	if v.QoS == 2 {
 		// A retransmitted QoS 2 PUBLISH while the first one is still pending
 		// (publisher waiting for PUBREL) must be acknowledged again but not
 		// delivered again.
 		c.mu.Lock()
-		_, pending := c.inboundQoS2[m.PacketID]
+		_, pending := c.inboundQoS2[v.PacketID]
 		full := !pending && c.inboundWindowFullLocked()
 		c.mu.Unlock()
 		if pending {
-			_ = c.writePublishAck(2, m.PacketID, 0)
+			_ = c.writePublishAck(2, v.PacketID, 0)
 			return
 		}
 		if full {
@@ -1157,11 +1214,11 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 			// retries (the same rule the broker applies to a publish it cannot accept).
 			c.broker.receiveMaxFull(topic)
 			if c.version == mqtt.Version5 {
-				_ = c.writePublishAck(2, m.PacketID, ReasonQuotaExceeded)
+				_ = c.writePublishAck(2, v.PacketID, ReasonQuotaExceeded)
 			}
 			return
 		}
-	} else if m.QoS == 1 {
+	} else if v.QoS == 1 {
 		// QoS 1 has no handshake to hold a slot open: the broker acknowledges a
 		// publish as soon as it is accepted, so the only way the inbound window can
 		// be full for a QoS 1 PUBLISH is that the client is still waiting for the
@@ -1179,27 +1236,40 @@ func (c *client) handlePublish(m *mqtt.Publish) {
 			return
 		}
 	}
+	// This is where the payload stops being a view of the read buffer and becomes
+	// an owned publication, and it is the only place the broker copies it: every
+	// consumer below may read it after this connection has read the next packet —
+	// the ACL, the interceptors and the EventSink (which a configured
+	// Config.PublishCallbackTimeout calls on its own goroutine, so a shared buffer
+	// would be a data race and not merely a stale read), the retained store, the
+	// offline queue of a persistent session, the cluster spread, and the writer
+	// queue plus the QoS 1/2 inflight table of every target connection. Those keep
+	// their own copies where they always made one; this one is what makes the
+	// reuse of c.readBuf invisible to all of them. A publish that is refused above
+	// — an unknown topic alias, a wildcard topic name, a full inbound window — is
+	// never copied at all.
+	payload := bytes.Clone(v.Payload)
 	res := c.broker.publish(c.origin(), PublishEvent{
 		ConnectionID: c.connID,
 		ClientID:     c.id,
 		Topic:        topic,
-		Payload:      m.Payload,
-		QoS:          m.QoS,
-		PacketID:     m.PacketID,
-		Retain:       m.Retain,
-		Dup:          m.Dup,
+		Payload:      payload,
+		QoS:          v.QoS,
+		PacketID:     v.PacketID,
+		Retain:       v.Retain,
+		Dup:          v.Dup,
 		Properties:   wireProps,
 	}, props)
-	switch m.QoS {
+	switch v.QoS {
 	case 1:
-		c.ackPublish(m.QoS, m.PacketID, res)
+		c.ackPublish(v.QoS, v.PacketID, res)
 	case 2:
 		if res.Accepted() {
 			c.mu.Lock()
-			c.inboundQoS2[m.PacketID] = struct{}{}
+			c.inboundQoS2[v.PacketID] = struct{}{}
 			c.mu.Unlock()
 		}
-		c.ackPublish(m.QoS, m.PacketID, res)
+		c.ackPublish(v.QoS, v.PacketID, res)
 	}
 }
 

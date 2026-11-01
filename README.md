@@ -967,8 +967,12 @@ to honour its context itself.
 TCP/TLS/WebSocket/WSS listeners are provided by the
 [`gnety`](https://github.com/maxid/gnety) transport framework (`RawHandler`
 mode). The MQTT wire format lives in `gnety/codec/mqtt`: every packet is read
-with its typed `Decoder` and written with `mqtt.Encode`, so gmqx owns the broker
-state machine and no packet layout of its own.
+with its codec and written with `mqtt.Encode`, so gmqx owns the broker state
+machine and no packet layout of its own. A PUBLISH — the packet a publisher sends
+by the thousand — takes the codec's reuse path (`mqtt.ReadPublishInto`): it is
+decoded into one grow-only buffer per connection, and the publication owns a copy
+of the payload from `client.handlePublish` on, so nothing downstream can observe
+the reused bytes. Every other packet goes through the typed `Decoder`.
 
 A listener whose configured port is already in use does not fail `Start`: it tries
 the next `PortFallback` ports (default 16, negative disables it) and keeps the
