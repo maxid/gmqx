@@ -1,5 +1,15 @@
 package gmqx
 
+// Wait policy for this file (and the rule a future change must keep): a stall is
+// observed through broker state, never through a sleep. waitWriterWedged is the
+// precondition of every test here, and it waits for the stalled connection's outbound
+// pipeline (inflight plus pending) to hold the warm-up deliveries: a net.Pipe has no
+// buffer and the peer never reads, so those deliveries cannot complete and the writer
+// is blocked on the first one. Do not go back to "len(outq) > 0": the writer batches
+// what is already queued into one write, so under load it can take every warm-up
+// packet and leave the queue empty, and the wait then times out although the writer is
+// wedged.
+
 // Writer-queue tests: every packet of a connection leaves through that
 // connection's single writer goroutine, which writes one packet at a time under
 // Config.WriteTimeout. The point of the tests here is that no other goroutine —
@@ -43,16 +53,27 @@ func pipeClient(t *testing.T, b *Broker, cc confConnect) *confClient {
 	return c
 }
 
-// waitWriterWedged waits until the writer goroutine of clientID is stuck in a
-// write: a packet it already took from the queue never reaches a peer that does
-// not read, so the packets behind it stay queued.
+// waitWriterWedged waits until the warm-up deliveries of clientID cannot have been
+// written: the peer of a pipeClient never reads (net.Pipe is unbuffered), so two
+// deliveries in the connection's outbound pipeline mean the writer is blocked on the
+// first one.
+//
+// The condition is the pipeline (inflight plus pending), not len(outq): the writer
+// drains the queue into one write batch before it blocks on the socket, so a non-empty
+// queue is a scheduling race that a loaded run loses (the writer takes both warm-ups
+// into the batch and the queue stays empty), not a property of a wedged writer.
 func waitWriterWedged(t *testing.T, b *Broker, clientID string) {
 	t.Helper()
 	waitFor(t, "the writer of "+clientID+" to be stuck on the socket", func() bool {
 		b.mu.RLock()
 		c := b.clients[clientID]
 		b.mu.RUnlock()
-		return c != nil && len(c.outq) > 0
+		if c == nil {
+			return false
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return len(c.inflight)+len(c.pending) >= 2
 	})
 }
 
@@ -109,8 +130,8 @@ func TestStalledSubscriberDoesNotBlockClusterDispatch(t *testing.T) {
 
 	stalled := pipeClient(t, b, confConnect{clientID: "cluster-stalled", clean: true})
 	subscribe(t, stalled, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "cluster/#", QoS: 1})
-	// Two warm-up deliveries: the writer takes the first and blocks on the pipe,
-	// the second stays in the queue, which is how the test observes the stall.
+	// Two warm-up deliveries: the peer never reads, so both stay in the connection's
+	// outbound pipeline and the writer blocks on the first one.
 	pub, _ := mustConnect(t, b.Addr(), confConnect{clientID: "cluster-warmup", clean: true})
 	pub.mustPublish(t, confPublish{topic: "cluster/warm", payload: "m0", qos: 1, pid: 1})
 	pub.mustPublish(t, confPublish{topic: "cluster/warm", payload: "m1", qos: 1, pid: 2})
@@ -154,8 +175,8 @@ func TestStalledSubscriberDoesNotBlockWillPublish(t *testing.T) {
 
 	stalled := pipeClient(t, b, confConnect{clientID: "will-stalled", clean: true})
 	subscribe(t, stalled, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "will/#", QoS: 1})
-	// Two warm-up deliveries: the writer takes the first and blocks on the pipe,
-	// the second stays in the queue, which is how the test observes the stall.
+	// Two warm-up deliveries: the peer never reads, so both stay in the connection's
+	// outbound pipeline and the writer blocks on the first one.
 	warm, _ := mustConnect(t, b.Addr(), confConnect{clientID: "will-warmup", clean: true})
 	warm.mustPublish(t, confPublish{topic: "will/warm", payload: "m0", qos: 1, pid: 1})
 	warm.mustPublish(t, confPublish{topic: "will/warm", payload: "m1", qos: 1, pid: 2})

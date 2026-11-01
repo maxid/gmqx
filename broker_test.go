@@ -1,5 +1,14 @@
 package gmqx
 
+// Wait policy for the raw test clients in this file (and the rule a future change must
+// keep): dialTestClient fixes one absolute socket deadline for the CONNECT/CONNACK
+// handshake. A test that spends time waiting on broker or cluster state after dialing
+// and then blocks on a read re-arms the deadline with armDeadline: the condition it
+// waits for is observed through the broker's own state (Members(), a cluster accessor,
+// a handler), never by sleeping, and the read's ceiling is testClientIOTimeout (10 s)
+// so a lost delivery still fails. Never widen the handshake deadline to cover a test
+// that waits first, and never replace such a wait with a sleep.
+
 import (
 	"bufio"
 	"bytes"
@@ -10,9 +19,23 @@ import (
 	"time"
 )
 
+// testClientIOTimeout is the ceiling of one blocking exchange with a test client.
+// It is a ceiling, not a timing assertion: a test whose delivery is lost still fails,
+// only after 10 s instead of hanging.
+const testClientIOTimeout = 10 * time.Second
+
 type testClient struct {
 	conn net.Conn
 	r    *bufio.Reader
+}
+
+// armDeadline gives the next exchange a fresh deadline. dialTestClient fixes one
+// absolute deadline for the handshake, so a test that waits on cluster state between
+// dialing and the read that proves routing re-arms it here instead of letting the
+// wait eat the socket timeout (which is exactly how the gossip and TCP cluster tests
+// used to flake under load).
+func (c *testClient) armDeadline(timeout time.Duration) {
+	_ = c.conn.SetDeadline(time.Now().Add(timeout))
 }
 
 func dialTestClient(t *testing.T, addr, clientID string) *testClient {

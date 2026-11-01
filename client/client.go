@@ -123,8 +123,6 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		close(c.closedCh)
-		c.cancel()
 		c.mu.Lock()
 		cs, hc := c.conn, c.handshakeConn
 		c.mu.Unlock()
@@ -136,9 +134,19 @@ func (c *Client) Close() error {
 		if cs != nil {
 			// Best effort: the DISCONNECT tells the server not to publish the will.
 			// A dead socket just makes the write fail.
+			//
+			// The write happens before the supervisor is woken below: teardown
+			// shuts the connection down, and a socket closed under this write would
+			// turn an orderly close into an abrupt one, which publishes the will.
+			// The write is bounded by Config.WriteTimeout.
 			c.sendDisconnect(cs)
 			cs.shutdown()
 		}
+		// The supervisor is woken only now, so its teardown cannot close the
+		// socket before DISCONNECT is on the wire. Cancelling afterwards still
+		// aborts a reconnect attempt (cs was nil above) before the join below.
+		close(c.closedCh)
+		c.cancel()
 		<-c.sessionDone
 		c.stopDelivery()
 		<-c.deliverDone
@@ -237,6 +245,11 @@ func (c *Client) teardown(cs *connState, err error) {
 		c.conn = nil
 	}
 	c.connected = false
+	if c.closed.Load() {
+		// Close is what ended this connection, so a call waiting on it sees the close
+		// rather than the socket error that closing the connection produced.
+		err = ErrClosed
+	}
 	c.failRequestsLocked(err)
 	c.broadcastSlotsLocked()
 	if !c.cfg.Reconnect.Enabled || c.closed.Load() {

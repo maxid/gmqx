@@ -1,10 +1,27 @@
 package client_test
 
+// Wait policy for this file (and the rule a future change must keep): every wait
+// is on an observable event, with a generous ceiling that only exists so a broken
+// build fails instead of hanging. A broker-side event is observed through the
+// EventSink the broker calls (OnDisconnect/OnConnectionLost/OnPublish) or through
+// a channel the test controls; a client-side event is observed through the
+// callbacks or through Connected(). No test in this file uses a sleep as its
+// detection mechanism: the negative will assertion below waits for the broker to
+// resolve the connection first, so a sleep can neither hide nor invent the outcome.
+//
+// TestClientWillNotPublishedOnClose is the reason for that rule: Close used to
+// wake the supervisor before DISCONNECT was written, so teardown could close the
+// socket first and the server would publish the will of an "abrupt" close. The
+// test now watches the broker's own view of the close (a clean OnDisconnect, never
+// OnConnectionLost, and no accepted publish on the will topic), which is what
+// fails if the ordering regresses.
+
 import (
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -336,11 +353,79 @@ func TestClientNegativeAcknowledgement(t *testing.T) {
 	}
 }
 
+// closeWatcher is an EventSink that records how the broker saw one connection end
+// and what it published while the test ran. It is the observable condition the will
+// test waits on: the broker resolves the will of a closing connection before it calls
+// the disconnect hook, so once ended is closed no will publication can still be
+// pending.
+type closeWatcher struct {
+	clientID string
+	topic    string
+
+	mu        sync.Mutex
+	clean     int
+	lost      int
+	published []string
+	once      sync.Once
+	ended     chan struct{}
+}
+
+func newCloseWatcher(clientID, topic string) *closeWatcher {
+	return &closeWatcher{clientID: clientID, topic: topic, ended: make(chan struct{})}
+}
+
+func (w *closeWatcher) OnConnect(context.Context, gmqx.ConnectInfo) {}
+
+func (w *closeWatcher) OnPing(context.Context, string) {}
+
+func (w *closeWatcher) OnDisconnect(_ context.Context, clientID string, _ error) {
+	if clientID != w.clientID {
+		return
+	}
+	w.mu.Lock()
+	w.clean++
+	w.mu.Unlock()
+	w.once.Do(func() { close(w.ended) })
+}
+
+func (w *closeWatcher) OnConnectionLost(_ context.Context, clientID string, _ error) {
+	if clientID != w.clientID {
+		return
+	}
+	w.mu.Lock()
+	w.lost++
+	w.mu.Unlock()
+	w.once.Do(func() { close(w.ended) })
+}
+
+func (w *closeWatcher) OnPublish(_ context.Context, ev gmqx.PublishEvent) gmqx.PublishResult {
+	w.mu.Lock()
+	if ev.Topic == w.topic {
+		w.published = append(w.published, string(ev.Payload))
+	}
+	w.mu.Unlock()
+	return gmqx.PublishResult{Disposition: gmqx.PublishAccepted}
+}
+
+func (w *closeWatcher) counts() (clean, lost int, published []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.clean, w.lost, append([]string(nil), w.published...)
+}
+
 // TestClientWillNotPublishedOnClose is the counterpart of the abrupt-disconnect
 // will test: a client that closes in an orderly way sends DISCONNECT, so the
 // broker does not publish its will.
+//
+// The wait is the broker's own view of the close: c.Close returns after the
+// DISCONNECT is on the wire, and the test then waits (bounded, 10 s) for the broker
+// to report the end of that connection. A clean OnDisconnect proves the server
+// processed the DISCONNECT; OnConnectionLost proves it saw an abrupt close instead.
+// The will is resolved before either hook runs, so "no accepted publish on the will
+// topic" needs no settle period to be meaningful.
 func TestClientWillNotPublishedOnClose(t *testing.T) {
-	b := startBroker(t, gmqx.Config{})
+	w := newCloseWatcher("no-will-client", "will/clean")
+	b := startBroker(t, gmqx.Config{Sink: w})
 	ctx := testContext(t)
 	rec := newRecorder(2)
 
@@ -368,7 +453,25 @@ func TestClientWillNotPublishedOnClose(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	rec.none(t, 300*time.Millisecond)
+
+	select {
+	case <-w.ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the broker did not report the end of the will client within 10s")
+	}
+	clean, lost, published := w.counts()
+	if lost != 0 {
+		t.Fatalf("the broker saw %d abrupt close(s) after an orderly Close: DISCONNECT was lost, so the will is published", lost)
+	}
+	if clean != 1 {
+		t.Fatalf("the broker reported %d clean disconnects, want 1", clean)
+	}
+	if len(published) != 0 {
+		t.Fatalf("the broker published the will %d time(s): %v", len(published), published)
+	}
+	// The broker-side checks above are the assertion; this only keeps the
+	// subscriber honest about a delivery the broker said it never made.
+	rec.none(t, 100*time.Millisecond)
 }
 
 // TestClientAssignedClientIDReusedOnReconnect checks the other half of the

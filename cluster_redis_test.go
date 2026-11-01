@@ -1,5 +1,20 @@
 package gmqx
 
+// Wait policy for this file (and the rule a future change must keep): every wait is
+// on an observable condition with a generous ceiling (redisWaitCeiling, 10 s).
+// Nothing sleeps for a fixed time and then asserts.
+//
+// Two conditions are easy to get wrong here:
+//
+//   - Members() reads the member keys straight from Redis, but Spread routes through
+//     the node's *cached* routing view, which is refreshed at most once per
+//     SummaryInterval. Waiting for Members() therefore does not make a peer routable:
+//     a kick or a retained publish spread in that window is written to no channel and
+//     is lost. A test that asserts such a delivery waits for waitRedisView first.
+//   - a Redis node's SUBSCRIBE is confirmed before it registers itself (see
+//     redisCluster.Start), so a registered member is a live subscriber; there is no
+//     separate subscription wait to add.
+
 import (
 	"context"
 	"encoding/json"
@@ -12,6 +27,10 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
+
+// redisWaitCeiling bounds a Redis cluster wait. It exists so a genuinely broken build
+// fails instead of hanging; a correct one returns as soon as its condition holds.
+const redisWaitCeiling = 10 * time.Second
 
 // runMiniRedis starts miniredis with clock-driven TTLs. Without ClockTTL a
 // miniredis key only expires on an explicit FastForward, and a test that asserts
@@ -74,7 +93,7 @@ func redisMemberIDs(c *redisCluster) []string {
 func waitRedisMembers(t *testing.T, c *redisCluster, want ...string) {
 	t.Helper()
 	sort.Strings(want)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(redisWaitCeiling)
 	var got []string
 	for time.Now().Before(deadline) {
 		got = redisMemberIDs(c)
@@ -91,7 +110,7 @@ func waitRedisMembers(t *testing.T, c *redisCluster, want ...string) {
 // test that asserts on directed delivery waits for this and not for a sleep.
 func waitRedisSummary(t *testing.T, c *redisCluster, nodeID string, want ...string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(redisWaitCeiling)
 	var got []string
 	for time.Now().Before(deadline) {
 		if filters, ok := c.viewSummary(nodeID); ok {
@@ -111,7 +130,7 @@ func waitRedisSummary(t *testing.T, c *redisCluster, nodeID string, want ...stri
 func waitRedisView(t *testing.T, c *redisCluster, want ...string) {
 	t.Helper()
 	sort.Strings(want)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(redisWaitCeiling)
 	var got []string
 	for time.Now().Before(deadline) {
 		got = c.viewMembers()
@@ -133,7 +152,7 @@ type redisCounter interface {
 // and kicks.
 func waitRedisCounts(t *testing.T, h redisCounter, wantPublish, wantKick int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(redisWaitCeiling)
 	var pub, kick int
 	for time.Now().Before(deadline) {
 		pub, kick = h.counts()
@@ -229,6 +248,11 @@ func TestRedisClusterKickAndRetainedBroadcast(t *testing.T) {
 	startRedisCluster(t, mr, "b", hb, cfg)
 	startRedisCluster(t, mr, "c", hc, cfg)
 	waitRedisMembers(t, a, "b", "c")
+	// Members() is read from Redis; the kick is routed through a's cached routing
+	// view, which is only refreshed once per SummaryInterval. Without this wait the
+	// kick can be spread before the view holds b and c, and a kick is published once
+	// with no retry.
+	waitRedisView(t, a, "b", "c")
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterKick, NodeID: "a", ClientID: "device-1",
@@ -680,7 +704,7 @@ func TestRedisClusterSummaryCap(t *testing.T) {
 	}
 	waitSummary := func(want ...string) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(redisWaitCeiling)
 		var got []string
 		for time.Now().Before(deadline) {
 			got = summary().Filters

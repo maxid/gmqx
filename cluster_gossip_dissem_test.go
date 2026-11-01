@@ -1,5 +1,22 @@
 package gmqx
 
+// Wait policy for this file (and the rule a future change must keep): every wait is
+// on an observable condition with a generous ceiling (gossipWaitCeiling, 10 s), and
+// a delivery assertion waits for the cluster to be *settled*, not merely for a peer
+// to be in the member view or for a link to exist.
+//
+// Two nodes that dial each other reconcile to one physical connection just after
+// startup: the link that loses is closed, and for a few milliseconds the peer has no
+// link at all. A gossip event queued on a closing link is dropped and is never
+// retried, so a test that spreads into that window loses the event it then waits
+// for. waitGossipLink covers "a link exists"; waitGossipSettled covers "the link set
+// has stopped changing", which is what a one-shot delivery needs. The evidence for
+// this was a flake whose drop counter said "cluster_unreachable: no link to d" while
+// the same link existed again a millisecond later.
+//
+// Do not replace these waits with a sleep: the failure they prevent is a dropped
+// event, and no amount of sleeping makes a dropped event arrive.
+
 import (
 	"context"
 	"sync"
@@ -29,7 +46,7 @@ func (h *gossipRecorder) targetCount() int {
 
 func (h *gossipRecorder) waitTargets(t *testing.T, want int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(gossipWaitCeiling)
 	for time.Now().Before(deadline) {
 		if h.targetCount() >= want {
 			return
@@ -41,7 +58,7 @@ func (h *gossipRecorder) waitTargets(t *testing.T, want int) {
 
 func (h *gossipRecorder) waitPublishes(t *testing.T, want int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(gossipWaitCeiling)
 	for time.Now().Before(deadline) {
 		if n, _ := h.counts(); n >= want {
 			return
@@ -54,7 +71,7 @@ func (h *gossipRecorder) waitPublishes(t *testing.T, want int) {
 
 func (h *gossipRecorder) waitKicks(t *testing.T, want int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(gossipWaitCeiling)
 	for time.Now().Before(deadline) {
 		if _, n := h.counts(); n >= want {
 			return
@@ -87,7 +104,7 @@ func (h *gossipFilterHandler) setFilters(filters ...string) {
 
 func waitGossipSummary(t *testing.T, c *gossipCluster, nodeID string, want ...string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(gossipWaitCeiling)
 	var got []string
 	for time.Now().Before(deadline) {
 		if filters, ok := c.memberSummary(nodeID); ok {
@@ -149,6 +166,7 @@ func TestGossipDisseminationForwardsThroughRelay(t *testing.T) {
 	waitGossipSummary(t, a, "b", "t/#")
 	waitGossipLink(t, a, "b")
 	waitGossipLink(t, b, "c")
+	waitGossipSettled(t, a, b)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "t/x", Payload: []byte("relayed"),
@@ -202,6 +220,7 @@ func TestGossipDisseminationFanoutBroadcasts(t *testing.T) {
 	waitGossipMembers(t, c, "a", "b")
 	waitGossipLink(t, a, "b")
 	waitGossipLink(t, a, "c")
+	waitGossipSettled(t, a, b, c)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "broadcast/x", Payload: []byte("all"),
@@ -255,6 +274,7 @@ func TestGossipRoutingSummaryPrecision(t *testing.T) {
 	waitGossipSummary(t, a, "c", "other/#")
 	waitGossipLink(t, a, "b")
 	waitGossipLink(t, a, "c")
+	waitGossipSettled(t, a)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "routed/x", Payload: []byte("b"),
@@ -309,6 +329,9 @@ func TestGossipRoutingUnknownSummaryFallsBack(t *testing.T) {
 	waitGossipLink(t, a, "b")
 	waitGossipLink(t, b, "c")
 	waitGossipLink(t, b, "d")
+	// The relay's link to d must survive startup: a frame written into a link that
+	// is being superseded is dropped and the event is not retried.
+	waitGossipSettled(t, a, b)
 	// d advertises nothing at all: its summary is unknown.
 
 	if err := a.Spread(context.Background(), ClusterMessage{
@@ -338,6 +361,7 @@ func TestGossipDisseminationKickBroker(t *testing.T) {
 	waitGossipMembers(t, cb.(*gossipCluster), "a")
 	waitGossipLink(t, ca.(*gossipCluster), "b")
 	waitGossipLink(t, cb.(*gossipCluster), "a")
+	waitGossipSettled(t, ca.(*gossipCluster), cb.(*gossipCluster))
 
 	remote := dialTestClient(t, b.Addr(), "dup")
 	// Let the kick b spread on the CONNECT reach a before the same client id
@@ -367,6 +391,7 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 	waitGossipMembers(t, gcb, "a", "c")
 	waitGossipMembers(t, gcc, "a", "b")
 	waitGossipLink(t, gca, "b")
+	waitGossipSettled(t, gca, gcb)
 
 	target, _ := mustConnect(t, b.Addr(), confConnect{clientID: "gossip-target", clean: true})
 	waitFor(t, "the presence claim to reach a", func() bool {
@@ -445,6 +470,7 @@ func TestGossipNamespaceIsolationAndDedup(t *testing.T) {
 	waitGossipMembers(t, b, "a")
 	waitGossipLink(t, a, "b")
 	waitGossipLink(t, b, "a")
+	waitGossipSettled(t, a, b)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "ns/x", Payload: []byte("a"),

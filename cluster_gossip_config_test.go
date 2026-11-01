@@ -1,5 +1,12 @@
 package gmqx
 
+// Wait policy for this file (and the rule a future change must keep): a wait is on an
+// observable cluster condition with a generous ceiling (gossipWaitCeiling, 10 s).
+// TestClusterEnabledGossipEndToEnd additionally arms a fresh socket deadline before
+// its blocking reads: dialTestClient fixes one absolute deadline for the whole
+// handshake, and a test that spends time waiting on cluster state before it publishes
+// must not charge that wait to the socket timeout. Nothing here is a fixed sleep.
+
 import (
 	"context"
 	"strings"
@@ -250,10 +257,15 @@ func TestClusterEnabledGossipEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = b.Stop(context.Background()) })
-	waitGossipMembers(t, a.cfg.ClusterBackend.(*gossipCluster), "b")
-	waitGossipMembers(t, b.cfg.ClusterBackend.(*gossipCluster), "a")
-	waitGossipLink(t, a.cfg.ClusterBackend.(*gossipCluster), "b")
-	waitGossipLink(t, b.cfg.ClusterBackend.(*gossipCluster), "a")
+	gcsA, gcsB := a.cfg.ClusterBackend.(*gossipCluster), b.cfg.ClusterBackend.(*gossipCluster)
+	waitGossipMembers(t, gcsA, "b")
+	waitGossipMembers(t, gcsB, "a")
+	waitGossipLink(t, gcsA, "b")
+	waitGossipLink(t, gcsB, "a")
+	// The publish below is a one-shot gossip event: wait for the startup link
+	// reconciliation to finish, otherwise it can be written into a link that is
+	// being superseded and dropped.
+	waitGossipSettled(t, gcsA, gcsB)
 
 	sub := dialTestClient(t, b.Addr(), "default-sub")
 	body := []byte{0, 1}
@@ -263,12 +275,20 @@ func TestClusterEnabledGossipEndToEnd(t *testing.T) {
 	if h, p, err := sub.readPacket(); err != nil || h>>4 != 9 || len(p) < 3 || p[2] != 0 {
 		t.Fatalf("suback: h=%x p=%v err=%v", h, p, err)
 	}
+	// The SUBACK proves b's broker has the subscription, not that a's view of b's
+	// summary does: the summary update travels as gossip, and a directed routing
+	// decision made before it arrives sees a fresh, empty summary and skips b. Wait
+	// for the advertisement the publish will be routed by.
+	waitGossipSummary(t, gcsA, "b", "default/x")
 
 	pub := dialTestClient(t, a.Addr(), "default-pub")
 	pubBody := appendString(nil, "default/x")
 	pubBody = append(pubBody, []byte("hello")...)
 	pub.writePacket(0x30, pubBody)
 
+	// A fresh deadline for the read that proves the routing: the handshake deadline
+	// of dialTestClient is not a bound on the whole test.
+	sub.armDeadline(testClientIOTimeout)
 	h, p, err := sub.readPacket()
 	if err != nil || h>>4 != 3 {
 		t.Fatalf("publish: h=%x err=%v", h, err)
