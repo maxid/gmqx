@@ -269,7 +269,10 @@ QoS 2 improved ≈2×. The delivered rate at QoS 1/2 is the *sustained end-to-en
 rate: the publisher's PUBACK bounds the pipeline, the subscriber's inflight
 window bounds the delivery, and the small `inflight_overflow` count is the
 broker's documented overflow policy for a delivery that finds the bounded queue
-full.
+full. (The harness's subscribers are clean sessions, so the same drops are
+reported as `inflight_overflow_clean` by a build that takes a *persistent*
+session offline at a full inflight queue instead of dropping; the policy for a
+clean session and the numbers above are unchanged.)
 
 The per-second curve of the profiled case (QoS 1, 64 B, after), which is what the
 harness prints, shows the window is steady rather than a burst:
@@ -342,7 +345,8 @@ by the pending/inflight tables copying it.
 4. **QoS 1/2 delivery window.** Per subscriber connection the delivered rate is
    window / acknowledgement round trip. The harness configures a 256-deep window;
    at 200 publishers this is the bound, and the ~1 % `inflight_overflow` drops
-   are its documented overflow.
+   (reported as `inflight_overflow_clean`: the harness's subscribers are clean
+   sessions) are its documented overflow.
 
 ### What changed, and what each change was worth
 

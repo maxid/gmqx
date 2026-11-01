@@ -457,6 +457,64 @@ func (b *Broker) sweepExpiredSessions() {
 	}
 }
 
+// absorbPendingLocked moves the deliveries a connection still owed its inflight
+// window into the session queue it leaves behind, in the order they were queued.
+// They were acknowledged to their publisher and never written, so a persistent
+// session must not lose them with the connection: they take their place behind
+// whatever the offline queue still holds, which is where the next CONNECT drains
+// them from.
+//
+// This is the queue a persistent session gets instead of a drop when its inflight
+// queue overflows (see client.sendPublish), and it is also what a connection that
+// simply went away leaves behind. The queue's own bounds apply exactly as they do
+// to a message published while the session is offline — Config.MaxOfflineQueueSize
+// drops the oldest messages of the combined queue, Config.MaxTotalOfflineMessages
+// rejects the newest — and they are counted with the same reasons
+// ("offline_queue_full", "offline_queue_total"), so the offline queue's capacity
+// stays the single, documented loss point of a persistent session.
+//
+// The caller holds b.mu and c.mu, and has not saved the session yet: the counter
+// of queued messages follows len(c.queue) when saveStoredSession stores it.
+func (b *Broker) absorbPendingLocked(c *client) {
+	if len(c.pending) == 0 {
+		return
+	}
+	pending := c.pending
+	c.pending = nil
+	rejected := 0
+	for _, m := range pending {
+		if limit := b.cfg.MaxTotalOfflineMessages; limit > 0 && b.offlineQueued+len(c.queue) >= limit {
+			rejected++
+			continue
+		}
+		c.queue = append(c.queue, queuedMessage{
+			topic:   m.topic,
+			payload: m.payload,
+			qos:     m.qos,
+			retain:  m.retain,
+			props:   m.props,
+		})
+	}
+	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(c.queue) > maxQueue {
+		c.queue = c.queue[len(c.queue)-maxQueue:]
+		b.metrics.RecordDroppedMessage("offline_queue_full")
+	}
+	for i := 0; i < rejected; i++ {
+		b.metrics.RecordDroppedMessage("offline_queue_total")
+	}
+}
+
+// dropPendingLocked discards the deliveries a connection still owed, counting each
+// one with reason. It is the last resort: a session that another node owns (or that
+// was taken over here) has no queue on this node to keep them in. The caller holds
+// b.mu and c.mu.
+func (b *Broker) dropPendingLocked(c *client, reason string) {
+	for range c.pending {
+		b.metrics.RecordDroppedMessage(reason)
+	}
+	c.pending = nil
+}
+
 // enqueueOffline appends one publication to the queue of the persistent session
 // target names. It is the write half of an offline LocalTarget.
 //

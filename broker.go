@@ -773,8 +773,12 @@ func (b *Broker) register(c *client) error {
 			} else {
 				// The old connection owns the state, so the replacement takes it over
 				// directly — the QoS 2 state of both directions included, exactly as a
-				// store would have carried it.
+				// store would have carried it. The deliveries it still owed its inflight
+				// window move into the queue it hands over instead of being lost with
+				// it: a client that reconnects before unregister has stored the session
+				// gets them now, one that reconnects later takes them from the store.
 				inboundQoS2, inflight := old.snapshotQoS2Locked()
+				b.absorbPendingLocked(old)
 				takeover = &session{
 					clientID:    old.id,
 					subs:        copySubscriptions(old.subs),
@@ -784,6 +788,11 @@ func (b *Broker) register(c *client) error {
 				}
 				old.queue = nil
 			}
+			// The pending queue of the displaced connection now belongs to the
+			// replacement (or to nothing at all, when the session came from the store),
+			// so a delivery that still reaches it is queued through the offline path
+			// instead of being dropped (see client.sendPublish).
+			old.handoff = handoffStored
 		}
 		old.mu.Unlock()
 		b.mu.Unlock()
@@ -923,12 +932,37 @@ func (b *Broker) unregister(c *client) {
 	// store the pre-existing behavior stays: the stored state of a kicked session
 	// is kept here, because only this node can ever reach it.
 	movedAway := superseded || (kicked && b.sharedStore())
-	if !movedAway {
+	switch {
+	case movedAway:
+		// The session belongs to another connection now, so this node writes nothing to
+		// the store: it neither saves its own copy back nor deletes the key (see
+		// above). A delivery that still arrives with a target of this connection is
+		// queued through the offline path — which reaches the replacement when it is a
+		// local one — and a clean session, which has no queue anywhere, ends with the
+		// connection as it always did.
 		if persistent {
-			b.saveStoredSession(key, c)
+			b.dropPendingLocked(c, "offline_session_missing")
+			c.handoff = handoffStored
 		} else {
-			b.deleteStoredSession(key)
+			c.pending = nil
 		}
+	case persistent:
+		// The deliveries the connection still owed its inflight window are not lost
+		// with it: they join the session queue before it is stored
+		// (absorbPendingLocked), so an inflight overflow — which is what takes a
+		// session offline in the first place — keeps what the publisher was already
+		// acknowledged for.
+		b.absorbPendingLocked(c)
+		b.saveStoredSession(key, c)
+		// The session is stored: a delivery that still arrives here with a stale
+		// target of this connection is queued for it through the offline path
+		// instead of being dropped (see client.sendPublish).
+		c.handoff = handoffStored
+	default:
+		b.deleteStoredSession(key)
+		// A clean session has no queue and no store entry: what it still owed ends
+		// with the connection, which is what declaring the session clean means.
+		c.pending = nil
 	}
 	c.mu.Unlock()
 	if movedAway {

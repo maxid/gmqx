@@ -10,7 +10,8 @@
 - [x] MQTT 5: CONNACK capabilities, Topic Alias, User Property forwarding, subscription options
 - [x] Persistent-session storage behind the `SessionStore` seam, bounded offline queue, MQTT 5 session expiry and a bounded sweeper
 - [x] Outbound QoS 1/2 retransmission (DUP, PUBREL retries, one timer per connection) and inflight windows in both directions
-- [x] Bounded per-connection inflight queue (a window-full delivery waits instead of being dropped)
+- [x] Bounded per-connection inflight queue (a window-full delivery waits instead of being dropped); a full queue of a persistent session takes the session offline and queues there, a clean session drops with `inflight_overflow_clean`
+- [x] Persistence and availability blueprint (`docs/PERSISTENCE.md`): what survives a restart, the store contract, Redis and SQL blueprints, the availability model and a sizing worksheet
 - [x] One writer goroutine per connection, bounded outbound queue and a write deadline per packet
 - [x] CONNECT-phase read deadline and authorization timeouts (`ConnectTimeout`, `AuthTimeout`)
 - [x] Shared subscriptions (`$share/{ShareName}/{filter}`): validated per §4.8.2, one live member per group round robin, one node per group across a cluster (origin-side election over the advertised groups), no retained replay and no shared offline queue

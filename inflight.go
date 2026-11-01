@@ -25,10 +25,22 @@ package gmqx
 // Config.MaxInflightQueueSize) instead of blocking the publishing goroutine — a
 // publisher has already been acknowledged by the sink and must not be stalled by
 // a slow subscriber — or being skipped: an acknowledgement that frees a slot
-// drains the queue in arrival order. Only a full pending queue drops a delivery,
-// and that drop is counted twice and logged with the client id (see sendPublish).
-// The pending queue belongs to the live connection, unlike the stored offline
-// queue of a persistent session, and it ends with the connection.
+// drains the queue in arrival order. The pending queue belongs to the live
+// connection, unlike the stored offline queue of a persistent session, and it
+// ends with the connection.
+//
+// A pending queue that is full is where the two kinds of session part. A
+// persistent session is not dropped from at all: the delivery joins the queue and
+// the connection is closed, so the session — its subscriptions, the exchanges it
+// has not confirmed and everything still waiting in pending — is stored and the
+// next CONNECT drains it. That hand-off reuses the machinery a lost connection
+// already has (close → unregister → SessionStore → drain after the next CONNACK);
+// the only loss points that remain are the offline queue's own capacity limits
+// (Config.MaxOfflineQueueSize, Config.MaxTotalOfflineMessages), which are a
+// documented capacity limit and not a defect. A clean session has nowhere to
+// queue — its state ends with the connection — so the delivery is still dropped
+// there, on one explicit path with its own reason ("inflight_overflow_clean").
+// See sendPublish.
 //
 // The reference broker of this family retries every unacked PUBLISH but never
 // sets DUP and has no window at all; both are defects this implementation does
@@ -51,9 +63,30 @@ import (
 var (
 	// errClientClosed reports a write to a connection that is already gone.
 	errClientClosed = errors.New("gmqx: connection closed")
-	// errInflightFull reports an outbound QoS 1/2 delivery that was dropped: the
-	// connection's inflight window and the queue waiting behind it are both full.
+	// errInflightFull reports an outbound QoS 1/2 delivery that was dropped: a
+	// clean session's inflight window and the queue waiting behind it are both
+	// full, and a clean session has no offline queue to keep the delivery in.
 	errInflightFull = errors.New("gmqx: inflight window full")
+)
+
+// handoffState is where a persistent session of a live connection stands while it
+// moves to its offline queue. The value is kept under c.mu, so a delivery and the
+// unregister that stores the session cannot disagree about which side of the move
+// the delivery belongs to.
+type handoffState byte
+
+const (
+	// handoffNone is a connection that delivers normally. Every clean session
+	// stays here: it has no offline queue to move to.
+	handoffNone handoffState = iota
+	// handoffCollecting is a persistent connection that is closing. Its session is
+	// not stored yet, so a delivery that still arrives waits in pending, in arrival
+	// order, next to the deliveries that were already waiting there.
+	handoffCollecting
+	// handoffStored is a connection whose session has been stored (unregister ran)
+	// or handed to a new connection (a take-over). A delivery that still arrives
+	// with a stale target of this connection is queued through the offline path.
+	handoffStored
 )
 
 // inflightState is where an outbound exchange stands.
@@ -566,33 +599,152 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 // sendPublish is the outbound delivery path of a live session. A QoS 1/2 delivery
 // that would exceed the connection's inflight window is queued for the connection
 // and sent, in arrival order, as soon as an acknowledgement frees a slot: the
-// publisher is never blocked and the message is never lost. Only a queue that is
-// full drops the delivery, and that drop is counted twice and logged with the
-// client id — a publisher's successful PUBACK is a promise about the sink, so a
-// delivery the broker cannot keep has to be visible.
+// publisher is never blocked and the message is never lost.
+//
+// A pending queue that is full is the one place where the policy differs by kind
+// of session, because only one of the two has somewhere to keep the delivery:
+//
+//   - a persistent session is not dropped from. The delivery joins the queue, the
+//     session is taken offline — the socket is closed, exactly as it is for a lost
+//     connection, so the read loop unwinds and unregister stores the session —
+//     and everything the connection still owed is stored with it (see
+//     Broker.absorbPendingLocked). The next CONNECT of that client id resumes the
+//     session and drains the queue. Taking the session offline is counted with
+//     Metrics.RecordOverflow("inflight_overflow") and logged at Warn level with
+//     the client id and the reason "inflight_overflow"; nothing is dropped, so no
+//     drop counter moves.
+//   - a clean session has nowhere to queue, because its state ends with the
+//     connection. The delivery is dropped on that one explicit path, counted with
+//     Metrics.RecordDroppedMessage("inflight_overflow_clean") — the offline queue
+//     of a persistent session does not exist for it — and logged with the same
+//     reason.
+//
+// Deliveries that arrive while the hand-off is in flight are not a third case:
+// they wait in the same pending queue (handoffCollecting) or, once the session is
+// stored, are queued for it through the offline path the broker already has
+// (handoffStored), so a publisher that holds a target of a connection that just
+// went away loses nothing and never observes an error.
 func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	switch c.handoff {
+	case handoffCollecting:
+		// The session is on its way to the store: the delivery waits in the very
+		// queue unregister moves into it, so it keeps its place behind everything
+		// queued before it.
+		c.collectLocked(pendingMessage{topic: topic, payload: payload, qos: qos, retain: retain, props: props})
+		c.mu.Unlock()
+		return nil
+	case handoffStored:
+		// The session is stored (or now belongs to another connection): the delivery
+		// is queued exactly like one that arrives while the session is offline,
+		// which may find the client already reconnected and deliver it live.
+		key := namespaceKey(c.namespace, c.id)
+		clientID := c.id
+		c.mu.Unlock()
+		c.broker.enqueueOffline(
+			LocalTarget{ClientID: clientID, sessionKey: key, QoS: qos, Retain: retain},
+			deliveryPublication(topic, payload, qos, retain, props), props)
+		return nil
+	}
 	// writeClosed also covers a connection that is closing, whose socket failed or
 	// which is being disconnected as a slow consumer: its queue is not growing any
 	// more, so a delivery is refused instead of parked in it.
 	if c.closed || c.writeClosed.Load() {
+		c.mu.Unlock()
 		return errClientClosed
 	}
-	if qos > 0 && c.windowFullLocked(qos) {
-		limit := c.inflightQueueLimit()
-		if len(c.pending) >= limit {
-			c.broker.metrics.RecordDroppedMessage("inflight_overflow")
-			c.broker.metrics.RecordOverflow("inflight")
-			c.warn("gmqx dropped a delivery at a full inflight queue",
-				"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow",
-				"qos", qos, "topic", topic, "queue", limit)
-			return errInflightFull
-		}
+	if qos == 0 || !c.windowFullLocked(qos) {
+		err := c.writePublishLocked(topic, payload, qos, retain, props)
+		c.mu.Unlock()
+		return err
+	}
+	limit := c.inflightQueueLimit()
+	if len(c.pending) < limit {
 		c.pending = append(c.pending, pendingMessage{topic: topic, payload: payload, qos: qos, retain: retain, props: props})
+		c.mu.Unlock()
 		return nil
 	}
-	return c.writePublishLocked(topic, payload, qos, retain, props)
+	if !c.persistentSession() {
+		// A clean session trades durability for statelessness: there is no queue to
+		// keep the delivery in, so it is dropped — visibly, and never silently.
+		c.mu.Unlock()
+		c.broker.metrics.RecordDroppedMessage("inflight_overflow_clean")
+		c.broker.metrics.RecordOverflow("inflight")
+		c.warn("gmqx dropped a delivery at a full inflight queue of a clean session",
+			"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow_clean",
+			"qos", qos, "topic", topic, "queue", limit)
+		return errInflightFull
+	}
+	// A persistent session is taken offline instead of losing a delivery its
+	// publisher was already acknowledged for: the message joins the queue, the
+	// connection is closed the way a lost one is, and unregister stores the session
+	// with the queue in it.
+	c.collectLocked(pendingMessage{topic: topic, payload: payload, qos: qos, retain: retain, props: props})
+	c.handoff = handoffCollecting
+	c.mu.Unlock()
+	c.broker.metrics.RecordOverflow("inflight_overflow")
+	c.warn("gmqx taking a session offline at a full inflight queue",
+		"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow",
+		"qos", qos, "topic", topic, "queue", limit)
+	c.closeOverflowed()
+	return nil
+}
+
+// collectLocked queues one more delivery in the pending queue of a session that is
+// being taken offline. The collection window is short — the socket is already
+// closed, so the read loop that leads to unregister is on its way — but it is
+// bounded like the queue these deliveries are going to: past the per-session
+// offline cap the oldest one goes, counted exactly as that queue counts its own
+// drops ("offline_queue_full"). A deployment that disabled the cap still gets the
+// inflight queue's own bound, because a connection that is being taken offline
+// must not grow without one. The caller holds c.mu.
+func (c *client) collectLocked(m pendingMessage) {
+	c.pending = append(c.pending, m)
+	limit := c.collectLimit()
+	if len(c.pending) > limit {
+		dropped := len(c.pending) - limit
+		c.pending = c.pending[dropped:]
+		for i := 0; i < dropped; i++ {
+			c.broker.metrics.RecordDroppedMessage("offline_queue_full")
+		}
+	}
+}
+
+// collectLimit is how many deliveries may wait in the pending queue while the
+// session is handed over to its offline queue.
+func (c *client) collectLimit() int {
+	if limit := c.broker.cfg.MaxOfflineQueueSize; limit > 0 {
+		return max(limit, c.inflightQueueLimit())
+	}
+	return c.inflightQueueLimit()
+}
+
+// closeOverflowed ends a connection whose session is being taken offline because
+// its inflight queue is full. It is the teardown of a lost connection: the socket
+// is closed, the read loop unwinds and the connection's serve goroutine runs the
+// normal unregister, which stores the session (see Broker.unregister). Nothing is
+// written first on purpose — a client that stopped reading cannot receive a
+// DISCONNECT, and the publishing goroutine must not wait for one to be written; it
+// is the hang-up the client reconnects from, and the session queue, not the
+// connection, is where the messages are.
+func (c *client) closeOverflowed() {
+	c.writeClosed.Store(true)
+	_ = c.conn.Close()
+}
+
+// deliveryPublication rebuilds the Publication an outbound delivery came from, so
+// a session that has just been stored can be queued for through the offline path
+// (Broker.enqueueOffline) — the same path a publication that arrives while the
+// session is offline takes. The property block is re-encoded exactly as the live
+// delivery carried it, subscription identifiers included.
+func deliveryPublication(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) Publication {
+	wire, err := encodePropertyBlock(props)
+	if err != nil {
+		// The typed properties are still valid; only their wire form is lost, which
+		// is what a delivery with an unencodable block degrades to.
+		wire = nil
+	}
+	return Publication{Topic: topic, Payload: payload, QoS: qos, Retain: retain, Props: wire}
 }
 
 // drainPendingLocked sends the queued deliveries whose window has room, in the
@@ -601,11 +753,21 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 // and QoS 2 windows free slots at different times. The caller holds c.mu and has
 // just released an inflight slot.
 //
+// A session that is being taken offline is not drained at all: its pending queue
+// belongs to the offline queue from now on, and a drain would compete with the
+// hand-off for the same messages.
+//
 // A delivery that cannot be queued for the writer (the connection is closing, or
 // the writer queue is full and the connection is being disconnected as a slow
-// consumer) ends the drain: the rest stays in the queue and ends with the
-// connection, exactly like the unconfirmed exchanges of the inflight table.
+// consumer) goes back to the front of the queue instead of being lost, so the
+// hand-off to the offline queue — or the next reconnect — still has it. A packet
+// the client's Maximum Packet Size forbids is the one exception: it can never be
+// delivered, it was counted when it was queued, and it is skipped so it cannot
+// wedge the queue.
 func (c *client) drainPendingLocked() {
+	if c.handoff != handoffNone {
+		return
+	}
 	for len(c.pending) > 0 {
 		msg := c.pending[0]
 		if c.windowFullLocked(msg.qos) {
@@ -614,6 +776,10 @@ func (c *client) drainPendingLocked() {
 		c.pending[0] = pendingMessage{}
 		c.pending = c.pending[1:]
 		if err := c.writePublishLocked(msg.topic, msg.payload, msg.qos, msg.retain, msg.props); err != nil {
+			if errors.Is(err, errPacketTooLarge) {
+				continue
+			}
+			c.pending = append([]pendingMessage{msg}, c.pending...)
 			return
 		}
 	}

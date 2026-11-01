@@ -23,6 +23,9 @@
   保留其订阅匹配到的消息（FIFO，按会话与全局双重上限），在下次 CONNACK 之后立即按序
   投递，并在过期间隔到达后由有界清扫器删除。状态位于 `SessionStore` 接缝之后
   （`Load`/`Save`/`Delete`/`Keys`），默认即为早期版本的内存存储。
+- 持久化与可用性蓝皮书（`docs/PERSISTENCE.zh-CN.md`）：哪些状态必须跨重启存活、哪些不必，
+  `SessionStore` 实现必须满足的契约，已交付的 Redis 蓝图，一份 SQL 速写与离线队列的容量
+  估算表
 - QoS 0/1/2 流程（按订阅 QoS 降级）、broker 侧出站 QoS 1/2 重传（PUBLISH 重传带 DUP、
   PUBREL 重传到 PUBCOMP、每连接一个定时器、有上限的指数退避）以及由每连接有界队列支撑的
   inflight 窗口：窗口满时按 FIFO 排队、腾出位置后再投递，既不阻塞也不丢弃。入站 QoS 2
@@ -557,6 +560,9 @@ broker, _ := gmqx.New(gmqx.Config{
 的会话锁只串行化单个节点的写入，因此两个节点同时为同一个已存储会话排队时可能丢掉其中一条
 ——离线会话的队列实际上由保存它的节点独占。
 
+完整蓝皮书——哪些状态必须跨重启存活、后端存储必须保证什么、Redis 部署规则、SQL 速写与
+容量估算表——见 [`docs/PERSISTENCE.zh-CN.md`](docs/PERSISTENCE.zh-CN.md)。
+
 **过期。** MQTT 5 的 Session Expiry Interval 是一个截止时间：断连时把
 `ConnectInfo.SessionExpiry` 记为 `now + interval`，有界清扫器（`SessionSweepInterval`，
 每轮最多检查 512 个存储会话）在截止时间过后删除该会话及其订阅与排队消息。CONNECT 路径
@@ -573,6 +579,11 @@ broker, _ := gmqx.New(gmqx.Config{
 `RecordQueueDepth("offline", n)` 报告当前深度。队列在下次 CONNECT 的 CONNACK 之后立即
 按序排空。既拿不到 inflight 窗口、也拿不到空闲 packet id 的消息会降级为 QoS 0 投递，
 而不是让会话停滞——这正是参考实现在 packet id 用尽时采用的降级方式。
+
+这个队列也是连接未完成工作的落点：持久连接结束时（链路丢失、慢速消费者被断开、或 inflight
+队列溢出），仍在等待 inflight 窗口的投递会按顺序在会话被存储之前并入会话队列
+（`absorbPendingLocked`），既不丢失也不重复。而会话刚被存储后仍到达该连接的投递，会走同一条
+离线路径为它排队。
 
 **重传。** 出站 QoS 1/2 投递会以 packet id 为键保存在每连接的 inflight 表中，直到客户端
 确认。每个连接一个定时器（而不是每条消息一个）驱动所有重传：首次重传在
@@ -596,10 +607,21 @@ broker 也在 CONNACK 中通告自己的 receive maximum 并对入站 publish �
 
 **inflight 队列。** 会超出窗口的 QoS 1/2 投递按到达顺序进入该连接的 inflight 队列，并在
 更早消息的确认腾出位置后发送：慢速订阅者只花内存，不丢消息，发布方也不会被阻塞。队列有界
-（`MaxInflightQueueSize`，默认 256）：只有队列本身已满时才丢弃，而该丢弃会被计数两次
-（`RecordDroppedMessage("inflight_overflow")`、`RecordOverflow("inflight")`）并以 Warn
-级别带 client id 记录日志——发布方收到的 PUBACK 已经代表 sink 接受了这条消息，丢失必须
-可见。队列属于连接，随连接结束，不会像离线队列那样写入会话。
+（`MaxInflightQueueSize`，默认 256），而找到队列已满的那次投递正是两类会话分岔之处：
+
+- **持久会话**不再丢投递：该投递进入队列，同时会话被转为离线——连接按丢失连接的方式关闭
+  （不发 DISCONNECT：已经停读的客户端收不到它，发布协程也不得等它），随后常规的 unregister
+  把会话与它仍欠的一切（未确认的交换、队列、以及仍在后面等待的投递）一并存储，下一次
+  CONNECT 排空。交接用 `RecordOverflow("inflight_overflow")` 加带 client id 的 Warn 日志
+  记录；因为什么都没丢，drop 计数不变；
+- **clean 会话**无处可存（它的状态随连接结束），因此仍然丢弃，并用自己独立的 reason 计数：
+  `RecordDroppedMessage("inflight_overflow_clean")`（外加 `RecordOverflow("inflight")`）
+  与一条 Warn 日志。
+
+持久会话唯一剩下的丢失点是离线队列自身的上限（`MaxOfflineQueueSize`、
+`MaxTotalOfflineMessages`）：那是容量限制，并按该队列原本就有的 reason 计数。哪些状态能跨
+重启存活、存储 seam 承诺什么、以及如何为一个部署估算容量，见
+[`docs/PERSISTENCE.zh-CN.md`](docs/PERSISTENCE.zh-CN.md)。
 
 **字节速率整形。** `MaxReadByteRate`/`MaxWriteByteRate` 限制单个连接每秒可读/可写的字节数，
 `MaxTotalReadByteRate`/`MaxTotalWriteByteRate` 限制整个 broker，二者都是令牌桶，突发额度为
@@ -621,8 +643,9 @@ PUBREL/PUBCOMP、SUBACK、PINGRESP。其队列有界（`MaxOutboundQueueSize`，
 有界，因此单个连接最多占用 `MaxOutboundQueueSize` 个、每个不超过 `MaxPacketSize` 字节的
 数据包。两个协程与重传定时器都随连接结束，并由 `close` 等待；会话清扫器由 `Stop` 等待。
 
-有意保留的限制（上文均给出原因）：窗口之后的 inflight 队列属于连接，因此重连会重发已经
-写出的交换（来自已存储的会话），但不会重发只排进队列、从未发出的投递；离线队列位于收到
+有意保留的限制（上文均给出原因）：窗口之后的 inflight 队列属于连接，因此 clean 会话结束时
+会丢掉仍在排队的投递（这正是声明 clean 的含义），而持久会话会在存储前把那些投递并入离线
+队列，重连后照常重发；离线队列位于收到
 该 publish 的节点上，而集群对端通告的订阅摘要只覆盖活动会话，因此其他节点上的 publish 不会
 在此处为离线会话排队（共享会话存储搬运的是状态，而不是这条路由）。
 

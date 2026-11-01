@@ -5,6 +5,40 @@
 
 ## [Unreleased]
 
+- **A full inflight queue no longer drops an acknowledged QoS 1/2 delivery of a
+  persistent session.** The delivery joins the connection's pending queue and the
+  session is taken offline: the connection is closed the way a lost one is (no
+  DISCONNECT, nothing written), the normal `unregister` → `SessionStore` path stores
+  the session with everything it still owed (the unconfirmed exchanges, the remaining
+  offline queue and the pending deliveries behind it, in order), and the next CONNECT
+  drains it. The hand-off is counted with `RecordOverflow("inflight_overflow")` and
+  logged at Warn level with the client id and that reason; no drop counter moves. A
+  delivery that arrives while the hand-off is in flight waits in the same queue or is
+  queued through the offline path once the session is stored, so a publisher holding a
+  stale target of a closing connection loses nothing. A **clean** session, which has
+  nowhere to queue, keeps the drop on one explicit path with its own reason
+  (`RecordDroppedMessage("inflight_overflow_clean")`, replacing the drop reason
+  `"inflight_overflow"`, which is now an overflow counter, not a drop). The pending
+  deliveries of a persistent connection that simply goes away (a lost socket, a
+  slow-consumer disconnect) also move into the session queue now, and a delivery that
+  fails to reach a closing writer goes back to the front of the pending queue instead
+  of being lost. The offline queue's own caps (`MaxOfflineQueueSize` drop-oldest,
+  `MaxTotalOfflineMessages` reject-newest) are the only remaining loss points of a
+  persistent session, and they were already counted (`offline_queue_full`,
+  `offline_queue_total`). No store change was needed: the hand-off is one `Save` of the
+  complete state under the broker's session lock, so the Redis store keeps its single
+  Lua take.
+
+- Persistence and availability blueprint (`docs/PERSISTENCE.md`, `docs/PERSISTENCE.zh-CN.md`):
+  what must survive a process restart and what may not, the `SessionStore` contract a
+  backing implementation has to satisfy (atomic take, per-key TTL from the session
+  expiry, namespace-scoped keys, exact round-trip, corrupt values dropped and counted)
+  with a compilable custom-store example, the shipped Redis blueprint and its failure
+  modes, a SQL sketch with the transaction that makes a take atomic, why a cache
+  library cannot be a session store, the availability model of a shared store plus a
+  gossip cluster, and a sizing worksheet for `MaxOfflineQueueSize` /
+  `MaxTotalOfflineMessages`.
+
 - Interoperability matrix in `interop/`, its own module so the library keeps zero
   third-party dependencies: a third-party client against this broker, this client
   against a reference broker in docker, and reference command-line clients against

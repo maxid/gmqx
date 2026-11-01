@@ -27,6 +27,10 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   CONNACK, and is deleted by a bounded sweeper when its expiry interval elapses.
   The state lives behind the `SessionStore` seam (`Load`/`Save`/`Delete`/`Keys`),
   whose default is the in-memory store of earlier versions.
+- A persistence and availability blueprint (`docs/PERSISTENCE.md`): what has to
+  survive a restart and what may not, the contract a `SessionStore`
+  implementation must satisfy, the shipped Redis blueprint, a SQL sketch and a
+  sizing worksheet for the offline queues
 - QoS 0/1/2 flows with per-subscription QoS capping, broker-side outbound QoS 1/2
   retransmission (DUP on PUBLISH retries, PUBREL retries until PUBCOMP, one timer
   per connection, capped exponential backoff) and inflight windows backed by a
@@ -710,6 +714,10 @@ broker's session lock only serialises the writers of one node, so two nodes
 queueing for the same stored session at the same instant can lose one of them —
 the queue of an offline session is effectively owned by the node that stored it.
 
+The full blueprint — what has to survive a restart, what a backing store must
+guarantee, the Redis deployment rules, a SQL sketch and a sizing worksheet — is
+[`docs/PERSISTENCE.md`](docs/PERSISTENCE.md).
+
 **Expiry.** MQTT 5's Session Expiry Interval is a deadline:
 `ConnectInfo.SessionExpiry` is stamped on disconnect as `now + interval`, and a
 bounded sweeper (`SessionSweepInterval`, at most 512 stored sessions per tick)
@@ -734,6 +742,13 @@ in order immediately after the CONNACK of the next CONNECT. A message that canno
 get a slot in the inflight window or a free packet id is delivered at QoS 0
 instead of stalling the session, which is the degradation the reference broker
 applies when its packet ids run out.
+
+The queue is also where a connection's unfinished work lands: when a persistent
+connection goes away — a lost socket, a slow-consumer disconnect, or an inflight
+queue that overflowed — the deliveries still waiting for its inflight window move
+into the session queue before it is stored (`absorbPendingLocked`), in order, so
+they are neither lost nor duplicated. A delivery that reaches a connection whose
+session was just stored is queued for it through the same offline path.
 
 **Retransmission.** An outbound QoS 1/2 delivery is kept in a per-connection
 inflight table keyed by packet id until the client confirms it. One timer per
@@ -768,13 +783,27 @@ expiry) takes both halves with it.
 connection's inflight queue, in arrival order, and is sent when the
 acknowledgement of an older message frees a slot — a slow subscriber costs memory,
 not messages, and the publisher is never blocked. The queue is bounded
-(`MaxInflightQueueSize`, default 256): only a delivery that finds it full is
-dropped, and that drop is counted twice
-(`RecordDroppedMessage("inflight_overflow")`, `RecordOverflow("inflight")`) and
-logged at Warn level with the client id, because the publisher's PUBACK has
-already promised the message to the sink. The queue is per connection, so it ends
-with the connection; its messages are not stored in the session like the offline
-queue.
+(`MaxInflightQueueSize`, default 256), and a delivery that finds it full is where
+the two kinds of session part:
+
+- a **persistent** session is not dropped from. The delivery joins the queue and
+the session is taken offline: the connection is closed the way a lost one is (no
+DISCONNECT — a client that stopped reading cannot receive one and the publishing
+goroutine must not wait for it), the normal unregister stores the session with
+everything it still owed (the unconfirmed exchanges, the queue and the deliveries
+still waiting behind it) and the next CONNECT drains it.
+`RecordOverflow("inflight_overflow")` and a Warn log with the client id record the
+hand-off, and no drop counter moves because nothing is dropped;
+- a **clean** session has nowhere to queue, because its state ends with the
+connection, so the delivery is dropped there and counted with its own reason,
+`RecordDroppedMessage("inflight_overflow_clean")` (plus
+`RecordOverflow("inflight")`) and a Warn log.
+
+The only loss points a persistent session keeps are the offline queue's own caps
+(`MaxOfflineQueueSize`, `MaxTotalOfflineMessages`), a capacity limit counted with
+the reasons that queue already had. See [`docs/PERSISTENCE.md`](docs/PERSISTENCE.md)
+for what survives a restart, what the store seam promises and how to size a
+deployment.
 
 **Writer.** Every packet leaves through one writer goroutine per connection, in
 the order it was queued: PUBLISHes, PUBACK/PUBREC/PUBREL/PUBCOMP, SUBACK, PINGRESP.
@@ -807,9 +836,10 @@ defaults (8 MiB/s read and 16 MiB/s write per connection, 256 MiB/s each in tota
 leave ordinary traffic unshaped.
 
 Deliberate limitations, all documented above with their reason: the inflight
-queue *behind* the window is per connection, so a reconnect re-sends the exchanges
-that were already written (from the stored session) but not the deliveries that
-were only queued and never sent; the offline queue is local to the node that
+queue *behind* the window is per connection, so a clean session loses what it
+still had queued when it ends (that is what declaring a session clean means),
+while a persistent session moves those deliveries into its offline queue before it
+is stored and therefore re-sends them; the offline queue is local to the node that
 received the publication, and the subscription summary a cluster peer advertises
 covers live sessions only, so a publication on another node does not queue for an
 offline session here (a shared session store moves the state between nodes, not

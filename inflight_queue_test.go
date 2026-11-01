@@ -3,9 +3,10 @@ package gmqx
 // The inflight queue is the second half of the outbound window: a QoS 1/2
 // delivery that finds the window full waits for a free slot instead of being
 // dropped, is sent in arrival order when the acknowledgement of an older message
-// frees one, and is only dropped when the queue itself is full — a drop that is
-// counted twice and logged with the client id, so a lost delivery can never go
-// unnoticed.
+// frees one, and finds a documented answer when the queue itself is full. That
+// answer depends on the kind of session — a persistent one is taken offline and
+// queues (see inflight_overflow_test.go), a clean one drops the delivery, counted
+// and logged with its own reason — so a lost delivery can never go unnoticed.
 
 import (
 	"bytes"
@@ -80,11 +81,14 @@ func TestInflightQueueDeliversInOrder(t *testing.T) {
 	}
 }
 
-// TestInflightQueueOverflowDropsWithMetricAndLog pins the only case that may lose
-// a QoS 1/2 delivery: the window and the queue behind it are both full. The drop
-// is counted twice and logged with the client id, because the publisher was
-// already acknowledged and nothing else would make the loss visible.
-func TestInflightQueueOverflowDropsWithMetricAndLog(t *testing.T) {
+// TestInflightQueueOverflowDropsCleanSessionWithMetricAndLog pins the only case
+// that may lose a QoS 1/2 delivery: the window and the queue behind it are both
+// full and the session is clean, so there is no offline queue to keep the message
+// in. The drop has its own reason ("inflight_overflow_clean", never the
+// "inflight_overflow" of a persistent session's hand-off) and is logged with the
+// client id, because the publisher was already acknowledged and nothing else would
+// make the loss visible.
+func TestInflightQueueOverflowDropsCleanSessionWithMetricAndLog(t *testing.T) {
 	metrics := newDeliveryMetrics()
 	logger, logs := captureLogger()
 	b := startBroker(t, Config{
@@ -108,14 +112,17 @@ func TestInflightQueueOverflowDropsWithMetricAndLog(t *testing.T) {
 	if string(got.Payload) != "m1" {
 		t.Fatalf("first delivery = %q, want m1", got.Payload)
 	}
-	if n := metrics.count("inflight_overflow"); n != 1 {
-		t.Fatalf("inflight_overflow drops = %d, want 1", n)
+	if n := metrics.count("inflight_overflow_clean"); n != 1 {
+		t.Fatalf("inflight_overflow_clean drops = %d, want 1", n)
+	}
+	if n := metrics.count("inflight_overflow"); n != 0 {
+		t.Fatalf("inflight_overflow = %d, want 0: a clean session has no offline queue to take the session to", n)
 	}
 	if n := metrics.overflows("inflight"); n < 1 {
 		t.Fatalf("overflow(\"inflight\") = %d, want at least 1", n)
 	}
 	logged := logs.String()
-	if !strings.Contains(logged, "inflight_overflow") || !strings.Contains(logged, "overflow-sub") {
+	if !strings.Contains(logged, "inflight_overflow_clean") || !strings.Contains(logged, "overflow-sub") {
 		t.Fatalf("the drop was not logged with the reason and the client id: %q", logged)
 	}
 

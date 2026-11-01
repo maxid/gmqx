@@ -137,8 +137,16 @@ type client struct {
 	// pending is where an outbound QoS 1/2 delivery waits when the inflight window
 	// of its QoS is full: arrival order, drained by the acknowledgement that frees
 	// a slot, bounded by Config.MaxInflightQueueSize. It is a live-connection
-	// queue, unlike the session queue below, and it ends with the connection.
+	// queue, unlike the session queue below, and it ends with the connection —
+	// except for a persistent session, whose pending deliveries move into the
+	// session queue when the connection goes away (see Broker.absorbPendingLocked).
 	pending []pendingMessage
+	// handoff says where a persistent session of this connection stands while it
+	// moves to its offline queue. A delivery that arrives in that window waits in
+	// pending (handoffCollecting) or is queued through the offline path
+	// (handoffStored) instead of being dropped (see client.sendPublish). It is
+	// maintained under c.mu and is handoffNone for every clean session.
+	handoff handoffState
 	// queue is what the session queued while it was offline, owned by this
 	// connection between register (which takes it from the store) and unregister
 	// (which stores what a failed drain left behind). Filled and read on the
@@ -1311,6 +1319,14 @@ func (c *client) close(withWill bool) {
 		return
 	}
 	c.closed = true
+	// A persistent session outlives this connection, so the deliveries it still
+	// owes its inflight window are not lost with it: they wait in pending from here
+	// on and unregister moves them into the session queue (see
+	// Broker.absorbPendingLocked). A clean session keeps the previous behavior —
+	// its state ends with the connection.
+	if c.handoff == handoffNone && c.persistentSession() {
+		c.handoff = handoffCollecting
+	}
 	// No packet may be queued from here on: the socket is about to go away and an
 	// enqueue must answer "closed" instead of growing a queue nobody drains.
 	c.writeClosed.Store(true)

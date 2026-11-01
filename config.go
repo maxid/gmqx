@@ -201,11 +201,20 @@ type Config struct {
 	// waiting for a free inflight slot (default 256). The queue preserves the
 	// connection's delivery order and is drained by the acknowledgements that free
 	// a slot; it is never unbounded, because a client that never confirms anything
-	// would otherwise cost unbounded broker memory. Only a delivery that finds the
-	// queue full is dropped, and that drop is counted twice
-	// (Metrics.RecordDroppedMessage("inflight_overflow") and
-	// Metrics.RecordOverflow("inflight")) and logged at Warn level with the client
-	// id. A non-positive value selects the default; there is no unlimited setting.
+	// would otherwise cost unbounded broker memory. A non-positive value selects
+	// the default; there is no unlimited setting.
+	//
+	// A delivery that finds the queue full is where the two kinds of session part.
+	// A *persistent* session is not dropped from: the delivery joins the queue and
+	// the session is taken offline — the connection is closed the way a lost one is
+	// and everything it still owed is stored, so the next CONNECT drains it. That
+	// hand-off is counted with Metrics.RecordOverflow("inflight_overflow"), logged
+	// at Warn level with the client id, and loses nothing; the only loss points left
+	// are the offline queue's own caps (MaxOfflineQueueSize,
+	// MaxTotalOfflineMessages). A *clean* session has nowhere to queue, because its
+	// state ends with the connection, so the delivery is dropped there and counted
+	// with Metrics.RecordDroppedMessage("inflight_overflow_clean") — and
+	// Metrics.RecordOverflow("inflight") — and logged with the same reason.
 	MaxInflightQueueSize int
 	// ReceiveMaximum is the broker's own MQTT 5 receive maximum: how many
 	// unacknowledged QoS 1/2 exchanges one client may have outstanding toward the
@@ -286,6 +295,14 @@ type Config struct {
 	// Metrics.RecordDroppedMessage and both are disabled by a negative value. Only
 	// a persistent session (Clean Session / Clean Start cleared) queues; a clean
 	// session never does.
+	//
+	// These two caps are the only loss points of a persistent session: a delivery
+	// that finds its connection's inflight queue full is not dropped, it moves into
+	// this queue (see MaxInflightQueueSize), and so does everything else the
+	// connection still owed when it went away. Sizing them is a memory decision —
+	// messages-per-session times payload — and a durability decision: a message
+	// dropped here is a message the broker acknowledged and then lost. See
+	// docs/PERSISTENCE.md.
 	MaxOfflineQueueSize     int
 	MaxTotalOfflineMessages int
 	// SessionSweepInterval is how often the broker looks for sessions whose

@@ -312,9 +312,11 @@ type EventSink interface {
 // "subscription_identifier" (a SUBSCRIBE carried an out-of-range Subscription
 // Identifier, which is a Protocol Error), "subscription_identifier_limit" (a
 // delivery carried more Subscription Identifiers than the documented cap, or a
-// subscription stored more), "cluster_namespace", "inflight_overflow" (a QoS 1/2 delivery found
-// the connection's inflight window and the queue behind it both full, so it was
-// dropped), "receive_maximum_full" (an inbound QoS 1/2 PUBLISH over the broker's own
+// subscription stored more), "cluster_namespace", "inflight_overflow_clean" (a
+// QoS 1/2 delivery found the inflight window and the queue behind it of a *clean*
+// session both full, and a clean session has no offline queue to keep it in, so it
+// was dropped — a persistent session is taken offline instead and keeps the
+// delivery, see RecordOverflow), "receive_maximum_full" (an inbound QoS 1/2 PUBLISH over the broker's own
 // receive maximum: it was neither delivered nor acknowledged),
 // "retry_exhausted" (an outbound exchange used up its retransmissions),
 // "outbound_queue_full" (a QoS 0 PUBLISH was dropped because the connection's
@@ -339,13 +341,15 @@ type EventSink interface {
 // fire-and-forget, so this is counted instead of returned as an error).
 // RecordQueueDepth("offline", n) reports the messages currently queued for
 // offline sessions across the broker; RecordOverflow reports a limit that was hit
-// without losing a message ("connections", "inflight" — a delivery was dropped
-// as well, see "inflight_overflow" —, "receive_maximum", "outbound_queue",
-// "will_delay" — a Will Delay Interval was clamped to Config.MaxWillDelayInterval
-// —, "packet_ids" — a delivery degraded to QoS 0 because no packet id was free —
-// and "byte_rate_read"/"byte_rate_write" — a byte-rate limit delayed a transfer;
-// the throttled byte count itself is reported through the optional
-// ByteRateMetrics interface).
+// without losing a message ("connections", "inflight" — a clean session's delivery
+// was dropped as well, see "inflight_overflow_clean" —, "inflight_overflow" — a
+// persistent session's inflight queue was full, so the session was taken offline
+// and what it still owed was stored with it, nothing was dropped —,
+// "receive_maximum", "outbound_queue", "will_delay" — a Will Delay Interval was
+// clamped to Config.MaxWillDelayInterval —, "packet_ids" — a delivery degraded to
+// QoS 0 because no packet id was free — and "byte_rate_read"/"byte_rate_write" — a
+// byte-rate limit delayed a transfer; the throttled byte count itself is reported
+// through the optional ByteRateMetrics interface).
 type MetricsManager interface {
 	IncrementConnections()
 	DecrementConnections()
