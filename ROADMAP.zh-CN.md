@@ -1,0 +1,42 @@
+[English](ROADMAP.md) | 简体中文
+
+# 路线图
+
+- [x] MQTT 3.1/3.1.1 TCP packet codec
+- [x] Session/subscriptions/wildcards/QoS 0–2 basic/retained/will/keepalive
+- [x] Auth & ACL hook 接口
+- [x] 通过 gnety 的 TCP/TLS/WS/WSS transport（`RawHandler`）；MQTT codec/状态机在 gmqx
+- [x] Connect modes（UNIQUE/KICK）、限额、连接速率限制、metrics hooks
+- [x] TLS / WebSocket / WSS listeners
+- [x] MQTT 5 handshake、property skipping 与基础 reason code
+- [x] MQTT 5：CONNACK capabilities、Topic Alias、User Property 转发、subscription options
+- [x] `SessionStore` 接缝后的持久会话存储、有界离线队列、MQTT 5 session expiry 与有界 sweeper
+- [x] 出站 QoS 1/2 重传（DUP、PUBREL 重试、每连接一个 timer）与双向 inflight window
+- [x] 有界 per-connection inflight 队列（窗口满时等待而非丢弃）；持久会话队列满则转 offline，clean session 以 `inflight_overflow_clean` 丢弃
+- [x] 持久化与可用性蓝图（`docs/PERSISTENCE.md`）：重启后什么保留、store 契约、Redis/SQL 蓝图、可用性模型与容量计算
+- [x] 每连接一个 writer goroutine、有界 outbound 队列与每包 write deadline
+- [x] CONNECT 阶段 read deadline 与授权超时（`ConnectTimeout`、`AuthTimeout`）
+- [x] 共享订阅（`$share/{ShareName}/{filter}`）：按 §4.8.2 校验、每组一个 live member round robin、跨集群每组一个节点、无 retained replay、无共享离线队列
+- [x] Subscription identifiers（SUBSCRIBE property 0x0B）：随订阅存储、经 `SessionStore` 往返、附在 live/retained/offline/shared 投递上、去重并限制每条投递
+- [x] MQTT 5 Will Delay Interval（resume 取消、session expiry 截断、`MaxWillDelayInterval` 限制）
+- [x] MQTT 5 enhanced authentication（AUTH）：`AuthExchange` SPI（`Begin`/`Continue`），`Config.Authenticator`/`AuthMethods`，CONNACK method echo，identity 优先于 `AuthManager`，live connection 重认证，有界步骤与 deadline
+- [x] Retained message expiry（MQTT 5 Message Expiry Interval，replay 时递减，过期删除）
+- [x] 跨节点 takeover parity（两种 connect mode 的 connect-time kick、DISCONNECT 0x8E）与 `NotKickSeconds` 防抖窗口
+- [x] Kick epochs：kick 记录产生它的节点与连接时间，延迟 kick 不能关闭更新连接；接收侧同样应用防抖
+- [x] Redis-backed 共享 session store（`NewRedisSessionStore`、原子 take、按 session expiry 的 per-key TTL、namespace-scoped key），断线重连到其它节点可恢复会话
+- [x] MQTT 5 Receive Maximum 双向：客户端 CONNECT 值限制 outbound window（QoS1/QoS2 共享，队列而非丢弃）；broker 自己的 receive maximum（默认 64，已广告）约束入站 publish（QoS1 不 ACK，QoS2 以 PUBREC 0x97 拒绝）
+- [x] MQTT 5 client Maximum Packet Size：写前测量每个包，放不下的包（PUBLISH、retained replay、control packet）以 `max_packet_size_too_large` 丢弃，不拆分/截断
+- [x] 重连后的 QoS 2 状态：pending PUBREL 的入站 packet id 与未确认出站 exchange 随 session 存储（`SessionState.InboundQoS2`/`SessionState.Inflight`），按 §4.4 恢复，session 结束时丢弃
+- [x] 字节速率整形：per-connection 与 broker-wide 读写 token bucket，超限延迟（受 write/keep-alive deadline 约束），统计被限流字节，默认值不影响正常流量
+- [x] Listener 端口回退（`PortFallback`，默认 16）用于 TCP/TLS/WS/WSS：bind 即探测，`Addrs()` 报告真正绑定的端口
+- [x] Cluster 接口 + 跨节点 publish/kick hook（内存）
+- [x] 内置 TCP cluster backend（静态 seeds、跨节点 publish/kick、重连）
+- [x] Cluster membership（handshake、heartbeat、eviction、重复折叠）、事件去重、订阅感知定向路由
+- [x] Redis cluster backend（per-node channel、Redis TTL membership、定向路由）
+- [x] 本地路由订阅索引（literal filter 用 map，wildcard 按 distinct filter；publish 路径不调用 `SessionStore`）
+- [x] 定向投递到 client id（`PublishToClient`），Redis client-id presence 与 TCP broadcast 回退
+- [x] Gossip cluster backend（SWIM membership、epidemic dissemination、gossiped summaries 与 client-id presence），默认 backend
+- [x] MQTT client library（`client/`）：MQTT 3.1.1/5、双向 QoS 1/2 状态机（DUP/PUBREL 重传与 inflight window）、重连退避与订阅恢复、keepalive、MQTT 5 属性、有界有序 writer/delivery 队列
+- [x] 核心一致性测试：仓库内 MQTT 3.1.1/5 suite、paho 对 broker、docker mosquitto 双向矩阵（`interop/`）
+- [x] 基准与 soak 测试（`bench_test.go`、`soak_test.go`、`docs/PERFORMANCE.md`）
+- [ ] v1.0 API 稳定化
