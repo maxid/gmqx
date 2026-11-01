@@ -11,7 +11,7 @@
    丢一个节点付出的是重连，而不是会话。下面说明原因与取舍。
 
 接缝是 `SessionStore`，本包交付的实现是 Redis 版本；本文其余部分是契约、部署规则、另外两份
-蓝图（SQL，以及为什么缓存库不能充当会话存储）、可用性模型与容量估算表。
+蓝图（SQL，以及缓存与会话存储的边界）、可用性模型与容量估算表。
 
 ## 必须跨重启存活的状态
 
@@ -280,7 +280,7 @@ broker, err := gmqx.New(gmqx.Config{
 | 故障切换 | 在配置的地址前放 sentinel 或 cluster 模式 | 存储对每个节点只是一个地址，自身不做 sentinel 发现。把懂 sentinel 的代理或懂 cluster 的客户端端点放在那里，让主节点迁移。 |
 | 键前缀 | 每个环境与集群一个 `ChannelPrefix`，各节点一致 | 它同时隔离集群自身的键（`node`、`owner`、`member`、`subs`、`client`）与会话键（`session`），因此两个部署可以共用一个 Redis 而绝不互相寻址。 |
 | 命名空间 | 每租户一个 `Config.Namespace`，或每租户一套 broker | 存储的键已包含 broker 的命名空间键，因此同一前缀内租户不会相撞。隔离仍是策略决定：一部署一命名空间最简单，多命名空间也受支持。 |
-| TTL | 交给存储：它以 `ExpiresAt` 作为 key 的 TTL | 过期会话在没有 broker 运行时也会在截止时间从 Redis 消失。不要给这个 key 再套一个更短的、缓存式的 TTL：那等于数据丢失（见[蓝图 C](#蓝图-c--为什么缓存库不能用作持久化)）。 |
+| TTL | 交给存储：它以 `ExpiresAt` 作为 key 的 TTL | 过期会话在没有 broker 运行时也会在截止时间从 Redis 消失。不要给这个 key 再套一个更短的、缓存式的 TTL：那等于数据丢失（见[蓝图 C](#蓝图-c--缓存库作为存储)）。 |
 | 内存 | `会话数 ×（队列长度 × payload + 订阅 + 开销）`，再加余量 | 下文估算表把"每会话消息数"和"payload"变成数字。存储所在库请用 `maxmemory-policy noeviction`：会话键被淘汰就是静默数据丢失，而存储无法得知。 |
 | 超时 | `DialTimeout`/`IOTimeout`（各默认 2 s） | broker 持有会话锁调用存储，不可达的 Redis 必须付出有界等待。 |
 | 可观测 | 对 `session_store_error` 与 `session_store_corrupt` 告警 | `session_store_error` 上升说明会话正在被静默退化为"没有会话"；`session_store_corrupt` 说明存储格式与读取端的构建不一致。 |
@@ -455,45 +455,21 @@ UPDATE mqtt_session
    `DELETE FROM mqtt_session WHERE expires_at < NOW(6)` 一条语句。若希望在没有 broker 运行时也
    执行截止时间，用定时任务跑同一条语句即可。
 
-## 蓝图 C —— 为什么缓存库不能用作持久化
+## 蓝图 C —— 缓存库作为存储
 
-人们很自然地想把手边现成的缓存库直接塞进 `Config.SessionStore`。不要这么做：**缓存不是会话
-存储。**
+`gcache` 不再是脚手架：它已实现并有测试覆盖，其中两个端口正是已存储会话所需要的。
+`RemoteStore` 是按 key 寻址、带每键 TTL 的存储（`Get`/`Set`/`Delete`，已实现于 Redis 与内嵌
+Olric 集群），`Locker` 是带"比对 token 再释放/续期"的租约。现成的适配器是
+[`contrib/sessionstore-gcache`](../contrib/sessionstore-gcache)：它在 `RemoteStore` 之上
+实现 `SessionStore`，用 gcache 可选的 `Scanner` 端口实现 `Keys`，用 `Locker.Acquire` 加
+compare-and-delete 释放让 `Take` 原子（三次往返加一个锁 TTL），并声明自己是共享的。
+`gmqx` 中没有任何文件导入 gcache：适配器是独立模块，不使用它的部署根本不会构建 gcache。
 
-### `gcache` 仍是脚手架
-
-在本生态里，`gcache` 仍被定位为脚手架：实验性质、版本 `0.0.0-dev`、没有稳定 API，也没有任何
-消费者把它当作事实来源。`gmqx` 不依赖它，也不应该依赖：broker 的持久化接缝不能建立在一个
-未发布的库上，而且会话存储不可能在事后被换成缓存而不改变"确认"的语义。
-
-### 缓存不是会话存储
-
-缓存的定义性行为就是它可以丢掉自己持有的东西：内存压力下的 LRU/LFU 淘汰、只是新鲜度提示而
-非截止时间的 TTL、存储失败后仍被返回的"stale-if-error"条目、只携带 key 的失效广播。以上每一条
-都是设计上的数据丢失，而每一条对会话都是致命的：
-
-| 缓存行为 | 它会对会话做什么 |
-|---|---|
-| 内存压力下淘汰 | 一条发布方已被确认的排队消息消失。静默、无计数、事后无从解释。 |
-| 把 TTL 当新鲜度提示 | 会话存在，然后不存在，队列随之而去。`SessionState.ExpiresAt` 里的截止时间是契约；缓存 TTL 只是启发式。 |
-| stale-if-error | 用比对端保存的更旧的值恢复会话——两个节点、两段历史。 |
-| 失效 pub/sub | 定义上就是尽力而为；一次丢失的失效就是一条继续活着的过期会话。 |
-| 负缓存 | 显式缓存"这个 key 不存在"正是 `Load` 返回 `false` 所必须表达之意的反面。 |
-
-接缝的契约与缓存相反：写入的值在“被取走、被删除或过期”之前一直存在，而无法保证这一点的存储
-应该通过 `SharedAcrossNodes`/`Take` 语义说明，而不是假装。
-
-### `gcache` 落地后真正合适的位置
-
-`gcache` 中与持久化故事契合的部分是它的**分布式锁**（`Locker`：`SET NX PX` 获取，
-比对 token 释放或续期）。锁正是用来在多个节点之间守护共享存储的**取走**与**过期清扫**的工具：
-为一会话 key（或一个清扫分片）获取锁，然后取走或过期，最后释放。它不是用来持有数据的工具。
-因此形态是：
-
-```
-lock  -> gcache 的 Locker（一份租约，只覆盖一次 take 或一次 sweep）
-data  -> SessionStore（持久记录，自带 TTL 与原子取走）
-```
+**不是**会话存储的是 `gcache.Cache`——建在这些端口之上的两级缓存。部署绝不能把它放在已存储
+会话前面：它的本地层可能返回比另一节点刚写入的更旧的副本，它会在内存压力下淘汰，它把 TTL 收敛到
+自己的上限，它可能在存储故障后返回过期条目（stale-if-error），它还会缓存"不存在"。以上每一条
+都是设计上的数据丢失——对缓存数据可以接受，对会话是致命的。因此适配器直接读写 `RemoteStore`。
+接缝的契约与缓存相反：写入的值在"被取走、被删除或过期"之前一直存在。
 
 ### 其他 KV 存储必须提供什么
 
@@ -503,6 +479,7 @@ data  -> SessionStore（持久记录，自带 TTL 与原子取走）
 1. **每键 TTL 或过期**，且查询能看到并执行它，从而让 `ExpiresAt` 是截止时间而不是建议。
 2. **原子 compare-and-delete**（或效果相同的事务）用于 `Take`，保证一个会话只有一个属主。
 3. **按键前缀扫描**用于 `Keys`，不加载 value，并且便宜到每轮清扫几百个会话也无压力。
+   （在 gcache 里这是可选的 `Scanner` 端口；`redis.Store` 用 `SCAN` 实现。）
 4. **在 broker 持有会话锁时仍低且可预测的延迟**——存储在 CONNECT 与 DISCONNECT 路径上被调用，
    因此 p99 50 ms 的存储会让重连变慢，而无界长尾会让它挂住。
 5. **没有可能丢 key 的淘汰策略**（或容量大到不可能触发），以及节点丢失时的持久性故事：具备

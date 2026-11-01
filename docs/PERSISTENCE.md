@@ -15,8 +15,8 @@ acknowledgement raises the moment a publisher trusts it:
 
 The seam is `SessionStore`, the shipped implementation is the Redis one, and the
 rest of this document is the contract, the deployment rules, two further blueprints
-(SQL, and why a cache is not a session store), the availability model, and a sizing
-worksheet.
+(SQL, and the boundary between a cache and a session store), the availability model,
+and a sizing worksheet.
 
 ## What must survive a restart
 
@@ -324,7 +324,7 @@ change of a Go field name cannot change the stored layout.
 | Failover | sentinel or cluster mode in front of the address you configure | The store is one address per node; it does not do sentinel discovery itself. Put a sentinel-aware proxy or a cluster-aware client endpoint there and let it move the primary. |
 | Key prefix | one `ChannelPrefix` per environment and cluster, identical on every node | It namespaces both the cluster's keys (`node`, `owner`, `member`, `subs`, `client`) and the session keys (`session`), so two deployments can share one Redis without ever addressing each other's state. |
 | Namespace | `Config.Namespace` per tenant, or one broker set per tenant | The store's key already contains the broker's namespace key, so tenants cannot collide inside one prefix. Isolation is still a policy decision: one namespace per deployment is simplest, several are supported. |
-| TTL | leave it to the store; it uses `ExpiresAt` as the key's TTL | An expired session disappears from Redis at its deadline even if no broker runs. Do not put a shorter, cache-like TTL on the key: that is data loss (see [blueprint C](#blueprint-c--why-not-a-cache-library-for-durability)). |
+| TTL | leave it to the store; it uses `ExpiresAt` as the key's TTL | An expired session disappears from Redis at its deadline even if no broker runs. Do not put a shorter, cache-like TTL on the key: that is data loss (see [blueprint C](#blueprint-c--a-cache-library-as-the-store)). |
 | Memory | `sessions × (queue length × payload + subscriptions + overhead)`, plus headroom | The worksheet below turns messages-per-session and payload into a number. `maxmemory-policy noeviction` for the database the store lives in: eviction of a session key is silent data loss, and the store cannot tell it happened. |
 | Timeouts | `DialTimeout`/`IOTimeout` (default 2 s each) | The broker calls the store with its session lock held; an unreachable Redis must cost a bounded wait. |
 | Observability | alert on `session_store_error` and `session_store_corrupt` | `session_store_error` rising means sessions are being silently degraded to "no session"; `session_store_corrupt` means the stored format and the reading build disagree. |
@@ -522,51 +522,29 @@ Three bounds, all enforced in the store, not only in the broker:
    deadline enforced without a broker can run the same statement from a scheduled
    job.
 
-## Blueprint C — why not a cache library for durability
+## Blueprint C — a cache library as the store
 
-It is tempting to point `Config.SessionStore` at whatever cache library the
-ecosystem already has. Do not: **a cache is not a session store.**
+`gcache` is no longer a scaffold: it is implemented and tested, and two of its
+ports are exactly what a stored session needs. `RemoteStore` is a key-addressed
+store with a per-key TTL (`Get`/`Set`/`Delete`, implemented on Redis and on an
+embedded Olric cluster), and `Locker` is a lease with a compare-the-token release
+and renew. The ready-made adapter is
+[`contrib/sessionstore-gcache`](../contrib/sessionstore-gcache): it implements
+`SessionStore` over a `RemoteStore`, enumerates with gcache's optional `Scanner`
+port for `Keys`, makes `Take` atomic with `Locker.Acquire` plus a
+compare-and-delete release (three round trips and a lock TTL), and reports itself
+shared. Nothing in `gmqx` imports gcache: the adapter is a separate module, so a
+deployment that does not use it does not build gcache at all.
 
-### `gcache` is a scaffold
-
-In this ecosystem `gcache` is still positioned as a scaffold: experimental, version
-`0.0.0-dev`, with no stable API and no consumer that treats it as a source of truth.
-`gmqx` does not depend on it, and it must not: a broker's durability seam cannot be
-an unreleased library, and a session store cannot be swapped for a cache later
-without changing the semantics of an acknowledgement.
-
-### A cache is not a session store
-
-The defining behavior of a cache is that it may drop what it holds: an LRU/LFU
-eviction under memory pressure, a TTL that is a freshness hint rather than a
-deadline, a "stale-if-error" entry served after the store failed, an invalidation
-broadcast that only carries the key. Every one of those is data loss by design, and
-each is fatal for a session:
-
-| Cache behavior | What it does to a session |
-|---|---|
-| Eviction under memory pressure | A queued message a publisher was acked for disappears. Silent, uncounted, unexplainable later. |
-| TTL as a freshness hint | A session exists, then does not, and the queue with it. The deadline in `SessionState.ExpiresAt` is a contract; a cache TTL is a heuristic. |
-| Stale-if-error | A resumed session built from an older value than the one the peer saved — two nodes, two histories. |
-| Invalidation pub/sub | Best effort by definition; a lost invalidation is a stale session that lives on. |
-| Negative caching | Explicitly caching "this key is absent" is the opposite of what `Load` returning `false` must mean. |
-
+What is **not** a session store is `gcache.Cache`, the two-level cache built on
+top of those ports, and a deployment must not put it in front of the stored
+session: its local tier can answer with an older copy than the one another node
+wrote, it evicts under memory pressure, it clamps TTLs to its own maximum, it can
+serve an expired entry after a store failure (stale-if-error) and it caches
+absences. Each of those is data loss by design — acceptable for cached data, fatal
+for a session. The adapter therefore reads and writes the `RemoteStore` directly.
 The seam's contract is the opposite of a cache's: a value that was saved is there
-until it is taken, deleted or expires, and a store that cannot guarantee that must
-say so through `SharedAcrossNodes`/`Take` semantics rather than pretend.
-
-### What `gcache` would be good for when it lands
-
-The piece of `gcache` that does fit a persistence story is its **distributed lock**
-(`Locker`: `SET NX PX` to acquire, compare-the-token to release or renew). A lock is
-exactly the tool for guarding a shared store's *take* and *expiry sweep* across
-nodes: acquire the lock for a session key (or for a sweep shard), then take or
-expire; release when done. It is not the tool for holding the data. So the shape is:
-
-```
-lock  -> gcache's Locker (a lease, held for the duration of one take or one sweep)
-data  -> SessionStore (the durable record, with its own TTL and atomic take)
-```
+until it is taken, deleted or expires.
 
 ### What any other KV store would have to offer
 
@@ -578,7 +556,8 @@ of the following; check them explicitly before choosing one:
 2. **An atomic compare-and-delete** (or a transaction with the same effect) for
    `Take`, so one session has one owner.
 3. **A scan by prefix** for `Keys`, without loading the values, and bounded enough
-   that a sweep of a few hundred sessions per tick is cheap.
+   that a sweep of a few hundred sessions per tick is cheap. (In gcache this is the
+   optional `Scanner` port; `redis.Store` implements it with `SCAN`.)
 4. **Low and predictable latency with the broker's session lock held** — the store
    is called on the CONNECT and DISCONNECT path, so a store with a 50 ms p99 makes a
    reconnect slow and a store with an unbounded tail makes it hang.
