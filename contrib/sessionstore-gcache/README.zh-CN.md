@@ -157,6 +157,12 @@ docker run --name gmqx-redis -p 6379:6379 -v gmqx-redis:/data redis:7 \
 
 ## 测试
 
+逻辑用内嵌 Redis 覆盖；`redis_container_test.go` 用 testcontainers 起一个
+`redis:7-alpine` 容器，重复两件只有真服务器才能证明的事——`SCAN` 真的分页，以及键会
+自己过期。该文件需要 docker；没有时这些用例会带原因跳过。
+
+## 测试
+
 测试跑在 miniredis 和真实 broker 上，覆盖跨节点恢复（持久客户端在 broker A 订阅、断开、
 离线期间发布消息、再用同一个存储重连到 broker B，带着 `sessionPresent` 按序收到全部消息）、
 clean 连接丢弃共享会话、两个 broker 争抢同一个会话、会话过期即 key 的 TTL、损坏值，以及
