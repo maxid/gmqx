@@ -1,3 +1,5 @@
+English | [简体中文](PERFORMANCE.zh-CN.md)
+
 # Performance baseline
 
 This document records the benchmark and soak baselines of this repository's
