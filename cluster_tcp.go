@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/maxid/gmqx/internal/clusterkit"
 	"log/slog"
 	"sort"
 	"strings"
@@ -159,8 +160,8 @@ func NewTCPCluster(cfg TCPClusterConfig) Cluster {
 		links:       map[*clusterLink]struct{}{},
 		members:     map[string]*clusterMember{},
 		seeds:       map[string]string{},
-		local:       newSummarySet(),
-		sharedLocal: newSummarySet(),
+		local:       clusterkit.NewSet(),
+		sharedLocal: clusterkit.NewSet(),
 	}
 }
 
@@ -224,14 +225,14 @@ type tcpCluster struct {
 	seeds map[string]string
 	// local is the advertised filter summary, oldest first, sharedLocal the
 	// advertised shared group keys.
-	local       *summarySet
-	sharedLocal *summarySet
+	local       *clusterkit.Set
+	sharedLocal *clusterkit.Set
 	// summaryMu serialises summary computation and broadcast, so a peer cannot
 	// end up with an older snapshot than the one already sent.
 	summaryMu sync.Mutex
 
 	seq   atomic.Uint64
-	dedup *dedupTable
+	dedup *clusterkit.Table
 	drops atomic.Uint64
 	// targetFanouts counts the peer writes the backend performed for directed
 	// publishes (ClusterTarget). The TCP mesh has no client-id presence, so one
@@ -266,7 +267,7 @@ func (c *tcpCluster) Start(ctx context.Context, nodeID string, handler ClusterHa
 	}
 	c.nodeID, c.handler = nodeID, handler
 	c.incarnation = randomIncarnation()
-	c.dedup = newDedupTable(c.cfg.DedupSize, c.cfg.DedupTTL)
+	c.dedup = clusterkit.NewTable(c.cfg.DedupSize, c.cfg.DedupTTL)
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	srv, err := gnety.New(gnety.Config{
@@ -680,8 +681,8 @@ func (c *tcpCluster) handleSummary(l *clusterLink, f clusterFrame) {
 	if m == nil || m.link != l {
 		return
 	}
-	m.filters = capFilters(f.Filters, c.maxSummaryFilters())
-	m.shared = capFilters(f.Shared, c.maxSummaryFilters())
+	m.filters = clusterkit.Cap(f.Filters, c.maxSummaryFilters())
+	m.shared = clusterkit.Cap(f.Shared, c.maxSummaryFilters())
 	m.filtersKnown = true
 	m.filtersAt = time.Now()
 }
@@ -706,7 +707,7 @@ func (c *tcpCluster) refreshLocalFilters() (filters, shared []string, ok bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.local.refresh(current, c.maxSummaryFilters()), c.sharedLocal.refresh(groups, c.maxSummaryFilters()), true
+	return c.local.Refresh(current, c.maxSummaryFilters()), c.sharedLocal.Refresh(groups, c.maxSummaryFilters()), true
 }
 
 func (c *tcpCluster) advertiseSummary(l *clusterLink) {
@@ -773,7 +774,7 @@ func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 		c.recordDrop("cluster_loop", "event originated on this node")
 		return
 	}
-	if msg.Seq != 0 && c.dedup.seen(dedupKey{origin: msg.Origin, seq: msg.Seq}) {
+	if msg.Seq != 0 && c.dedup.Seen(clusterkit.Key{Origin: msg.Origin, Seq: msg.Seq}) {
 		c.recordDrop("cluster_duplicate", "event already applied")
 		return
 	}

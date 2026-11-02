@@ -415,13 +415,7 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 	// c only ever received the connect-time kick of b's client, never the
 	// directed publish (which dedup would have made at most one identity).
 	if got := gcc.dedupLen(); got > 1 {
-		gcc.dedup.mu.Lock()
-		keys := make([]dedupKey, 0, len(gcc.dedup.index))
-		for k := range gcc.dedup.index {
-			keys = append(keys, k)
-		}
-		gcc.dedup.mu.Unlock()
-		t.Fatalf("the bystander applied %d events %v, want at most the kick", got, keys)
+		t.Fatalf("the bystander applied %d events %v, want at most the kick", got, gcc.dedup.Keys())
 	}
 	if got := gcc.targetForwardCount(); got != 0 {
 		t.Fatalf("the bystander forwarded %d directed publishes, want 0", got)

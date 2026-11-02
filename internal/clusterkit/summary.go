@@ -1,8 +1,8 @@
-package gmqx
+package clusterkit
 
 import "sort"
 
-// summarySet tracks the subscription summary a node advertises to its cluster
+// Set tracks the subscription summary a node advertises to its cluster
 // peers: the topic filters its local sessions are subscribed to, oldest first.
 //
 // Order is the eviction policy, not cosmetics: over the advertised cap the
@@ -13,19 +13,19 @@ import "sort"
 //
 // The set is not safe for concurrent use; every backend guards it with its own
 // lock.
-type summarySet struct {
+type Set struct {
 	order []string
 	set   map[string]struct{}
 }
 
-func newSummarySet() *summarySet {
-	return &summarySet{set: map[string]struct{}{}}
+func NewSet() *Set {
+	return &Set{set: map[string]struct{}{}}
 }
 
-// refresh folds the current local filter list into the set and returns the
+// Refresh folds the current local filter list into the set and returns the
 // filters to advertise, oldest first and capped at max. A max <= 0 applies no
 // cap.
-func (s *summarySet) refresh(current []string, max int) []string {
+func (s *Set) Refresh(current []string, max int) []string {
 	present := make(map[string]struct{}, len(current))
 	for _, f := range current {
 		if f != "" {
@@ -57,11 +57,11 @@ func (s *summarySet) refresh(current []string, max int) []string {
 		s.order = append(s.order, f)
 		s.set[f] = struct{}{}
 	}
-	return s.snapshot(max)
+	return s.Snapshot(max)
 }
 
-// snapshot returns the filters to advertise, oldest first and capped at max.
-func (s *summarySet) snapshot(max int) []string {
+// Snapshot returns the filters to advertise, oldest first and capped at max.
+func (s *Set) Snapshot(max int) []string {
 	order := s.order
 	if max > 0 && len(order) > max {
 		order = order[len(order)-max:]
@@ -69,9 +69,9 @@ func (s *summarySet) snapshot(max int) []string {
 	return append(make([]string, 0, len(order)), order...)
 }
 
-// capFilters applies the per-node cap to a summary received from a peer: the
+// Cap applies the per-node cap to a summary received from a peer: the
 // newest filters survive, exactly as in the local cap.
-func capFilters(filters []string, max int) []string {
+func Cap(filters []string, max int) []string {
 	if max > 0 && len(filters) > max {
 		filters = filters[len(filters)-max:]
 	}

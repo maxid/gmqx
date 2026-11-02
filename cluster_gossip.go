@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/maxid/gmqx/internal/clusterkit"
 	"log/slog"
 	"math/rand/v2"
 	"sort"
@@ -230,8 +231,8 @@ func newGossipCluster(cfg GossipClusterConfig) *gossipCluster {
 		presence:      map[string]*gossipPresence{},
 		pendingProbes: map[uint64]*gossipProbe{},
 		indirect:      map[uint64]*gossipIndirect{},
-		local:         newSummarySet(),
-		sharedLocal:   newSummarySet(),
+		local:         clusterkit.NewSet(),
+		sharedLocal:   clusterkit.NewSet(),
 		updateCh:      make(chan struct{}, 1),
 		dialCh:        make(chan gossipDialRequest, 64),
 		dialing:       map[string]bool{},
@@ -291,8 +292,8 @@ type gossipCluster struct {
 	// local and sharedLocal are the summary sets this node advertises; summary is
 	// the snapshot carried by the next metadata frame, built at most every
 	// SummaryInterval and immediately on a subscription change.
-	local        *summarySet
-	sharedLocal  *summarySet
+	local        *clusterkit.Set
+	sharedLocal  *clusterkit.Set
 	summary      SubscriptionSummary
 	summaryKnown bool
 	summaryAt    time.Time
@@ -309,7 +310,7 @@ type gossipCluster struct {
 
 	seq      atomic.Uint64
 	nonce    atomic.Uint64
-	dedup    *dedupTable
+	dedup    *clusterkit.Table
 	drops    atomic.Uint64
 	forwards atomic.Uint64
 	// targetRouted and targetFlooded count directed publishes by the routing
@@ -420,7 +421,7 @@ func (c *gossipCluster) Start(ctx context.Context, nodeID string, handler Cluste
 	c.incarnation = randomIncarnation()
 	c.incNumber = 1
 	c.since = c.now()
-	c.dedup = newDedupTable(c.cfg.DedupSize, c.cfg.DedupTTL)
+	c.dedup = clusterkit.NewTable(c.cfg.DedupSize, c.cfg.DedupTTL)
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.refreshSummary()
 
@@ -730,7 +731,7 @@ func (c *gossipCluster) handleEvent(l *gossipLink, msg ClusterMessage) {
 		c.recordDrop("cluster_loop", "event originated on this node")
 		return
 	}
-	if msg.Seq != 0 && c.dedup.seen(dedupKey{origin: msg.Origin, seq: msg.Seq}) {
+	if msg.Seq != 0 && c.dedup.Seen(clusterkit.Key{Origin: msg.Origin, Seq: msg.Seq}) {
 		c.recordDrop("cluster_duplicate", "event already applied")
 		return
 	}
@@ -854,8 +855,8 @@ func (c *gossipCluster) refreshSummary() {
 	}
 	now := c.now()
 	c.mu.Lock()
-	filters := c.local.refresh(current, c.maxSummaryFilters())
-	shared := c.sharedLocal.refresh(groups, c.maxSummaryFilters())
+	filters := c.local.Refresh(current, c.maxSummaryFilters())
+	shared := c.sharedLocal.Refresh(groups, c.maxSummaryFilters())
 	c.summary = SubscriptionSummary{
 		Filters:   filters,
 		Shared:    shared,
@@ -917,8 +918,8 @@ func (c *gossipCluster) handleSummary(f gossipFrame, now time.Time) {
 		return
 	}
 	m.summary = SubscriptionSummary{
-		Filters:   capFilters(f.Summary.Filters, c.maxSummaryFilters()),
-		Shared:    capFilters(f.Summary.Shared, c.maxSummaryFilters()),
+		Filters:   clusterkit.Cap(f.Summary.Filters, c.maxSummaryFilters()),
+		Shared:    clusterkit.Cap(f.Summary.Shared, c.maxSummaryFilters()),
 		Namespace: f.Summary.Namespace,
 		Updated:   f.Summary.Updated,
 	}
@@ -1601,7 +1602,7 @@ func (c *gossipCluster) dedupLen() int {
 	if c.dedup == nil {
 		return 0
 	}
-	return c.dedup.len()
+	return c.dedup.Len()
 }
 
 // memberSummary reports a peer's advertised filters and whether they are known.

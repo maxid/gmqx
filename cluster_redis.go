@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/maxid/gmqx/internal/clusterkit"
 	"log/slog"
 	"sort"
 	"strings"
@@ -245,8 +246,8 @@ func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 	return &redisCluster{
 		cfg:          cfg,
 		namespace:    cfg.Namespace,
-		local:        newSummarySet(),
-		sharedLocal:  newSummarySet(),
+		local:        clusterkit.NewSet(),
+		sharedLocal:  clusterkit.NewSet(),
 		refreshCh:    make(chan struct{}, 1),
 		presence:     make(map[string]time.Time),
 		presenceGone: make(map[string]struct{}),
@@ -281,7 +282,7 @@ type redisCluster struct {
 	cfg         RedisClusterConfig
 	log         *slog.Logger
 	rdb         *redis.Client
-	dedup       *dedupTable
+	dedup       *clusterkit.Table
 	nodeID      string
 	namespace   string
 	incarnation string
@@ -313,8 +314,8 @@ type redisCluster struct {
 
 	// summaryMu guards the local advertised summary and its shared half.
 	summaryMu   sync.Mutex
-	local       *summarySet
-	sharedLocal *summarySet
+	local       *clusterkit.Set
+	sharedLocal *clusterkit.Set
 
 	// refreshCh wakes the housekeeping loop after a local subscription change.
 	// It is buffered and never blocks the SUBSCRIBE/UNSUBSCRIBE path: a change
@@ -372,7 +373,7 @@ func (c *redisCluster) Start(ctx context.Context, nodeID string, handler Cluster
 	c.incarnation = randomIncarnation()
 	c.since = time.Now()
 	c.ownerValue = nil
-	c.dedup = newDedupTable(c.cfg.DedupSize, c.cfg.DedupTTL)
+	c.dedup = clusterkit.NewTable(c.cfg.DedupSize, c.cfg.DedupTTL)
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.rdb = redis.NewClient(c.options())
 	c.running = true
@@ -380,7 +381,7 @@ func (c *redisCluster) Start(ctx context.Context, nodeID string, handler Cluster
 	c.mu.Unlock()
 
 	c.summaryMu.Lock()
-	c.local = newSummarySet()
+	c.local = clusterkit.NewSet()
 	c.summaryMu.Unlock()
 	c.viewMu.Lock()
 	c.view, c.viewAt = nil, time.Time{}
@@ -1006,8 +1007,8 @@ func (c *redisCluster) loadViewCtx(ctx context.Context) (map[string]*redisPeer, 
 			// receive path.
 			continue
 		}
-		p.filters = capFilters(rec.Filters, c.maxSummaryFilters())
-		p.shared = capFilters(rec.Shared, c.maxSummaryFilters())
+		p.filters = clusterkit.Cap(rec.Filters, c.maxSummaryFilters())
+		p.shared = clusterkit.Cap(rec.Shared, c.maxSummaryFilters())
 		p.filtersKnown = true
 	}
 	return view, nil
@@ -1207,7 +1208,7 @@ func (c *redisCluster) localFilters() (filters, shared []string, known bool) {
 	}
 	c.summaryMu.Lock()
 	defer c.summaryMu.Unlock()
-	return c.local.refresh(current, c.maxSummaryFilters()), c.sharedLocal.refresh(groups, c.maxSummaryFilters()), true
+	return c.local.Refresh(current, c.maxSummaryFilters()), c.sharedLocal.Refresh(groups, c.maxSummaryFilters()), true
 }
 
 // subscriptionsChanged implements subscriptionChangeNotifier. The broker calls it
@@ -1511,7 +1512,7 @@ func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
 		c.recordDrop("cluster_loop", "event originated on this node")
 		return
 	}
-	if msg.Seq != 0 && c.dedup.seen(dedupKey{origin: msg.Origin, seq: msg.Seq}) {
+	if msg.Seq != 0 && c.dedup.Seen(clusterkit.Key{Origin: msg.Origin, Seq: msg.Seq}) {
 		c.recordDrop("cluster_duplicate", "event already applied")
 		return
 	}

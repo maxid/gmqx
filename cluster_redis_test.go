@@ -368,7 +368,7 @@ func TestRedisClusterDedupAndLoopGuard(t *testing.T) {
 	publish(frame("a", 9, "marker")) // ordering marker: processed after the above
 	waitRedisCounts(t, hb, 3, 0)
 
-	if got := b.dedup.len(); got != 3 {
+	if got := b.dedup.Len(); got != 3 {
 		t.Fatalf("dedup table holds %d identities, want 3 (a/7, a/8, a/9)", got)
 	}
 	// One duplicate drop for the first redelivery, five loop drops, one duplicate

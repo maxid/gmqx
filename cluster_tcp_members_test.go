@@ -505,8 +505,8 @@ func TestTCPClusterDedup(t *testing.T) {
 	if n, _ := h.counts(); n != 1 {
 		t.Fatalf("deliveries = %d, want 1", n)
 	}
-	if ca.dedup.len() != 1 {
-		t.Fatalf("dedup table = %d, want 1", ca.dedup.len())
+	if ca.dedup.Len() != 1 {
+		t.Fatalf("dedup table = %d, want 1", ca.dedup.Len())
 	}
 
 	// An event stamped with this node as its origin must not be applied.
@@ -550,7 +550,7 @@ func TestTCPClusterDedupBounds(t *testing.T) {
 	if n, _ := h.counts(); n != 10 {
 		t.Fatalf("deliveries = %d, want 10", n)
 	}
-	if got := ca.dedup.len(); got != 4 {
+	if got := ca.dedup.Len(); got != 4 {
 		t.Fatalf("dedup table = %d, want 4", got)
 	}
 	// The oldest identities are gone, so they apply again — and the table stays
@@ -559,7 +559,7 @@ func TestTCPClusterDedupBounds(t *testing.T) {
 	if n, _ := h.counts(); n != 11 {
 		t.Fatalf("evicted identity was suppressed: deliveries = %d, want 11", n)
 	}
-	if got := ca.dedup.len(); got != 4 {
+	if got := ca.dedup.Len(); got != 4 {
 		t.Fatalf("dedup table = %d, want 4", got)
 	}
 }
