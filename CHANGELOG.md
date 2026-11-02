@@ -84,6 +84,21 @@
   take, save, sweep and the offline queue's caps — so the stored format, the wire
   behavior and the public API are unchanged.
 
+- **The routing table and the shared-group election live in `gmqx/routing`.**
+  `routing.Index` is the broker's routing table (exact and wildcard buckets, live
+  filter counts, shared groups with their round-robin cursor, stored-session
+  entries), and it no longer holds the engine's connection type: a live session is
+  reachable through `routing.Endpoint` — client id, connection id, delivery handle —
+  and nothing else, which is also what the displacement rule needs (two endpoints
+  compare by identity). `routing.Target` is what a match returns; `LocalTarget`
+  stays the name a `Dispatcher` uses (`server.LocalTarget` and `gmqx.LocalTarget`
+  are aliases of it), and `SendLocal` accepts only a target the same broker
+  produced, now checked through the type's accessors. `routing.Election` is the
+  cluster-wide choice of which node delivers a shared publication, with the
+  per-group rotation that makes successive publications visit every candidate; the
+  broker keeps the local index, the peer view, the metrics and the send as thin
+  calls. No stored format, wire behavior or public API changes.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,

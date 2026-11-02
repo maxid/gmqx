@@ -31,6 +31,16 @@
   解不出的属性块、未知 stage）。`server/session.go` 只留 broker 侧（take/save/sweep 与离线队列上限），
   存储格式、线上行为与公开 API 都不变。
 
+- **路由表与共享订阅的节点选举进了 `gmqx/routing`。** `routing.Index` 是 broker 的路由表
+  （精确/通配桶、每 filter 的活跃计数、带轮转游标的共享订阅组、离线会话条目），且不再持有引擎的
+  连接类型：一个活会话只通过 `routing.Endpoint`（client id、connection id、投递句柄）暴露给表，
+  这同时也是“被顶替的连接”规则需要的——两个 endpoint 按身份比较。`routing.Target` 是一次匹配的
+  返回值；`LocalTarget` 仍是 `Dispatcher` 使用的名字（`server.LocalTarget` 与
+  `gmqx.LocalTarget` 是它的别名），`SendLocal` 仍只接受同一个 broker 产出的 target（改用类型上的
+  访问器判定）。`routing.Election` 是“哪个节点投递这条共享订阅发布”的集群选择，带 per-group 轮转，
+  让同一组的连续发布走遍所有候选；broker 侧只留本地索引、peer 视图、指标与发送这几步薄调用。
+  存储格式、线上行为与公开 API 均不变。
+
 ### 新增
 
 - `hook.SinkFuncs`：只实现关心的事件；nil 字段跳过，没写 publish 钩子的 sink 表示接受。
