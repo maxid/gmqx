@@ -18,6 +18,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 
 	"github.com/maxid/gmqx/cluster"
+	topicmatch "github.com/maxid/gmqx/internal/topic"
 )
 
 // sharedTestCluster is an in-memory cluster backend that behaves like the built-in
@@ -112,7 +113,7 @@ func handlerMatches(h ClusterHandler, topic string) bool {
 		return false
 	}
 	for _, filter := range provider.SubscriptionFilters() {
-		if matchTopic(filter, topic) {
+		if topicmatch.Match(filter, topic) {
 			return true
 		}
 	}

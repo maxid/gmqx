@@ -24,6 +24,10 @@ import (
 	"github.com/maxid/gplugin"
 
 	"github.com/maxid/gmqx/hook"
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	ns "github.com/maxid/gmqx/internal/namespace"
+	topicmatch "github.com/maxid/gmqx/internal/topic"
+	retainedstore "github.com/maxid/gmqx/retained"
 )
 
 // Broker is a single-node MQTT 3.1.1 broker.
@@ -75,7 +79,7 @@ type Broker struct {
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
 	clients  map[string]*client
-	retained map[string]retainedMessage
+	retained *retainedstore.Store
 	servers  []*gnety.Server
 	addrs    map[string]string
 	done     chan struct{}
@@ -94,18 +98,6 @@ type Broker struct {
 	// across a publish, so a will timer can publish while a connection connects.
 	wills  map[string]*pendingWill
 	willMu sync.Mutex
-}
-
-type retainedMessage struct {
-	namespace string
-	topic     string
-	payload   []byte
-	qos       byte
-	props     mqtt.Properties
-	// expiresAt is when the store may drop the message: the time it was stored
-	// plus its MQTT 5 Message Expiry Interval. The zero time means it never
-	// expires — no interval on the publish, or MQTT 3.1.1, which has none.
-	expiresAt time.Time
 }
 
 // copySubscriptions returns a detached copy of a session's subscription map, so
@@ -292,7 +284,7 @@ func New(cfg Config) (*Broker, error) {
 		clients:   make(map[string]*client),
 		store:     cfg.SessionStore,
 		index:     newSubscriptionIndex(),
-		retained:  make(map[string]retainedMessage),
+		retained:  retainedstore.NewStore(),
 		wills:     make(map[string]*pendingWill),
 		addrs:     make(map[string]string),
 		done:      make(chan struct{}),
@@ -1060,8 +1052,8 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 	// rule written for the group name would not be consulted. The full filter is
 	// what the session stores, the index keys and an UNSUBSCRIBE names.
 	aclFilter := filter
-	if shared, isShared, ok := parseSharedFilter(filter); isShared && ok {
-		aclFilter = shared.filter
+	if shared, isShared, ok := topicmatch.ParseSharedFilter(filter); isShared && ok {
+		aclFilter = shared.Filter
 	}
 	if !b.checkACL(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, aclFilter, AclSubscribe) {
 		b.metrics().RecordDroppedMessage("acl_subscribe")
@@ -1157,21 +1149,23 @@ func (b *Broker) subscriptionsChanged() {
 // one-second resolution of the property already dwarfs).
 func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte, props mqtt.Properties) {
 	key := namespaceKey(namespace, topic)
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	if len(payload) == 0 {
-		delete(b.retained, key)
+		b.retained.Delete(key)
 		return
 	}
-	if _, exists := b.retained[key]; !exists && b.cfg.MaxRetainMessages > 0 && int64(len(b.retained)) >= b.cfg.MaxRetainMessages {
-		b.metrics().RecordDroppedMessage("max_retain")
-		return
+	m := retainedstore.Message{
+		Namespace: namespace,
+		Topic:     topic,
+		Payload:   append([]byte(nil), payload...),
+		QoS:       qos,
+		Props:     props,
 	}
-	m := retainedMessage{namespace: namespace, topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
 	if expiry := props.MessageExpiryInterval; expiry > 0 {
-		m.expiresAt = time.Now().Add(time.Duration(expiry) * b.second())
+		m.ExpiresAt = time.Now().Add(time.Duration(expiry) * b.second())
 	}
-	b.retained[key] = m
+	if !b.retained.Put(key, m, b.cfg.MaxRetainMessages) {
+		b.metrics().RecordDroppedMessage("max_retain")
+	}
 }
 
 // sendRetained replays the retained messages a new subscription matches, in its
@@ -1197,29 +1191,27 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 		props   mqtt.Properties
 	}
 	var msgs []replay
-	b.mu.Lock()
-	for key, m := range b.retained {
-		if m.namespace != c.namespace {
-			continue
+	b.retained.Range(func(key string, m retainedstore.Message) bool {
+		if m.Namespace != c.namespace {
+			return true
 		}
-		if !matchTopic(filter, m.topic) {
-			continue
+		if !topicmatch.Match(filter, m.Topic) {
+			return true
 		}
-		props := m.props
-		if !m.expiresAt.IsZero() {
-			remaining := m.expiresAt.Sub(now)
+		props := m.Props
+		if !m.ExpiresAt.IsZero() {
+			remaining := m.ExpiresAt.Sub(now)
 			if remaining <= 0 {
-				delete(b.retained, key)
 				b.metrics().RecordDroppedMessage("retained_expired")
-				continue
+				return false
 			}
 			props.MessageExpiryInterval = b.expiryInterval(remaining)
 		}
-		msgs = append(msgs, replay{topic: m.topic, payload: m.payload, qos: m.qos, props: props})
-	}
-	b.mu.Unlock()
+		msgs = append(msgs, replay{topic: m.Topic, payload: m.Payload, qos: m.QoS, props: props})
+		return true
+	})
 	for _, m := range msgs {
-		props, dropped := withSubscriptionIDs(m.props, ids)
+		props, dropped := mqtt5.WithSubscriptionIDs(m.props, ids)
 		if dropped {
 			b.metrics().RecordDroppedMessage("subscription_identifier_limit")
 		}
@@ -1494,7 +1486,7 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 	}
 	props := pub.props
 	if !pub.propsSet {
-		decoded, err := decodePropertyBlock(pub.Props)
+		decoded, err := mqtt5.DecodePropertyBlock(pub.Props)
 		if err != nil {
 			return fmt.Errorf("gmqx: local delivery properties: %w", err)
 		}
@@ -1504,7 +1496,7 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 	// through, so they are attached here, once per delivery, and never travel in
 	// Publication.Props (see subscription_id.go).
 	var dropped bool
-	props, dropped = withSubscriptionIDs(props, target.subscriptionIDs)
+	props, dropped = mqtt5.WithSubscriptionIDs(props, target.subscriptionIDs)
 	if dropped {
 		b.metrics().RecordDroppedMessage("subscription_identifier_limit")
 	}
@@ -1608,7 +1600,7 @@ func (b *Broker) PublishToClient(ctx context.Context, clientID string, pub Publi
 		return fmt.Errorf("%w: publication namespace %q, broker namespace %q",
 			ErrNamespaceMismatch, pub.Namespace, b.namespace)
 	}
-	if !validTopic(pub.Topic) {
+	if !topicmatch.ValidTopic(pub.Topic) {
 		// A directed publish is a PUBLISH the broker produces itself, so it has to
 		// carry a topic name a subscriber could have subscribed to.
 		return fmt.Errorf("%w: directed publish topic %q", ErrMalformedPacket, pub.Topic)
@@ -1748,7 +1740,7 @@ func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 		b.log.Debug("gmqx remote publish dropped", "namespace", msg.Namespace, "topic", msg.Topic)
 		return
 	}
-	props, err := decodePropertyBlock(msg.Props)
+	props, err := mqtt5.DecodePropertyBlock(msg.Props)
 	if err != nil {
 		b.log.Warn("gmqx cluster publish properties", "err", err)
 		return
@@ -1980,7 +1972,7 @@ func (b *Broker) OnRemoteTarget(msg ClusterMessage) {
 		b.metrics().RecordDroppedMessage("target_unknown")
 		return
 	}
-	props, err := decodePropertyBlock(msg.Props)
+	props, err := mqtt5.DecodePropertyBlock(msg.Props)
 	if err != nil {
 		b.log.Warn("gmqx cluster target properties", "err", err)
 		return
@@ -2066,3 +2058,9 @@ func (r *rateLimiter) allow() bool {
 	r.tokens--
 	return true
 }
+
+// The key-space rules live in ./internal/namespace; these wrappers keep the root
+// package's call sites and tests unchanged.
+func namespaceKey(namespace, name string) string { return ns.Key(namespace, name) }
+
+func keyInNamespace(namespace, key string) bool { return ns.InNamespace(namespace, key) }

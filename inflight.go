@@ -58,6 +58,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 var (
@@ -738,7 +740,7 @@ func (c *client) closeOverflowed() {
 // session is offline takes. The property block is re-encoded exactly as the live
 // delivery carried it, subscription identifiers included.
 func deliveryPublication(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) Publication {
-	wire, err := encodePropertyBlock(props)
+	wire, err := mqtt5.EncodePropertyBlock(props)
 	if err != nil {
 		// The typed properties are still valid; only their wire form is lost, which
 		// is what a delivery with an unencodable block degrades to.

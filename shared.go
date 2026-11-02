@@ -59,6 +59,8 @@ import (
 	"context"
 	"hash/fnv"
 	"sort"
+
+	topicmatch "github.com/maxid/gmqx/internal/topic"
 )
 
 // sharedDirectory is implemented by a cluster backend that advertises the shared
@@ -109,8 +111,8 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 		if _, isLocal := localSet[group]; isLocal {
 			continue
 		}
-		parsed, isShared, ok := parseSharedFilter(group)
-		if !isShared || !ok || !parsed.matches(pub.Topic) {
+		parsed, isShared, ok := topicmatch.ParseSharedFilter(group)
+		if !isShared || !ok || !parsed.Matches(pub.Topic) {
 			continue
 		}
 		groups = append(groups, group)

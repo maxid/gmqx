@@ -26,10 +26,10 @@ func TestRetainedMessageExpiryReplaysRemainingInterval(t *testing.T) {
 	})
 
 	stored := waitRetained(t, b, "ret/x", "value")
-	if stored.props.MessageExpiryInterval != 10 {
-		t.Fatalf("stored interval = %d, want the published 10", stored.props.MessageExpiryInterval)
+	if stored.Props.MessageExpiryInterval != 10 {
+		t.Fatalf("stored interval = %d, want the published 10", stored.Props.MessageExpiryInterval)
 	}
-	if stored.expiresAt.IsZero() {
+	if stored.ExpiresAt.IsZero() {
 		t.Fatal("the stored retained message carries no expiry deadline")
 	}
 
@@ -67,7 +67,7 @@ func TestRetainedMessageExpiredIsNotReplayed(t *testing.T) {
 	subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "ret/#", QoS: 0})
 	expectNoMessage(t, sub, 150*time.Millisecond)
 	if m, ok := retainedSnapshot(b, "ret/old"); ok {
-		t.Fatalf("the expired retained message is still stored: %q", m.payload)
+		t.Fatalf("the expired retained message is still stored: %q", m.Payload)
 	}
 	if got := metrics.count("retained_expired"); got == 0 {
 		t.Fatal("the expired retained message was not counted")
@@ -81,8 +81,8 @@ func TestRetainedWithoutIntervalNeverExpires(t *testing.T) {
 	pub, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "ret-forever-pub", clean: true})
 	pub.publish(confPublish{topic: "ret/forever", payload: "kept", qos: 0, retain: true})
 	stored := waitRetained(t, b, "ret/forever", "kept")
-	if !stored.expiresAt.IsZero() {
-		t.Fatalf("a retained message without an interval got a deadline: %v", stored.expiresAt)
+	if !stored.ExpiresAt.IsZero() {
+		t.Fatalf("a retained message without an interval got a deadline: %v", stored.ExpiresAt)
 	}
 
 	time.Sleep(10 * testSecond)

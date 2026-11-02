@@ -17,6 +17,9 @@ import (
 
 	"github.com/maxid/gnety/codec/mqtt"
 	"github.com/maxid/gnety/codec/wire"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	topicmatch "github.com/maxid/gmqx/internal/topic"
 )
 
 var (
@@ -929,7 +932,7 @@ func (c *client) handshake() error {
 		_ = c.writeConnack(connackClientIDInvalid(c.version), "")
 		return fmt.Errorf("%w: MQTT 3.1 client id exceeds 23 characters", ErrMalformedPacket)
 	}
-	if connect.Will != nil && !validTopic(connect.Will.Topic) {
+	if connect.Will != nil && !topicmatch.ValidTopic(connect.Will.Topic) {
 		// A will topic is a topic name: no wildcards and not empty. MQTT 5 can
 		// name the reason; MQTT 3.1.1 has no return code for it, so the
 		// malformed CONNECT just closes the connection.
@@ -1164,7 +1167,7 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 	}
 	var wireProps []byte
 	if c.version == mqtt.Version5 {
-		if alias > topicAliasMaximum {
+		if alias > mqtt5.TopicAliasMaximum {
 			// The alias is above the Topic Alias Maximum this broker advertised.
 			c.protocolError(0x94)
 			return
@@ -1184,12 +1187,12 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 			c.topicAliases[alias] = topic
 		}
 		var err error
-		if wireProps, err = encodePropertyBlock(props); err != nil {
+		if wireProps, err = mqtt5.EncodePropertyBlock(props); err != nil {
 			c.protocolError(0x81)
 			return
 		}
 	}
-	if !validTopic(topic) {
+	if !topicmatch.ValidTopic(topic) {
 		// Empty or wildcard topic name in a PUBLISH is a protocol violation.
 		c.protocolError(0x90)
 		return
@@ -1279,7 +1282,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 	// value of 0 is a Protocol Error (§3.8.2.1.2) and ends the connection; the
 	// identifiers themselves are stored per subscription and attached to the
 	// deliveries that subscription causes (subscription_id.go).
-	ids, dropped, ok := normalizeSubscriptionIDs(m.Properties.SubscriptionIdentifiers)
+	ids, dropped, ok := mqtt5.NormalizeSubscriptionIDs(m.Properties.SubscriptionIdentifiers)
 	if !ok {
 		c.broker.metrics().RecordDroppedMessage("subscription_identifier")
 		c.protocolError(ReasonProtocolError)
@@ -1298,7 +1301,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 			retainHandling:    req.RetainHandling,
 			subscriptionIDs:   ids,
 		}
-		if _, isShared, wellFormed := parseSharedFilter(req.Filter); isShared {
+		if _, isShared, wellFormed := topicmatch.ParseSharedFilter(req.Filter); isShared {
 			// A "$share/<shareName>/<filter>" subscription, MQTT 5 §4.8.2. The
 			// filter must be well formed (MQTT-4.8.2-1, -2) and must not set No
 			// Local (MQTT-3.8.3-4): the two refusals are per filter in the SUBACK,
@@ -1316,7 +1319,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 				continue
 			}
 		}
-		if !validFilter(req.Filter) {
+		if !topicmatch.ValidFilter(req.Filter) {
 			// MQTT 3.1.1 has no per-filter rejection code for a malformed
 			// filter, so the protocol violation closes the connection. MQTT 5
 			// answers it with Topic Filter invalid and keeps the session.
@@ -1348,7 +1351,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 		// is skipped for the members of a group; later matching publications are
 		// delivered normally). A malformed shared filter is already skipped above,
 		// because its SUBACK code is not a granted QoS.
-		if _, isShared, _ := parseSharedFilter(req.Filter); isShared {
+		if _, isShared, _ := topicmatch.ParseSharedFilter(req.Filter); isShared {
 			continue
 		}
 		c.broker.sendRetained(c, req.Filter, req.QoS, req.RetainAsPublished, ids)
@@ -1376,7 +1379,7 @@ func (c *client) writeConnack(code byte, assignedClientID string) error {
 		ack.SessionPresent = c.sessionPresent
 	}
 	if c.version == mqtt.Version5 && code == 0 {
-		ack.Properties = connackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize),
+		ack.Properties = mqtt5.ConnackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize),
 			uint16(c.broker.receiveMaximum()), c.authMethod, c.authData)
 	}
 	return c.writeMessage(ack)

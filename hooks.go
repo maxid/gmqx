@@ -3,8 +3,9 @@ package gmqx
 import (
 	"context"
 
-	"github.com/maxid/gmqx/hook"
 	"github.com/maxid/gnety/codec/mqtt"
+
+	"github.com/maxid/gmqx/hook"
 )
 
 // Publication is one accepted publication the broker routes. It is the payload

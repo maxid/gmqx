@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 // session is the broker's in-memory form of the stored state.
@@ -82,7 +84,7 @@ func sessionState(s *session) SessionState {
 	if len(s.queue) > 0 {
 		state.Queue = make([]QueuedMessage, 0, len(s.queue))
 		for _, msg := range s.queue {
-			props, err := encodePropertyBlock(msg.props)
+			props, err := mqtt5.EncodePropertyBlock(msg.props)
 			if err != nil {
 				// A message whose properties cannot be encoded still travels; it
 				// simply carries none, exactly like a will with invalid properties.
@@ -104,7 +106,7 @@ func sessionState(s *session) SessionState {
 	if len(s.inflight) > 0 {
 		state.Inflight = make([]SessionInflight, 0, len(s.inflight))
 		for _, m := range s.inflight {
-			props, err := encodePropertyBlock(m.props)
+			props, err := mqtt5.EncodePropertyBlock(m.props)
 			if err != nil {
 				props = nil
 			}
@@ -178,7 +180,7 @@ func sessionFromState(state SessionState) (*session, int) {
 				// shape the protocol does not allow.
 				continue
 			}
-			props, err := decodePropertyBlock(stored.Props)
+			props, err := mqtt5.DecodePropertyBlock(stored.Props)
 			if err != nil {
 				// A property block that no longer decodes costs the properties, not
 				// the message: the exchange still has its topic, payload and packet id.
@@ -199,7 +201,7 @@ func sessionFromState(state SessionState) (*session, int) {
 	if len(state.Queue) > 0 {
 		s.queue = make([]queuedMessage, 0, len(state.Queue))
 		for _, msg := range state.Queue {
-			props, err := decodePropertyBlock(msg.Props)
+			props, err := mqtt5.DecodePropertyBlock(msg.Props)
 			if err != nil {
 				dropped++
 				continue
@@ -558,7 +560,7 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 	// stored unchanged, so an ordinary message is not re-encoded.
 	wireProps := pub.Props
 	if len(props.SubscriptionIdentifiers) > 0 {
-		if encoded, err := encodePropertyBlock(props); err == nil {
+		if encoded, err := mqtt5.EncodePropertyBlock(props); err == nil {
 			wireProps = encoded
 		}
 	}

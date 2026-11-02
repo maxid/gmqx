@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	mqttclient "github.com/maxid/gmqx/client"
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqttclient "github.com/maxid/gmqx/client"
 )
 
 // This file closes the coverage gaps in the directed-publish and wildcard paths:

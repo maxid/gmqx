@@ -23,6 +23,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 
 	"github.com/maxid/gmqx/cluster"
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 // newTestRedisSessionStore builds the store against the test miniredis and closes
@@ -80,7 +81,7 @@ func TestRedisSessionStoreRoundTrip(t *testing.T) {
 	mr := runMiniRedis(t)
 	store := newTestRedisSessionStore(t, mr, nil)
 
-	props, err := encodePropertyBlock(mqtt.Properties{
+	props, err := mqtt5.EncodePropertyBlock(mqtt.Properties{
 		ContentType:    "application/json",
 		UserProperties: []mqtt.UserProperty{{Key: "device", Value: "42"}},
 	})

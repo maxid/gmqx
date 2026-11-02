@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	retainedstore "github.com/maxid/gmqx/retained"
 )
 
 // Retained replication is shared behaviour of the two backends: a retained
@@ -44,8 +46,8 @@ func checkRetainedReplication(t *testing.T, p clusterPair) {
 	// joins b afterwards did not exist when the publish happened, so the value
 	// can only come from b's own retained store.
 	publishRetained(t, pub, "state/x", "on")
-	if m := waitRetained(t, p.b, "state/x", "on"); m.qos != 0 {
-		t.Fatalf("replicated retained QoS = %d, want 0", m.qos)
+	if m := waitRetained(t, p.b, "state/x", "on"); m.QoS != 0 {
+		t.Fatalf("replicated retained QoS = %d, want 0", m.QoS)
 	}
 	sub := dialTestClient(t, p.b.Addr(), "retain-sub")
 	subscribeTestClient(t, sub, "state/#")
@@ -102,11 +104,11 @@ func checkRetainedReplication(t *testing.T, p clusterPair) {
 		t.Fatalf("v5 puback: h=%#x err=%v", h, err)
 	}
 	m := waitRetained(t, p.b, "state/v5", "on")
-	if m.qos != 1 {
-		t.Fatalf("replicated retained QoS = %d, want 1", m.qos)
+	if m.QoS != 1 {
+		t.Fatalf("replicated retained QoS = %d, want 1", m.QoS)
 	}
-	if len(m.props.UserProperties) != 1 || m.props.UserProperties[0].Key != "key" || m.props.UserProperties[0].Value != "v" {
-		t.Fatalf("replicated retained properties = %+v", m.props)
+	if len(m.Props.UserProperties) != 1 || m.Props.UserProperties[0].Key != "key" || m.Props.UserProperties[0].Value != "v" {
+		t.Fatalf("replicated retained properties = %+v", m.Props)
 	}
 }
 
@@ -174,33 +176,27 @@ func waitSummaryContains(t *testing.T, name string, view func() ([]string, bool)
 }
 
 // retainedSnapshot returns the retained state of one topic.
-func retainedSnapshot(b *Broker, topic string) (retainedMessage, bool) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	m, ok := b.retained[topic]
+func retainedSnapshot(b *Broker, topic string) (retainedstore.Message, bool) {
+	m, ok := b.retained.Get(topic)
 	return m, ok
 }
 
 // retainedCount returns how many topics the broker retains.
-func retainedCount(b *Broker) int {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return len(b.retained)
-}
+func retainedCount(b *Broker) int { return b.retained.Len() }
 
 // waitRetained waits until the broker holds payload for topic.
-func waitRetained(t *testing.T, b *Broker, topic, payload string) retainedMessage {
+func waitRetained(t *testing.T, b *Broker, topic, payload string) retainedstore.Message {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if m, ok := retainedSnapshot(b, topic); ok && string(m.payload) == payload {
+		if m, ok := retainedSnapshot(b, topic); ok && string(m.Payload) == payload {
 			return m
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	m, ok := retainedSnapshot(b, topic)
 	t.Fatalf("node %s retained[%q] = (%+v, %t), want payload %q", b.nodeID, topic, m, ok, payload)
-	return retainedMessage{}
+	return retainedstore.Message{}
 }
 
 // waitRetainedGone waits until the broker no longer retains topic.
@@ -214,7 +210,7 @@ func waitRetainedGone(t *testing.T, b *Broker, topic string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	m, _ := retainedSnapshot(b, topic)
-	t.Fatalf("node %s still retains %q = %q", b.nodeID, topic, m.payload)
+	t.Fatalf("node %s still retains %q = %q", b.nodeID, topic, m.Payload)
 }
 
 // publishRetained sends a QoS 0 PUBLISH with the retain flag.

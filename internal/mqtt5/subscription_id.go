@@ -1,4 +1,4 @@
-package gmqx
+package mqtt5
 
 import "github.com/maxid/gnety/codec/mqtt"
 
@@ -23,12 +23,12 @@ import "github.com/maxid/gnety/codec/mqtt"
 //
 // Two bounds keep the property block bounded:
 //
-//   - maxSubscriptionIdentifiersPerSubscription caps what one subscription
+//   - MaxSubscriptionIdentifiersPerSubscription caps what one subscription
 //     stores. The codec delivers at most one identifier per SUBSCRIBE (the
 //     specification forbids repeating the property in SUBSCRIBE, §3.8.2.1.2), so
 //     the cap only matters for state restored from a SessionStore that another
 //     implementation wrote, and for a subscription modified by several packets.
-//   - maxSubscriptionIdentifiersPerDelivery caps one outgoing PUBLISH. Identifiers
+//   - MaxSubscriptionIdentifiersPerDelivery caps one outgoing PUBLISH. Identifiers
 //     beyond it are not attached and the drop is counted
 //     (Metrics.RecordDroppedMessage("subscription_identifier_limit")), so a
 //     session with many matching subscriptions cannot grow a property block
@@ -37,40 +37,40 @@ const (
 	// maxSubscriptionIdentifier is the highest value MQTT 5 §3.8.2.1.2 allows:
 	// 268,435,455 (the largest Variable Byte Integer). 0 is a Protocol Error.
 	maxSubscriptionIdentifier uint32 = 268435455
-	// maxSubscriptionIdentifiersPerSubscription bounds the identifiers one
+	// MaxSubscriptionIdentifiersPerSubscription bounds the identifiers one
 	// subscription stores.
-	maxSubscriptionIdentifiersPerSubscription = 8
-	// maxSubscriptionIdentifiersPerDelivery bounds the identifiers one outgoing
+	MaxSubscriptionIdentifiersPerSubscription = 8
+	// MaxSubscriptionIdentifiersPerDelivery bounds the identifiers one outgoing
 	// PUBLISH carries.
-	maxSubscriptionIdentifiersPerDelivery = 8
+	MaxSubscriptionIdentifiersPerDelivery = 8
 )
 
-// normalizeSubscriptionIDs validates and bounds the identifiers of one SUBSCRIBE.
+// NormalizeSubscriptionIDs validates and bounds the identifiers of one SUBSCRIBE.
 // It reports ok=false when a value is out of range, which is a Protocol Error
 // (§3.8.2.1.2) and ends the connection, and how many in-range identifiers were
 // dropped because the subscription already holds the maximum.
-func normalizeSubscriptionIDs(ids []uint32) (kept []uint32, dropped int, ok bool) {
+func NormalizeSubscriptionIDs(ids []uint32) (kept []uint32, dropped int, ok bool) {
 	if len(ids) == 0 {
 		return nil, 0, true
 	}
-	kept = make([]uint32, 0, min(len(ids), maxSubscriptionIdentifiersPerSubscription))
+	kept = make([]uint32, 0, min(len(ids), MaxSubscriptionIdentifiersPerSubscription))
 	for _, id := range ids {
 		if id == 0 || id > maxSubscriptionIdentifier {
 			return nil, 0, false
 		}
-		if len(kept) >= maxSubscriptionIdentifiersPerSubscription {
+		if len(kept) >= MaxSubscriptionIdentifiersPerSubscription {
 			dropped++
 			continue
 		}
 		kept = append(kept, id)
 	}
-	return dedupeSubscriptionIDs(kept), dropped, true
+	return DedupeSubscriptionIDs(kept), dropped, true
 }
 
-// mergeSubscriptionIDs returns the union of have and add, deduplicated, without
+// MergeSubscriptionIDs returns the union of have and add, deduplicated, without
 // mutating either. It is how a publication that matches several subscriptions of
 // one session collects their identifiers.
-func mergeSubscriptionIDs(have, add []uint32) []uint32 {
+func MergeSubscriptionIDs(have, add []uint32) []uint32 {
 	if len(add) == 0 {
 		return have
 	}
@@ -80,14 +80,14 @@ func mergeSubscriptionIDs(have, add []uint32) []uint32 {
 	out := make([]uint32, 0, len(have)+len(add))
 	out = append(out, have...)
 	out = append(out, add...)
-	return dedupeSubscriptionIDs(out)
+	return DedupeSubscriptionIDs(out)
 }
 
-// dedupeSubscriptionIDs removes repeated identifiers, keeping the first
+// DedupeSubscriptionIDs removes repeated identifiers, keeping the first
 // occurrence, and returns the input unchanged when it holds no duplicate (the
 // common case: one identifier per subscription). It never writes into ids, which
 // may be the slice an indexed subscription stores.
-func dedupeSubscriptionIDs(ids []uint32) []uint32 {
+func DedupeSubscriptionIDs(ids []uint32) []uint32 {
 	if len(ids) < 2 {
 		return ids
 	}
@@ -106,24 +106,24 @@ func dedupeSubscriptionIDs(ids []uint32) []uint32 {
 	return out
 }
 
-// capSubscriptionIDs bounds the identifiers of one delivery, and reports whether
+// CapSubscriptionIDs bounds the identifiers of one delivery, and reports whether
 // it had to drop any.
-func capSubscriptionIDs(ids []uint32) ([]uint32, bool) {
-	if len(ids) <= maxSubscriptionIdentifiersPerDelivery {
+func CapSubscriptionIDs(ids []uint32) ([]uint32, bool) {
+	if len(ids) <= MaxSubscriptionIdentifiersPerDelivery {
 		return ids, false
 	}
-	return ids[:maxSubscriptionIdentifiersPerDelivery], true
+	return ids[:MaxSubscriptionIdentifiersPerDelivery], true
 }
 
-// withSubscriptionIDs returns props with the identifiers of the subscriptions the
+// WithSubscriptionIDs returns props with the identifiers of the subscriptions the
 // delivery was made through. It reports whether the delivery cap dropped any, so
 // the caller can count it. props is a value type, so the caller's copy is never
 // touched.
-func withSubscriptionIDs(props mqtt.Properties, ids []uint32) (mqtt.Properties, bool) {
+func WithSubscriptionIDs(props mqtt.Properties, ids []uint32) (mqtt.Properties, bool) {
 	if len(ids) == 0 {
 		return props, false
 	}
-	capped, dropped := capSubscriptionIDs(ids)
+	capped, dropped := CapSubscriptionIDs(ids)
 	props.SubscriptionIdentifiers = capped
 	return props, dropped
 }

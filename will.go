@@ -37,6 +37,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 // pendingWill is a will waiting for its Will Delay Interval to elapse. It is
@@ -81,7 +83,7 @@ func (c *client) willOrigin() origin {
 // broker's pending-will scheduler when the client asked for a delay.
 func (c *client) publishWill(will *mqtt.Will) {
 	props := willPublishProperties(will.Properties)
-	wireProps, err := encodePropertyBlock(props)
+	wireProps, err := mqtt5.EncodePropertyBlock(props)
 	if err != nil {
 		// A will whose properties do not belong on a PUBLISH is published
 		// without them rather than not at all.

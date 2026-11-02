@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 func connectV5Payload(clientID string, props []byte) []byte {
@@ -202,7 +204,7 @@ func TestMQTT5TopicAliasAndUserProperty(t *testing.T) {
 	if topic != "alias/topic" || string(payload) != "one" {
 		t.Fatalf("unexpected first publish: topic=%q payload=%q", topic, payload)
 	}
-	forwarded, err := decodePropertyBlock(gotProps)
+	forwarded, err := mqtt5.DecodePropertyBlock(gotProps)
 	if err != nil {
 		t.Fatalf("forwarded properties %x: %v", gotProps, err)
 	}
@@ -276,8 +278,8 @@ func TestMQTT5ConnackProperties(t *testing.T) {
 	if p.SharedSubscriptionAvailable == nil || !*p.SharedSubscriptionAvailable {
 		t.Fatalf("CONNACK must declare shared subscriptions supported: %+v", p)
 	}
-	if p.TopicAliasMaximum != topicAliasMaximum {
-		t.Fatalf("topic alias maximum = %d, want %d", p.TopicAliasMaximum, topicAliasMaximum)
+	if p.TopicAliasMaximum != mqtt5.TopicAliasMaximum {
+		t.Fatalf("topic alias maximum = %d, want %d", p.TopicAliasMaximum, mqtt5.TopicAliasMaximum)
 	}
 	if want := uint32(b.cfg.MaxPacketSize); p.MaximumPacketSize != want {
 		t.Fatalf("maximum packet size = %d, want %d", p.MaximumPacketSize, want)

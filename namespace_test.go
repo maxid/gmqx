@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	retainedstore "github.com/maxid/gmqx/retained"
 )
 
 // dropRecorder implements MetricsManager and counts the drop reasons a component
@@ -71,25 +73,23 @@ func (c *injectCluster) inject(msg ClusterMessage) {
 }
 
 // retainedIn returns the retained message a namespace holds for topic.
-func retainedIn(b *Broker, namespace, topic string) (retainedMessage, bool) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	m, ok := b.retained[namespaceKey(namespace, topic)]
+func retainedIn(b *Broker, namespace, topic string) (retainedstore.Message, bool) {
+	m, ok := b.retained.Get(namespaceKey(namespace, topic))
 	return m, ok
 }
 
-func waitRetainedIn(t *testing.T, b *Broker, namespace, topic, payload string) retainedMessage {
+func waitRetainedIn(t *testing.T, b *Broker, namespace, topic, payload string) retainedstore.Message {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if m, ok := retainedIn(b, namespace, topic); ok && string(m.payload) == payload {
+		if m, ok := retainedIn(b, namespace, topic); ok && string(m.Payload) == payload {
 			return m
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	m, ok := retainedIn(b, namespace, topic)
 	t.Fatalf("retained[%s/%q] = (%+v, %t), want payload %q", namespace, topic, m, ok, payload)
-	return retainedMessage{}
+	return retainedstore.Message{}
 }
 
 // waitDrop waits until a metrics recorder saw at least one drop of reason.

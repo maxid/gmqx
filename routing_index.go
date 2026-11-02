@@ -57,6 +57,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	topicmatch "github.com/maxid/gmqx/internal/topic"
 )
 
 // subscriptionIndex is the broker's routing table. See the file comment for the
@@ -90,7 +93,7 @@ type subscriptionIndex struct {
 // instead (§4.8.2: a publication is sent to exactly one of the sessions).
 type sharedGroup struct {
 	// filter is the parsed group key: what a publication is matched against.
-	filter sharedFilter
+	filter topicmatch.SharedFilter
 	// members maps a session key to its entry.
 	members map[string]*routedSubscription
 	// order is the sorted member keys, so the round-robin choice is stable and
@@ -297,7 +300,7 @@ func (idx *subscriptionIndex) collectTargets(topic string, from ConnectionID, pu
 		matches = append(matches, exact)
 	}
 	for filter, entries := range idx.wildcard {
-		if matchTopic(filter, topic) {
+		if topicmatch.Match(filter, topic) {
 			matches = append(matches, entries)
 		}
 	}
@@ -334,7 +337,7 @@ func (idx *subscriptionIndex) collectTargets(topic string, from ConnectionID, pu
 			if rs.sub.retainAsPublished {
 				m.rap = true
 			}
-			m.ids = mergeSubscriptionIDs(m.ids, rs.sub.subscriptionIDs)
+			m.ids = mqtt5.MergeSubscriptionIDs(m.ids, rs.sub.subscriptionIDs)
 		}
 	}
 	for _, m := range matched {
@@ -370,7 +373,7 @@ func (idx *subscriptionIndex) sharedGroups(topic string) []string {
 	}
 	out := make([]string, 0, 2)
 	for key, group := range idx.shared {
-		if group.filter.matches(topic) {
+		if group.filter.Matches(topic) {
 			out = append(out, key)
 		}
 	}
@@ -505,7 +508,7 @@ func (idx *subscriptionIndex) removeLocked(key string) {
 // but is not a member, because a publication is delivered to exactly one live
 // member and shared state is not queued.
 func (idx *subscriptionIndex) putLocked(filter, key string, entry *routedSubscription) {
-	if isSharedSubscription(filter) {
+	if topicmatch.IsSharedSubscription(filter) {
 		if entry.session.client == nil {
 			return
 		}
@@ -535,7 +538,7 @@ func (idx *subscriptionIndex) putLocked(filter, key string, entry *routedSubscri
 
 // deleteLocked drops one entry, keeping the live-filter counts right.
 func (idx *subscriptionIndex) deleteLocked(filter, key string) {
-	if isSharedSubscription(filter) {
+	if topicmatch.IsSharedSubscription(filter) {
 		idx.deleteSharedLocked(filter, key)
 		return
 	}
@@ -584,7 +587,7 @@ func indexedSubscriptions(subs map[string]SessionSubscription) map[string]subscr
 func (idx *subscriptionIndex) putSharedLocked(filter, key string, entry *routedSubscription) {
 	group := idx.shared[filter]
 	if group == nil {
-		parsed, _, ok := parseSharedFilter(filter)
+		parsed, _, ok := topicmatch.ParseSharedFilter(filter)
 		if !ok {
 			return
 		}

@@ -1,4 +1,9 @@
-package gmqx
+// Package mqtt5 holds the MQTT 5 packet helpers the broker shares with its
+// connection state machine: the property block a PUBLISH carries, the CONNACK
+// property set and the Subscription Identifier rules. They are not part of gnety's
+// codec because they encode broker policy (which properties a CONNACK advertises,
+// how identifiers are capped), not just the wire format.
+package mqtt5
 
 import (
 	"bufio"
@@ -18,11 +23,11 @@ import (
 // own: the only thing this file knows is that a property block ends up in the
 // variable header of a PUBLISH.
 
-// topicAliasMaximum is the highest topic alias this broker accepts, and the
+// TopicAliasMaximum is the highest topic alias this broker accepts, and the
 // value its MQTT 5 CONNACK advertises.
-const topicAliasMaximum uint16 = 16
+const TopicAliasMaximum uint16 = 16
 
-// connackProperties builds the MQTT 5 CONNACK capability set gmqx advertises.
+// ConnackProperties builds the MQTT 5 CONNACK capability set gmqx advertises.
 //
 // Maximum QoS is deliberately absent: the specification allows only 0 or 1
 // there, and its absence already means "QoS 2", which is what this broker
@@ -46,7 +51,7 @@ const topicAliasMaximum uint16 = 16
 // method, and it must be that method, so this function never advertises a method
 // the client did not use. Authentication Data without a method is a Protocol
 // Error, which is why it is written only together with one.
-func connackProperties(assignedClientID string, maxPacketSize uint32, receiveMaximum uint16, authMethod string, authData []byte) mqtt.Properties {
+func ConnackProperties(assignedClientID string, maxPacketSize uint32, receiveMaximum uint16, authMethod string, authData []byte) mqtt.Properties {
 	yes := true
 	props := mqtt.Properties{
 		RetainAvailable:                 &yes,
@@ -55,7 +60,7 @@ func connackProperties(assignedClientID string, maxPacketSize uint32, receiveMax
 		SharedSubscriptionAvailable:     &yes,
 		MaximumPacketSize:               maxPacketSize,
 		ReceiveMaximum:                  receiveMaximum,
-		TopicAliasMaximum:               topicAliasMaximum,
+		TopicAliasMaximum:               TopicAliasMaximum,
 		AssignedClientID:                assignedClientID,
 	}
 	if authMethod != "" {
@@ -67,10 +72,10 @@ func connackProperties(assignedClientID string, maxPacketSize uint32, receiveMax
 	return props
 }
 
-// encodePropertyBlock returns the PUBLISH property bytes of p, without the
+// EncodePropertyBlock returns the PUBLISH property bytes of p, without the
 // property length prefix. Properties the codec refuses for a PUBLISH are
 // reported as an error instead of being dropped.
-func encodePropertyBlock(p mqtt.Properties) ([]byte, error) {
+func EncodePropertyBlock(p mqtt.Properties) ([]byte, error) {
 	var buf bytes.Buffer
 	pub := &mqtt.Publish{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version5}, Properties: p}
 	if err := mqtt.Encode(&buf, pub); err != nil {
@@ -87,14 +92,14 @@ func encodePropertyBlock(p mqtt.Properties) ([]byte, error) {
 		return nil, err
 	}
 	if n != len(rest) {
-		return nil, fmt.Errorf("%w: property block of %d bytes with %d trailing", ErrMalformedPacket, n, len(rest)-n)
+		return nil, fmt.Errorf("%w: property block of %d bytes with %d trailing", mqtt.ErrMalformedPacket, n, len(rest)-n)
 	}
 	return rest, nil
 }
 
-// decodePropertyBlock parses property bytes as they arrive from a sink, a
+// DecodePropertyBlock parses property bytes as they arrive from a sink, a
 // retained message or a peer node.
-func decodePropertyBlock(raw []byte) (mqtt.Properties, error) {
+func DecodePropertyBlock(raw []byte) (mqtt.Properties, error) {
 	body := make([]byte, 0, 2+4+len(raw))
 	body = append(body, 0, 0) // empty topic name
 	body = mqtt.AppendRemainingLength(body, len(raw))
@@ -109,7 +114,7 @@ func decodePropertyBlock(raw []byte) (mqtt.Properties, error) {
 	}
 	pub, ok := msg.(*mqtt.Publish)
 	if !ok {
-		return mqtt.Properties{}, fmt.Errorf("%w: unexpected %T", ErrMalformedPacket, msg)
+		return mqtt.Properties{}, fmt.Errorf("%w: unexpected %T", mqtt.ErrMalformedPacket, msg)
 	}
 	return pub.Properties, nil
 }

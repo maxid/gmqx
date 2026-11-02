@@ -1,4 +1,4 @@
-package gmqx
+package mqtt5
 
 import (
 	"bytes"
@@ -21,11 +21,11 @@ func TestPropertyBlockRoundTrip(t *testing.T) {
 		CorrelationData:       []byte{1, 2, 3},
 		UserProperties:        []mqtt.UserProperty{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}},
 	}
-	raw, err := encodePropertyBlock(want)
+	raw, err := EncodePropertyBlock(want)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	got, err := decodePropertyBlock(raw)
+	got, err := DecodePropertyBlock(raw)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestPropertyBlockRoundTrip(t *testing.T) {
 // user property is identifier 0x26, two UTF-8 strings, in ascending identifier
 // order.
 func TestPropertyBlockBytes(t *testing.T) {
-	raw, err := encodePropertyBlock(mqtt.Properties{
+	raw, err := EncodePropertyBlock(mqtt.Properties{
 		UserProperties: []mqtt.UserProperty{{Key: "key", Value: "v"}},
 	})
 	if err != nil {
@@ -51,14 +51,14 @@ func TestPropertyBlockBytes(t *testing.T) {
 }
 
 func TestPropertyBlockEmpty(t *testing.T) {
-	raw, err := encodePropertyBlock(mqtt.Properties{})
+	raw, err := EncodePropertyBlock(mqtt.Properties{})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	if len(raw) != 0 {
 		t.Fatalf("empty property set encodes %d bytes: %x", len(raw), raw)
 	}
-	got, err := decodePropertyBlock(nil)
+	got, err := DecodePropertyBlock(nil)
 	if err != nil {
 		t.Fatalf("decode empty: %v", err)
 	}
@@ -72,12 +72,12 @@ func TestPropertyBlockEmpty(t *testing.T) {
 // property that does not belong on a PUBLISH are both rejected.
 func TestPropertyBlockRejectsBadBytes(t *testing.T) {
 	truncated := []byte{0x26, 0, 3, 'k'}
-	if _, err := decodePropertyBlock(truncated); err == nil {
+	if _, err := DecodePropertyBlock(truncated); err == nil {
 		t.Fatal("expected an error for a truncated user property")
 	}
 	// 0x12 is Assigned Client Identifier, CONNACK only.
 	connackOnly := []byte{0x12, 0, 1, 'c'}
-	if _, err := decodePropertyBlock(connackOnly); err == nil {
+	if _, err := DecodePropertyBlock(connackOnly); err == nil {
 		t.Fatal("expected an error for a CONNACK-only property")
 	}
 }

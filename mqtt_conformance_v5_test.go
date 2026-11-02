@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 func testConformance5(t *testing.T) {
@@ -190,8 +192,8 @@ func test5ConnackProperties(t *testing.T) {
 	if p.MaximumPacketSize != 1024 {
 		t.Fatalf("maximum packet size = %d, want 1024", p.MaximumPacketSize)
 	}
-	if p.TopicAliasMaximum != topicAliasMaximum {
-		t.Fatalf("topic alias maximum = %d, want %d", p.TopicAliasMaximum, topicAliasMaximum)
+	if p.TopicAliasMaximum != mqtt5.TopicAliasMaximum {
+		t.Fatalf("topic alias maximum = %d, want %d", p.TopicAliasMaximum, mqtt5.TopicAliasMaximum)
 	}
 	if p.WildcardSubscriptionAvailable == nil || !*p.WildcardSubscriptionAvailable {
 		t.Fatalf("wildcard subscription available = %v, want true", p.WildcardSubscriptionAvailable)
@@ -243,7 +245,7 @@ func test5TopicAlias(t *testing.T) {
 
 	// An alias above the advertised Topic Alias Maximum is a protocol error.
 	outOfRange, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "v5-alias-big", clean: true})
-	outOfRange.publish(confPublish{topic: "alias/topic", payload: "x", qos: 0, props: mqtt.Properties{TopicAlias: topicAliasMaximum + 1}})
+	outOfRange.publish(confPublish{topic: "alias/topic", payload: "x", qos: 0, props: mqtt.Properties{TopicAlias: mqtt5.TopicAliasMaximum + 1}})
 	expectDisconnect(t, outOfRange, 0x94)
 
 	// An empty topic with an alias that was never created cannot resolve.

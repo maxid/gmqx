@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 // subscribeID subscribes one filter with the given subscription identifiers and
@@ -183,7 +185,7 @@ func TestSubscriptionIdentifierZeroIsAProtocolError(t *testing.T) {
 }
 
 // TestSubscriptionIdentifierDeliveryCap pins the documented bound: one PUBLISH
-// carries at most maxSubscriptionIdentifiersPerDelivery identifiers, and the excess
+// carries at most mqtt5.MaxSubscriptionIdentifiersPerDelivery identifiers, and the excess
 // is counted instead of silently dropped.
 func TestSubscriptionIdentifierDeliveryCap(t *testing.T) {
 	metrics := newDeliveryMetrics()
@@ -203,9 +205,9 @@ func TestSubscriptionIdentifierDeliveryCap(t *testing.T) {
 	pub.mustPublish(t, confPublish{topic: "cap/a/b", payload: "many", qos: 1, pid: 1})
 
 	ids := expectPublish(t, sub).Properties.SubscriptionIdentifiers
-	if len(ids) != maxSubscriptionIdentifiersPerDelivery {
+	if len(ids) != mqtt5.MaxSubscriptionIdentifiersPerDelivery {
 		t.Fatalf("identifiers on one delivery = %d (%v), want the documented cap of %d",
-			len(ids), ids, maxSubscriptionIdentifiersPerDelivery)
+			len(ids), ids, mqtt5.MaxSubscriptionIdentifiersPerDelivery)
 	}
 	seen := make(map[uint32]struct{}, len(ids))
 	for _, id := range ids {

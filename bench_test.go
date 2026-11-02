@@ -40,8 +40,9 @@ import (
 	"testing"
 	"time"
 
-	mqttclient "github.com/maxid/gmqx/client"
 	"github.com/maxid/gnety/codec/mqtt"
+
+	mqttclient "github.com/maxid/gmqx/client"
 )
 
 const (

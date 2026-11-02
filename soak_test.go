@@ -191,7 +191,7 @@ run:
 
 	broker.mu.RLock()
 	clients := len(broker.clients)
-	retained := len(broker.retained)
+	retained := broker.retained.Len()
 	offlineQueued := broker.offlineQueued
 	broker.mu.RUnlock()
 	stored := len(broker.store.Keys())
