@@ -111,12 +111,12 @@ go test -run '^$' -bench . -benchtime=2s ./...
 
 ```sh
 # 完整矩阵：QoS 0/1/2 × 64 B / 1 KiB，200 连接，每个用例 5 秒（约 35 秒）。
-GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./internal/engine
 
 # 单个用例（下文剖析的那个）。
 GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
     go test -run TestThroughput -cpuprofile /tmp/cpu.out \
-    -memprofile /tmp/mem.out ./server
+    -memprofile /tmp/mem.out ./internal/engine
 go tool pprof -top /tmp/cpu.out
 ```
 
@@ -257,7 +257,7 @@ case qos=1 payload=64B clients=200 subscribers=4 window=5s
 在上述机器上运行：
 
 ```sh
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./internal/engine
 ```
 
 结果：
@@ -308,22 +308,22 @@ go test -run '^$' -bench . -benchtime=2s ./...
 
 # 单个用例，带 CPU 剖析。
 go test -run '^$' -bench 'BenchmarkPublishQoS1$' -benchtime=2s \
-    -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./server
+    -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./internal/engine
 go tool pprof -top /tmp/cpu.out
 
 # 并发吞吐矩阵（200 连接，每个用例 5 秒）。
-GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./internal/engine
 
 # 单个吞吐用例，带 CPU 与堆剖析。
 GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
-    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./server
+    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./internal/engine
 go tool pprof -top /tmp/cpu.out
 
 # 浸泡测试（默认 10 秒）。
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./internal/engine
 
 # 更短的浸泡，适合合并前检查。
-GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./server
+GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./internal/engine
 ```
 
 `scripts/bench.sh` 与 `scripts/soak.sh` 封装了上述两条命令（`BENCHTIME=2s ./scripts/bench.sh`、`GMQX_SOAK_DURATION=30s ./scripts/soak.sh`）。

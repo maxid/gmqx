@@ -17,4 +17,4 @@ cd "$(dirname "$0")/.."
 export GMQX_SOAK=1
 export GMQX_SOAK_DURATION
 
-exec go test -timeout "$GMQX_SOAK_TIMEOUT" -run '^TestSoak$' -v -count=1 ./server
+exec go test -timeout "$GMQX_SOAK_TIMEOUT" -run '^TestSoak$' -v -count=1 ./internal/engine

@@ -229,12 +229,12 @@ Run it (from `libs/gmqx`):
 
 ```sh
 # Full matrix: QoS 0/1/2 × 64 B / 1 KiB, 200 connections, 5 s each (~35 s).
-GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./internal/engine
 
 # One case (the one profiled below).
 GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
     go test -run TestThroughput -cpuprofile /tmp/cpu.out \
-    -memprofile /tmp/mem.out ./server
+    -memprofile /tmp/mem.out ./internal/engine
 go tool pprof -top /tmp/cpu.out
 ```
 
@@ -487,7 +487,7 @@ test performed itself.
 Run on the machine above:
 
 ```sh
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./internal/engine
 ```
 
 Result:
@@ -557,22 +557,22 @@ go test -run '^$' -bench . -benchtime=2s ./...
 
 # A single case, with a CPU profile.
 go test -run '^$' -bench 'BenchmarkPublishQoS1$' -benchtime=2s \
-    -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./server
+    -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./internal/engine
 go tool pprof -top /tmp/cpu.out
 
 # The concurrent throughput matrix (200 connections, 5 s per case).
-GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./internal/engine
 
 # One throughput case with CPU and heap profiles.
 GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
-    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./server
+    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./internal/engine
 go tool pprof -top /tmp/cpu.out
 
 # The soak test (10 s by default).
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./internal/engine
 
 # Shorter soak, useful in a pre-merge check.
-GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./server
+GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./internal/engine
 ```
 
 `scripts/bench.sh` and `scripts/soak.sh` wrap the two commands
