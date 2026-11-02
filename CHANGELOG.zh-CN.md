@@ -15,6 +15,12 @@
   import、名称与类型断言全部照旧可用。契约从 `hooks.go` 里的一节变成单独可评审的目录，
   且 `gmqx/hook` 不 import broker 的任何东西。
 
+
+- **broker 引擎移到 `gmqx/server`，根包只剩门面。** 连接/会话状态机、路由索引、字节速率整形、配置、
+  错误与 broker 侧的 cluster 适配器一起进一个包——它们是同一个整体（inflight/will/auth 是未导出
+  `client` 的方法，路由索引持有 `*client`）。根包把公开类型全部别名导出并转发构造函数，消费方零改动；
+  根实现文件降到 8 个（全是门面），`libcheck` 的 gmqx 欠账条目随之删除。`server/` 是落脚点不是终点：
+  后续按角色（会话状态、routing、conn）的拆分计划记在 `docs/design/source-layout.md` §4.3。
 ### 新增
 
 - `hook.SinkFuncs`：只实现关心的事件；nil 字段跳过，没写 publish 钩子的 sink 表示接受。

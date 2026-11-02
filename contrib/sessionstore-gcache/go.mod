@@ -38,6 +38,7 @@ require (
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
 	github.com/magiconair/properties v1.8.10 // indirect
 	github.com/maxid/gnety v0.0.0-20261101055410-7fc85d35bd1c // indirect
+	github.com/maxid/gplugin v0.0.0-20261102034223-09f50dbe8e66 // indirect
 	github.com/mdelapenya/tlscert v0.2.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.2.0 // indirect

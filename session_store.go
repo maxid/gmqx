@@ -3,7 +3,7 @@ package gmqx
 // The session store lives in gmqx/session (docs/design/source-layout.md §2, rule L3):
 // the root package re-exports its types as aliases and forwards the constructors, so
 // Config.SessionStore, an implementation outside this module (contrib/sessionstore-
-// gcache) and the stores this package ships all name the same types as before.
+// gcache) and the stores this module ships all name the same types as before.
 
 import sessionstore "github.com/maxid/gmqx/session"
 
@@ -19,9 +19,9 @@ type (
 	InflightStage = sessionstore.InflightStage
 	// SessionInflight is one outbound QoS 1/2 exchange a session owes its client.
 	SessionInflight = sessionstore.SessionInflight
-	// SessionSubscription is one subscription of a stored sessionstore.
+	// SessionSubscription is one subscription of a stored session.
 	SessionSubscription = sessionstore.SessionSubscription
-	// QueuedMessage is one message queued for an offline persistent sessionstore.
+	// QueuedMessage is one message queued for an offline persistent session.
 	QueuedMessage = sessionstore.QueuedMessage
 	// MemorySessionStore is the default node-local store.
 	MemorySessionStore = sessionstore.MemorySessionStore
@@ -52,14 +52,4 @@ func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, erro
 // peers take over.
 func NewRedisClusterWithSessionStore(cfg RedisClusterConfig) (Cluster, *RedisSessionStore, error) {
 	return sessionstore.NewRedisClusterWithSessionStore(cfg)
-}
-
-// sessionTaker is implemented by a SessionStore that can remove a stored session
-// atomically and hand it to one caller. A shared store needs it: Load followed by
-// Delete is two round trips, so two nodes reconnecting the same client id at the
-// same time could both see the session and both serve it. The method is exported
-// so an implementation outside this module can provide it; the interface is
-// unexported because only the broker decides when to take a sessionstore.
-type sessionTaker interface {
-	Take(key string) (SessionState, bool)
 }

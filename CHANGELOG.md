@@ -44,6 +44,18 @@
   consumer changes. The root package is down to 21 implementation files from 26, and
   the backends carry their own tests (including -race) beside them.
 
+
+- **The broker engine lives in `gmqx/server`; the root package is a facade.** The
+  connection/session state machine, the routing index, the byte-rate shaper, the
+  configuration, the errors and the broker side of the cluster seam moved together
+  into one package, because they are one unit: the inflight, will and auth code are
+  methods of the unexported `client`, the routing index holds `*client`. The root
+  package re-exports every public type as an alias and forwards `New`,
+  `NewDefaultDispatcher` and the constructors, so no consumer changes and both
+  import paths name the same types. Root implementation files are down to 8 — all
+  facades — and `libcheck`'s root-debt entry for gmqx is gone. `server/` is a
+  waypoint, not the destination: the staged split by role (session state, routing,
+  connection) is recorded in `docs/design/source-layout.md` §4.3.
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
