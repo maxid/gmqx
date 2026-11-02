@@ -41,6 +41,16 @@
   让同一组的连续发布走遍所有候选；broker 侧只留本地索引、peer 视图、指标与发送这几步薄调用。
   存储格式、线上行为与公开 API 均不变。
 
+- **连接状态机进了 `gmqx/conn`。** 一条物理连接——CONNECT/AUTH 握手、读循环、写队列与 writer、
+  出站 QoS 1/2 窗口与重传定时器、以及它留下的 will——原本是 `gmqx/server` 里的未导出 `type client`，
+  现在是 `conn.Client`；broker 通过实现 `conn.Host` 为它服务：命名空间、解析后的每连接 `Limits`、
+  可换的 metrics/sink/logger 快照、认证入口、register/unregister、publish/subscribe/retained 路径、
+  离线入队与延迟 will 调度。会话交接仍是**一个临界区**（`HandOff`、`TakeOver`）：取走状态与“连接不再
+  拥有自己的队列”同时发生，broker 在这个回调里完成 store 写入，因此投递不可能落在“会话已保存”的
+  连接上。引擎保留待发 will 表与定时器、认证 exchange 工厂与会话簿记；`gmqx/server` 从 ~7.5k 行降到
+  ~4k 行。连接拒绝错误与 `MaxAuthSteps` 随产生它们的代码走并在 server 重新导出，`errors.Is`、错误值
+  与根包公开 API 均不变。
+
 ### 新增
 
 - `hook.SinkFuncs`：只实现关心的事件；nil 字段跳过，没写 publish 钩子的 sink 表示接受。

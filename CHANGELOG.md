@@ -99,6 +99,24 @@
   broker keeps the local index, the peer view, the metrics and the send as thin
   calls. No stored format, wire behavior or public API changes.
 
+- **The connection state machine lives in `gmqx/conn`.** One physical connection —
+  the CONNECT/AUTH handshake, the read loop, the write-behind queue and its writer,
+  the outbound QoS 1/2 window with its retransmission timer, and the will it leaves
+  behind — was the unexported `type client` inside `gmqx/server`; it is now
+  `conn.Client`, and the broker implements `conn.Host` to serve it: the namespace,
+  the resolved per-connection `Limits`, the swappable metrics/sink/logger
+  snapshots, the authentication entry points, register/unregister, the
+  publish/subscribe/retained path, the offline enqueue and the delayed-will
+  scheduler. The session handoff stays one critical section (`HandOff`,
+  `TakeOver`): the state is taken and the connection stops owning its queue
+  together, and the broker writes the store inside that callback, so a delivery can
+  never be written to a socket whose session was just stored. The engine keeps the
+  pending-will map and its timers, the exchange factory and the session
+  bookkeeping; `gmqx/server` is down to ~4k lines from ~7.5k. The connect-refusal
+  errors and `MaxAuthSteps` moved with the code that produces them and are
+  re-exported, so `errors.Is`, the error values and the root package's exported API
+  are unchanged.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
