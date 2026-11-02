@@ -11,4 +11,4 @@ cd "$(dirname "$0")/.."
 export GMQX_SOAK=1
 export GMQX_SOAK_DURATION
 
-exec go test -run TestSoak -v -count=1 .
+exec go test -run '^TestSoak$' -v -count=1 ./server

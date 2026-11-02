@@ -111,12 +111,12 @@ go test -run '^$' -bench . -benchtime=2s ./...
 
 ```sh
 # 完整矩阵：QoS 0/1/2 × 64 B / 1 KiB，200 连接，每个用例 5 秒（约 35 秒）。
-GMQX_THROUGHPUT=1 go test -run TestThroughput -v .
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
 
 # 单个用例（下文剖析的那个）。
 GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
     go test -run TestThroughput -cpuprofile /tmp/cpu.out \
-    -memprofile /tmp/mem.out .
+    -memprofile /tmp/mem.out ./server
 go tool pprof -top /tmp/cpu.out
 ```
 
@@ -308,15 +308,15 @@ go test -run '^$' -bench . -benchtime=2s ./...
 
 # 单个用例，带 CPU 剖析。
 go test -run '^$' -bench 'BenchmarkPublishQoS1$' -benchtime=2s \
-    -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out .
+    -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./server
 go tool pprof -top /tmp/cpu.out
 
 # 并发吞吐矩阵（200 连接，每个用例 5 秒）。
-GMQX_THROUGHPUT=1 go test -run TestThroughput -v .
+GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
 
 # 单个吞吐用例，带 CPU 与堆剖析。
 GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
-    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out .
+    go test -run TestThroughput -cpuprofile /tmp/cpu.out -memprofile /tmp/mem.out ./server
 go tool pprof -top /tmp/cpu.out
 
 # 浸泡测试（默认 10 秒）。
