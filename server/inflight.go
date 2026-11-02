@@ -504,14 +504,31 @@ func (c *client) resendInflight(batch []inflightResend) {
 // to the completion of an exchange that is already in flight.
 func (c *client) resumeInflight() {
 	c.mu.Lock()
-	ids := make([]uint16, 0, len(c.inflight))
-	for id := range c.inflight {
-		ids = append(ids, id)
-	}
+	batch := c.restoredBatchLocked()
+	c.mu.Unlock()
+
+	c.resendInflight(batch)
+}
+
+// restoredBatchLocked is the resend snapshot of the exchanges restoreQoS2State
+// carried over from the previous connection: those still unconfirmed when the
+// handshake finishes, in packet-id order, and only those. A delivery that reached
+// this fresh connection between the CONNACK and this call is registered in the
+// same table but was already written once; resending it would duplicate it with
+// DUP set (the Windows CI failure that led to this split).
+//
+// The caller holds c.mu.
+func (c *client) restoredBatchLocked() []inflightResend {
+	ids := c.restoredInflight
+	c.restoredInflight = nil
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	batch := make([]inflightResend, 0, len(ids))
 	for _, id := range ids {
-		m := c.inflight[id]
+		m, ok := c.inflight[id]
+		if !ok {
+			// Confirmed or given up between the CONNACK and now.
+			continue
+		}
 		batch = append(batch, inflightResend{
 			topic:    m.topic,
 			payload:  m.payload,
@@ -522,9 +539,7 @@ func (c *client) resumeInflight() {
 			retain:   m.retain,
 		})
 	}
-	c.mu.Unlock()
-
-	c.resendInflight(batch)
+	return batch
 }
 
 // writePublish sends one PUBLISH to this connection. For QoS 1 and 2 it registers

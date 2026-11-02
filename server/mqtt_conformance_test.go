@@ -294,7 +294,7 @@ func expectNoMessage(t *testing.T, c *confClient, d time.Duration) {
 	t.Helper()
 	msg, err := c.readFor(time.Now().Add(d))
 	if err == nil {
-		t.Fatalf("expected silence for %v, got %T", d, msg)
+		t.Fatalf("expected silence for %v, got %T: %+v", d, msg, msg)
 	}
 	var ne net.Error
 	if !errors.As(err, &ne) || !ne.Timeout() {

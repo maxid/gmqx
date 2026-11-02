@@ -132,6 +132,13 @@ type client struct {
 	inflightQoS1        int
 	inflightQoS2        int
 	inflightUnconfirmed int
+	// restoredInflight is the packet ids restoreQoS2State carried over from the
+	// previous connection, in restore order. resumeInflight re-sends exactly these
+	// and nothing else: the CONNACK is already on the wire when it runs, so a
+	// delivery made to the fresh connection can be registered in the meantime, and
+	// re-sending the whole table would duplicate it with DUP set. It is filled
+	// before the connection is served and emptied by resumeInflight.
+	restoredInflight []uint16
 	// retryAt is the deadline retransmitLoop is currently sleeping for, zero when
 	// no deadline is armed. It is maintained under c.mu and is what lets a new
 	// delivery skip the wakeup when its retransmission cannot be the earliest.

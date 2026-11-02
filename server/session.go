@@ -237,6 +237,7 @@ func (c *client) restoreQoS2State(s *session) {
 			m.due = now.Add(retry)
 		}
 		c.addInflightLocked(m.packetID, m)
+		c.restoredInflight = append(c.restoredInflight, m.packetID)
 	}
 }
 
