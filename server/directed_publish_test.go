@@ -159,7 +159,7 @@ func (c *directedCluster) setError(err error) {
 // backend failure is reported to the caller instead of being swallowed.
 func TestPublishToClientHandsRemoteClientToCluster(t *testing.T) {
 	cluster := &directedCluster{}
-	b := startBroker(t, Config{Namespace: "tenant-a", ClusterBackend: cluster})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-a"), ClusterBackend: cluster})
 
 	err := b.PublishToClient(context.Background(), "remote-client", Publication{
 		Topic:   "direct/x",
@@ -369,8 +369,8 @@ func TestDirectedPublishStaysInNamespace(t *testing.T) {
 	cfgB.Metrics = metricsB
 	ca := NewTCPCluster(testClusterConfig(aAddr, []string{bAddr}))
 	cb := NewTCPCluster(cfgB)
-	a := startBroker(t, Config{NodeID: "a", Namespace: "tenant-a", ClusterBackend: ca})
-	b := startBroker(t, Config{NodeID: "b", Namespace: "tenant-b", ClusterBackend: cb, Metrics: metricsB})
+	a := startBroker(t, Config{NodeID: "a", Namespace: nsValue("tenant-a"), ClusterBackend: ca})
+	b := startBroker(t, Config{NodeID: "b", Namespace: nsValue("tenant-b"), ClusterBackend: cb, Metrics: metricsB})
 	waitPeers(t, ca, 1)
 	waitPeers(t, cb, 1)
 

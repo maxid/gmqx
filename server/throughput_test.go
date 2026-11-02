@@ -48,6 +48,18 @@ package server
 //     buffers grow, and counting them afterwards would report a rate the window
 //     never served.
 //
+// Totals and the identity. Each case prints both rates and the counters they
+// accumulated over the window. The counters satisfy
+//
+//	published = delivered + dropped + in_flight
+//
+// where in_flight is what the broker's queues and the socket buffers still held
+// when the window closed. It is therefore checkable, not implied, that no message
+// vanished: one that was not delivered was either counted as a drop (with its
+// reason) or is part of a bounded in-flight remainder. A case that overdrives a
+// bounded queue shows the gap in "dropped", by design; a case at or below the
+// sustainable rate shows dropped=0 and an in_flight no larger than the pacer pool.
+//
 // Payload and latency. A payload is the documented size (64 B and 1 KiB by
 // default) with a fixed layout: the first 8 bytes are a per-publisher sequence
 // number, the next 8 the sender's wall clock in Unix nanoseconds, the rest is
@@ -77,7 +89,7 @@ package server
 //
 // Run it with:
 //
-//	GMQX_THROUGHPUT=1 go test -run TestThroughput -v .
+//	GMQX_THROUGHPUT=1 go test -run TestThroughput -v ./server
 //
 // The case matrix, the load and the window are environment-tunable:
 //
@@ -350,6 +362,11 @@ type thrResult struct {
 	accepted  int64
 	acked     int64
 	delivered int64
+	// droppedN is the broker's drop count over the same window; inFlight is what
+	// published - delivered - droppedN leaves: messages still in a socket buffer or
+	// a delivery queue when the window closed (see the file comment).
+	droppedN int64
+	inFlight int64
 
 	pubRate   float64
 	ackRate   float64
@@ -453,6 +470,7 @@ func thrRunCase(t *testing.T, cfg thrLoadConfigValue, qos byte, payloadSize int)
 		acked:     thrSumAcked(publishers),
 		accepted:  metrics.accepted.Load(),
 		delivered: thrSumDelivered(subs),
+		dropped:   metrics.droppedTotal(),
 		at:        start,
 	}
 	fmt.Printf("\ncase qos=%d payload=%dB clients=%d subscribers=%d window=%v\n",
@@ -472,6 +490,7 @@ func thrRunCase(t *testing.T, cfg thrLoadConfigValue, qos byte, payloadSize int)
 			acked:     thrSumAcked(publishers),
 			accepted:  metrics.accepted.Load(),
 			delivered: thrSumDelivered(subs),
+			dropped:   metrics.droppedTotal(),
 			at:        now,
 		}
 		seconds := now.Sub(last.at).Seconds()
@@ -508,6 +527,8 @@ func thrRunCase(t *testing.T, cfg thrLoadConfigValue, qos byte, payloadSize int)
 	result.acked = last.acked - base.acked
 	result.accepted = last.accepted - base.accepted
 	result.delivered = last.delivered - base.delivered
+	result.droppedN = last.dropped - base.dropped
+	result.inFlight = result.published - result.delivered - result.droppedN
 	result.pubRate = float64(result.published) / window.Seconds()
 	result.ackRate = float64(result.acked) / window.Seconds()
 	result.delivRate = float64(result.delivered) / window.Seconds()
@@ -518,6 +539,11 @@ func thrRunCase(t *testing.T, cfg thrLoadConfigValue, qos byte, payloadSize int)
 	fmt.Printf("  %-8s %12.0f %12.0f %12.0f %12.0f   (p50=%dµs p99=%dµs n=%d)\n",
 		"total", result.pubRate, result.ackRate, float64(result.accepted)/window.Seconds(), result.delivRate,
 		result.p50Micros, result.p99Micros, result.latencyN)
+	// The totals are what the per-second rates accumulate to; in_flight is the
+	// part of published that neither reached a subscriber nor was counted as a
+	// drop by the time the window closed.
+	fmt.Printf("  totals   published=%d accepted=%d acked=%d delivered=%d dropped=%d in_flight=%d\n",
+		result.published, result.accepted, result.acked, result.delivered, result.droppedN, result.inFlight)
 	if len(result.dropped) > 0 {
 		fmt.Printf("  dropped: %s\n", strings.Join(result.dropped, " "))
 	}
@@ -552,6 +578,7 @@ type thrSnapshot struct {
 	acked     int64
 	accepted  int64
 	delivered int64
+	dropped   int64
 	at        time.Time
 }
 
@@ -617,6 +644,14 @@ func thrPrintTable(results []thrResult) {
 			r.qos, r.payload, r.clients, r.subscribers,
 			r.pubRate, r.ackRate, float64(r.accepted)/r.window.Seconds(), r.delivRate, r.peakDeliv,
 			r.p50Micros, r.p99Micros, drops)
+	}
+	fmt.Println()
+	fmt.Println("Totals over the measurement window (in_flight = published - delivered - dropped)")
+	fmt.Println("| QoS | payload | published | accepted | acked | delivered | dropped | in_flight |")
+	fmt.Println("|---:|---:|---:|---:|---:|---:|---:|---:|")
+	for _, r := range results {
+		fmt.Printf("| %d | %d B | %d | %d | %d | %d | %d | %d |\n",
+			r.qos, r.payload, r.published, r.accepted, r.acked, r.delivered, r.droppedN, r.inFlight)
 	}
 }
 

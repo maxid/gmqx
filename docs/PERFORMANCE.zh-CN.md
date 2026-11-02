@@ -257,7 +257,7 @@ case qos=1 payload=64B clients=200 subscribers=4 window=5s
 在上述机器上运行：
 
 ```sh
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -run TestSoak -v ./...
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
 ```
 
 结果：
@@ -320,10 +320,10 @@ GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
 go tool pprof -top /tmp/cpu.out
 
 # 浸泡测试（默认 10 秒）。
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -run TestSoak -v ./...
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
 
 # 更短的浸泡，适合合并前检查。
-GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -run TestSoak -v ./...
+GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./server
 ```
 
 `scripts/bench.sh` 与 `scripts/soak.sh` 封装了上述两条命令（`BENCHTIME=2s ./scripts/bench.sh`、`GMQX_SOAK_DURATION=30s ./scripts/soak.sh`）。

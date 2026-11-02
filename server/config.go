@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/maxid/gns"
 	"log/slog"
 	"time"
 )
@@ -51,9 +52,9 @@ type ClusterConfig struct {
 	// Node is the node id this broker announces in the cluster. It is used only
 	// when Config.NodeID is empty; an explicit Config.NodeID wins.
 	Node string
-	// Namespace scopes the gossip traffic. It is used only when Config.Namespace
-	// is empty; the broker's namespace is authoritative for a backend attached to
-	// it. The empty string is the default namespace.
+	// Namespace scopes the traffic of a backend that is built on its own. A backend
+	// attached to a broker takes the broker's namespace instead (Config.Namespace),
+	// which stays authoritative for everything the broker produces.
 	Namespace string
 	// PingInterval is how often a node probes one random member (default 1s).
 	PingInterval time.Duration
@@ -165,10 +166,18 @@ type Config struct {
 	// subscription matching, retained store and advertised subscription summaries
 	// only ever hold and match entries of this namespace. A publication produced
 	// in another namespace is never delivered to a session here, locally or
-	// through a cluster backend. The empty string is the default namespace and is
-	// the zero value, so a deployment that does not set it behaves exactly as it
-	// did before namespaces existed.
-	Namespace string
+	// through a cluster backend.
+	//
+	// It is the gns namespace value, so a process that runs several brokers (or
+	// several middlewares) declares each namespace once with gns.New and passes the
+	// same value everywhere. The broker reads Name for every key it builds and
+	// Labels only for logs and metrics — a label never changes routing.
+	//
+	// The zero value is the default namespace: bare keys, no isolation, exactly the
+	// behaviour of a deployment from before namespaces existed. A non-zero value
+	// must satisfy gns.Namespace.Validate, which New checks, so an invalid name is
+	// a startup error instead of a key that cannot be read back.
+	Namespace gns.Namespace
 
 	// Limits (0 = unlimited)
 	MaxConnections        int

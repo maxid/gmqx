@@ -5,7 +5,7 @@ package server
 //
 // It is off by default because it takes real time:
 //
-//	GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -run TestSoak -v .
+//	GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
 //
 // Each worker owns one publisher connection and one subscriber connection. It
 // subscribes to its own topic at QoS 2, publishes batches that mix QoS 0, 1 and

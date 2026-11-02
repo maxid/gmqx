@@ -56,6 +56,18 @@
   facades — and `libcheck`'s root-debt entry for gmqx is gone. `server/` is a
   waypoint, not the destination: the staged split by role (session state, routing,
   connection) is recorded in `docs/design/source-layout.md` §4.3.
+- **`Config.Namespace` is a `gns.Namespace`.** The isolation scope of a broker is now
+  the gns namespace value, so a process that runs several brokers — or several
+  middlewares — declares each namespace once with `gns.New` and passes the same value
+  everywhere. The broker reads `Name` for every key it builds and `Labels` only for
+  logs and metrics. The zero value is the default namespace (bare keys, no isolation,
+  as before); a non-zero value must pass `gns.Namespace.Validate`, which `New` checks,
+  so an invalid name fails at startup instead of producing a key that cannot be read
+  back. `Config.Cluster.Namespace` is no longer inherited by the broker: it now only
+  scopes a backend that is built on its own, because inheriting it would let two
+  brokers sharing one Redis land in the same isolation domain by accident. gmqx now
+  depends on gns, a leaf library (R15).
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,

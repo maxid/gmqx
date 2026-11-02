@@ -182,7 +182,7 @@ func TestConnectionContextFlowsToEveryHook(t *testing.T) {
 	})
 
 	b := startBroker(t, Config{
-		Namespace:    "tenant-a",
+		Namespace:    nsValue("tenant-a"),
 		Auth:         ctxAuth{rec: rec},
 		ACL:          ctxACL{rec: rec},
 		Sink:         ctxSink{rec: rec},
@@ -238,7 +238,7 @@ func TestConnectionContextFlowsToEveryHook(t *testing.T) {
 // connection is gone.
 func TestConnectionContextCancelledOnConnectionLoss(t *testing.T) {
 	rec := &ctxRecorder{}
-	b := startBroker(t, Config{Namespace: "tenant-a", Sink: ctxSink{rec: rec}})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-a"), Sink: ctxSink{rec: rec}})
 
 	client := dialTestClient(t, b.Addr(), "lost-client")
 	connect := rec.wait(t, "connect")

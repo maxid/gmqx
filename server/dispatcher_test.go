@@ -89,7 +89,7 @@ func TestNilDispatcherKeepsDefaultRouting(t *testing.T) {
 // route it through the broker's seam.
 func TestCustomDispatcherSeesPublicationAndRoutes(t *testing.T) {
 	d := &recordingDispatcher{}
-	b := startBroker(t, Config{Namespace: "tenant-a", Dispatcher: d})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-a"), Dispatcher: d})
 	if _, bound := d.snapshot(); bound != b {
 		t.Fatalf("dispatcher bound to %p, want %p", bound, b)
 	}

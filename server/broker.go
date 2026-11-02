@@ -207,11 +207,12 @@ func New(cfg Config) (*Broker, error) {
 		// gossip cluster never collides by default.
 		cfg.NodeID = cfg.Cluster.Node
 	}
-	if cfg.Namespace == "" && cfg.Cluster.Namespace != "" {
-		// A namespace can be named on the cluster block; the broker's
-		// Config.Namespace stays authoritative once it is set, because the broker
-		// stamps every event and summary it produces.
-		cfg.Namespace = cfg.Cluster.Namespace
+	if !cfg.Namespace.IsZero() {
+		// A namespace that becomes part of a key must be valid before it is used:
+		// gns owns the rule, the broker owns what the name means.
+		if err := cfg.Namespace.Validate(); err != nil {
+			return nil, fmt.Errorf("gmqx: %w", err)
+		}
 	}
 	if cfg.NodeID == "" {
 		cfg.NodeID = randomID()
@@ -275,12 +276,12 @@ func New(cfg Config) (*Broker, error) {
 	// cluster, while NewTCPCluster and NewRedisCluster stay available for the
 	// static-mesh and shared-store deployments.
 	if cfg.ClusterBackend == nil && cfg.Cluster.Enabled {
-		cfg.ClusterBackend = NewGossipCluster(defaultGossipConfig(cfg.Cluster, cfg.Namespace, cfg.Metrics, logger))
+		cfg.ClusterBackend = NewGossipCluster(defaultGossipConfig(cfg.Cluster, cfg.Namespace.Name, cfg.Metrics, logger))
 	}
 	b := &Broker{
 		cfg:       cfg,
 		log:       logger,
-		namespace: cfg.Namespace,
+		namespace: cfg.Namespace.Name,
 		clients:   make(map[string]*client),
 		store:     cfg.SessionStore,
 		index:     newSubscriptionIndex(),

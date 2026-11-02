@@ -464,8 +464,8 @@ func TestRoutingIndexRemovals(t *testing.T) {
 // namespace has no local target.
 func TestRoutingIndexNamespaceIsolation(t *testing.T) {
 	store := NewMemorySessionStore()
-	a := startBroker(t, Config{Namespace: "tenant-a", SessionStore: store})
-	b := startBroker(t, Config{Namespace: "tenant-b", SessionStore: store})
+	a := startBroker(t, Config{Namespace: nsValue("tenant-a"), SessionStore: store})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-b"), SessionStore: store})
 
 	subA, _ := mustConnect(t, a.Addr(), confConnect{clientID: "same-id", clean: true})
 	subscribe(t, subA, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "iso/#", QoS: 1})

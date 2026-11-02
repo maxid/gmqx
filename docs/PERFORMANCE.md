@@ -487,7 +487,7 @@ test performed itself.
 Run on the machine above:
 
 ```sh
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -run TestSoak -v ./...
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
 ```
 
 Result:
@@ -569,10 +569,10 @@ GMQX_THROUGHPUT=1 GMQX_THROUGHPUT_QOS=1 GMQX_THROUGHPUT_PAYLOAD=64 \
 go tool pprof -top /tmp/cpu.out
 
 # The soak test (10 s by default).
-GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -run TestSoak -v ./...
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./server
 
 # Shorter soak, useful in a pre-merge check.
-GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -run TestSoak -v ./...
+GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./server
 ```
 
 `scripts/bench.sh` and `scripts/soak.sh` wrap the two commands

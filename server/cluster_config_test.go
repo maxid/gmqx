@@ -48,8 +48,15 @@ func TestClusterConfigSelectsGossip(t *testing.T) {
 	if b.nodeID != "cluster-node" {
 		t.Fatalf("node id = %q, want Cluster.Node", b.nodeID)
 	}
-	if b.namespace != "tenant-x" {
-		t.Fatalf("namespace = %q, want Cluster.Namespace", b.namespace)
+	// Cluster.Namespace is not inherited: the broker's namespace is authoritative
+	// for every event it produces, and silently borrowing the cluster block's value
+	// would let two brokers on one Redis share an isolation domain by accident.
+	// A backend built on its own still honours it (see TestNewGossipCluster...).
+	if !b.cfg.Namespace.IsZero() || b.namespace != "" {
+		t.Fatalf("broker namespace = %q, want the default namespace (no inheritance)", b.namespace)
+	}
+	if clusterCfg.Namespace != "tenant-x" {
+		t.Fatalf("the cluster block kept its own namespace: %q", clusterCfg.Namespace)
 	}
 	gc := defaultGossipConfig(clusterCfg, b.namespace, nil, nil)
 	if gc.Addr != addr || len(gc.Seeds) != 1 || gc.Seeds[0] != "127.0.0.1:1" {

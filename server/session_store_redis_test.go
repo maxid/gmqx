@@ -507,8 +507,8 @@ func TestSharedSessionKeptWhenPeerTookOver(t *testing.T) {
 func TestSharedSessionStoreNamespaceIsolation(t *testing.T) {
 	mr := runMiniRedis(t)
 	store := newTestRedisSessionStore(t, mr, newDeliveryMetrics())
-	a := startBroker(t, Config{Namespace: "tenant-a", SessionStore: store, Logger: discardLogger()})
-	b := startBroker(t, Config{Namespace: "tenant-b", SessionStore: store, Logger: discardLogger()})
+	a := startBroker(t, Config{Namespace: nsValue("tenant-a"), SessionStore: store, Logger: discardLogger()})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-b"), SessionStore: store, Logger: discardLogger()})
 
 	keyA := sessionStoreKey(namespaceKey("tenant-a", "shared-id"))
 	keyB := sessionStoreKey(namespaceKey("tenant-b", "shared-id"))

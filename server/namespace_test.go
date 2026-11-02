@@ -13,8 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxid/gns"
+
 	retainedstore "github.com/maxid/gmqx/retained"
 )
+
+// nsValue is the test shorthand for a namespace value: the broker takes the gns type, and
+// a test that only cares about the name should not repeat the struct.
+func nsValue(name string) gns.Namespace { return gns.Namespace{Name: name} }
 
 // dropRecorder implements MetricsManager and counts the drop reasons a component
 // reports.
@@ -137,8 +143,8 @@ func TestNamespaceKeyQualification(t *testing.T) {
 // same topic but different namespaces never deliver to each other and keep
 // separate retained state.
 func TestNamespaceRetainedAndSubscriptionIsolation(t *testing.T) {
-	a := startBroker(t, Config{Namespace: "tenant-a"})
-	b := startBroker(t, Config{Namespace: "tenant-b"})
+	a := startBroker(t, Config{Namespace: nsValue("tenant-a")})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-b")})
 
 	pub := dialTestClient(t, a.Addr(), "ns-pub")
 	publishRetained(t, pub, "state/x", "a-value")
@@ -172,7 +178,7 @@ func TestNamespaceRetainedAndSubscriptionIsolation(t *testing.T) {
 func TestRemoteEventsOfAnotherNamespaceAreDropped(t *testing.T) {
 	cluster := &injectCluster{}
 	metrics := &dropRecorder{}
-	b := startBroker(t, Config{Namespace: "tenant-a", ClusterBackend: cluster, Metrics: metrics})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-a"), ClusterBackend: cluster, Metrics: metrics})
 
 	sub := dialTestClient(t, b.Addr(), "ns-remote-sub")
 	subscribeTestClient(t, sub, "iso/#")
@@ -221,7 +227,7 @@ func TestRemoteEventsOfAnotherNamespaceAreDropped(t *testing.T) {
 // namespace and checks that a connection only resumes the session stored under
 // its broker's namespace.
 func TestNamespaceSessionTableIsPartitioned(t *testing.T) {
-	b := startBroker(t, Config{Namespace: "tenant-a"})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-a")})
 	b.store.Save(namespaceKey("tenant-a", "resumed"), SessionState{
 		ClientID:      "resumed",
 		Subscriptions: map[string]SessionSubscription{"ns/#": {QoS: 0}},
@@ -353,8 +359,8 @@ func TestBrokerNamespaceIsolationOverTCP(t *testing.T) {
 	cb := NewTCPCluster(TCPClusterConfig{
 		Addr: bAddr, Seeds: []string{aAddr}, ReconnectInterval: 20 * time.Millisecond, Logger: discardLogger(),
 	})
-	a := startBroker(t, Config{NodeID: "a", Namespace: "tenant-a", ClusterBackend: ca})
-	b := startBroker(t, Config{NodeID: "b", Namespace: "tenant-b", ClusterBackend: cb})
+	a := startBroker(t, Config{NodeID: "a", Namespace: nsValue("tenant-a"), ClusterBackend: ca})
+	b := startBroker(t, Config{NodeID: "b", Namespace: nsValue("tenant-b"), ClusterBackend: cb})
 	waitPeers(t, ca, 1)
 	waitPeers(t, cb, 1)
 
