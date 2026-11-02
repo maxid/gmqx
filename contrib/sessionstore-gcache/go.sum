@@ -64,6 +64,8 @@ github.com/maxid/gcache v0.0.0-20261101071036-f52cfa5736a3 h1:uGOl0jOUyLHrZKwg8t
 github.com/maxid/gcache v0.0.0-20261101071036-f52cfa5736a3/go.mod h1:T5Tjydi69c9FE3LHrXlk0aHN1XRvQwzoZttRFid/A6c=
 github.com/maxid/gnety v0.0.0-20261101055410-7fc85d35bd1c h1:uW2RiNAREumAQdaIeK9JA+967n5Aypm8bagU5u3vf1M=
 github.com/maxid/gnety v0.0.0-20261101055410-7fc85d35bd1c/go.mod h1:N56Y8M/otpHSaSmOlhtvrykr1Iud6PliOjgh5u/Bfpc=
+github.com/maxid/gns v0.0.0-20261102075341-0dc680a5af4a h1:yf8yg4gEPj/yRup+zqh41qlvEBCOqaka0E0EIDqLhY4=
+github.com/maxid/gns v0.0.0-20261102075341-0dc680a5af4a/go.mod h1:dKx9prsgndaFJOhz1w0TUsRvoOXU2za/tCcTY+a4bNc=
 github.com/maxid/gplugin v0.0.0-20261102034223-09f50dbe8e66 h1:e9zsH99GPYer7da4Zgr50/J5EiiP0E3zXD4bkJBGBA4=
 github.com/maxid/gplugin v0.0.0-20261102034223-09f50dbe8e66/go.mod h1:H5rDo2Osroq3uEXX/NkVi/7N8pXXA9irYcWjjAsR9TM=
 github.com/mdelapenya/tlscert v0.2.0 h1:7H81W6Z/4weDvZBNOfQte5GpIMo0lGYEeWbkGp5LJHI=
