@@ -1,7 +1,7 @@
 package conn
 
 // A Host for the cases that exercise the connection state machine on its own.
-// The broker-level suite (gmqx/server) runs the same code through a real broker;
+// The broker-level suite (gmqx/internal/engine) runs the same code through a real broker;
 // these cases need a connection with no server behind it, so they implement the
 // handful of Host methods the path under test calls and let the rest fail loudly
 // if a case starts depending on them.

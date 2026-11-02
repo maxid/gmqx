@@ -8,7 +8,7 @@ package conn
 // that depend on it — how long to wait (bounded by the session it belongs to) and
 // which identity the will is published under once the connection's own context is
 // cancelled — and hands the result to its host, which owns the timers and the
-// map that outlives the connection (see gmqx/server's will.go).
+// map that outlives the connection (see gmqx/internal/engine's will.go).
 
 import (
 	"time"

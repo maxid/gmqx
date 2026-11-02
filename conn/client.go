@@ -38,7 +38,7 @@ import (
 
 // The connect-refusal errors a host returns and the connection maps onto MQTT
 // reason codes. They are defined here because both sides compare against the same
-// value, and the broker (gmqx/server) re-exports them so a consumer still checks
+// value, and the broker (gmqx/internal/engine) re-exports them so a consumer still checks
 // gmqx.ErrClientIDInUse.
 var (
 	// ErrUnauthorized is returned when authentication fails.

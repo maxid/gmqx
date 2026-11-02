@@ -4,7 +4,7 @@ package routing
 // counters, the displacement rule, shared-group membership and the round robin —
 // directly against an Index with fake endpoints; the behavior a broker exposes
 // (LocalTargets, SendLocal, the store round trip) stays pinned by the broker-level
-// suite in gmqx/server.
+// suite in gmqx/internal/engine.
 
 import (
 	"reflect"

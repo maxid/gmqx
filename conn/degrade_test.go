@@ -2,7 +2,7 @@ package conn
 
 // The connection-level exhaustion case: what one connection does when it has no
 // packet id left to assign. The broker-level queue behavior around it stays in
-// gmqx/server.
+// gmqx/internal/engine.
 
 import (
 	"bufio"

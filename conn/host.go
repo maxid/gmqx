@@ -16,7 +16,7 @@ package conn
 //
 // The direction is what makes the split worth having: the broker owns identity,
 // routing and persistence, the connection owns the protocol state machine, and the
-// dependency arrow points one way (gmqx/server → gmqx/conn → gmqx/{hook,routing,session}).
+// dependency arrow points one way (gmqx/internal/engine → gmqx/conn → gmqx/{hook,routing,session}).
 
 import (
 	"context"
