@@ -165,6 +165,44 @@ The routing seam (`Dispatcher`, `Publication`, `LocalTarget`) stays in the root 
 purpose: it hands the broker's own routing primitives to a dispatcher, so it cannot move
 without exporting implementation details.
 
+### Plugins at run time
+
+Hooks are also swappable while the broker serves: `Broker.Plugins()` is a
+[`gplugin.Registry`](https://github.com/maxid/gplugin) whose host is the broker itself
+(`hook.Host`), so an application-side plugin installs, replaces and removes extensions
+without a restart:
+
+```go
+type codecPlugin struct{ remove func() }
+
+func (p *codecPlugin) Name() string { return "json-to-binary" }
+
+func (p *codecPlugin) Start(host hook.Host) error {
+    if err := host.Codecs().Register(jsonCodec{}); err != nil { return err }   // hook.Codec
+    if err := host.Codecs().Register(binaryCodec{}); err != nil { return err }
+    p.remove = host.AddTranscoder(&transcoder{codecs: host.Codecs()})          // hook.Transcoder
+    return nil
+}
+
+func (p *codecPlugin) Stop() error { p.remove(); return nil }
+
+broker.Plugins().Add(&codecPlugin{})
+err := broker.Plugins().Start("json-to-binary")   // dependency closure, rollback, states
+for _, status := range broker.Plugins().Snapshot() { log.Printf("%s: %s", status.ID, status.State) }
+```
+
+- `hook.Host` has one setter per swappable slot (`SetAuthManager`, `SetAclManager`,
+  `SetEventSink`, `SetMetricsManager`), plus `AddInterceptor`/`AddTranscoder` returning the
+  function that removes it and `Codecs()` for payload encodings. Every slot is an immutable
+  snapshot swapped atomically, so the publish path still reads it once.
+- **Payload encodings are the application's business.** `hook.Codec` is
+  `{MediaType, Encode, Decode}`; the broker never picks one and never interprets a payload.
+  A `hook.Transcoder` is the seam a plugin installs to change an encoding on the way out
+  (JSON in, binary out), and it runs after the sink accepted the publication and before it
+  is retained or routed — so topic, QoS, retain and properties stay exactly what the client
+  sent. JSON, CSV and a binary format are demonstrated in `plugin_codec_test.go`; a
+  deployment writes its own codecs outside the library.
+
 ## Install
 
 ```bash

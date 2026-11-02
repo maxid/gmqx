@@ -23,6 +23,19 @@
   accessors, which is what lets the cluster backends move to `gmqx/cluster` while
   the tests that stay here keep working.
 
+- **Extensions are swappable while the broker runs, and payload encodings are a plugin
+  concern.** `Broker.Plugins()` returns a `gplugin.Registry[hook.Host]`; `hook.Host` is one
+  setter per slot (`SetAuthManager`, `SetAclManager`, `SetEventSink`, `SetMetricsManager`)
+  plus `AddInterceptor`/`AddTranscoder` (each returning its remove function) and `Codecs()`.
+  The hooks moved into one immutable snapshot (`Broker.ext`) that is swapped atomically, so
+  the publish path still reads one consistent value instead of a field another goroutine
+  rewrites. `hook.Codec` (`MediaType`/`Encode`/`Decode`), `hook.CodecSet` and
+  `hook.Transcoder` add the data-protocol seam: an application-side plugin registers JSON,
+  CSV or a binary format and transcodes a payload on its way out, while the broker keeps
+  MQTT opaque — no codec is built in, and a broker without transcoders behaves exactly as
+  before. `plugin_codec_test.go` is the acceptance case (JSON→binary, CSV→JSON, and the
+  byte-for-byte passthrough after unloading the plugin).
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,

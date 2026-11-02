@@ -125,7 +125,7 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 		if len(candidates) == 0 {
 			// No node holds a live member: the group exists nowhere by the time the
 			// publication is routed. Dropped, and counted, rather than guessed at.
-			b.metrics.RecordDroppedMessage("shared_no_member")
+			b.metrics().RecordDroppedMessage("shared_no_member")
 			b.log.Debug("gmqx shared publication dropped", "group", group, "topic", pub.Topic, "reason", "no_member")
 			continue
 		}
@@ -145,7 +145,7 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 func (b *Broker) deliverSharedGroup(ctx context.Context, group string, pub Publication) bool {
 	target, ok := b.index.sharedTarget(group, pub.QoS, pub.Retain)
 	if !ok {
-		b.metrics.RecordDroppedMessage("shared_no_member")
+		b.metrics().RecordDroppedMessage("shared_no_member")
 		b.log.Debug("gmqx shared publication dropped", "group", group, "topic", pub.Topic, "reason", "no_live_member")
 		return false
 	}

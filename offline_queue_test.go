@@ -335,7 +335,8 @@ func TestOfflineQueueDrainDegradesToQoS0(t *testing.T) {
 // packet id a retransmission would collide with.
 func TestWritePublishDegradesWhenPacketIDsExhausted(t *testing.T) {
 	metrics := newDeliveryMetrics()
-	b := &Broker{cfg: Config{QoSRetryInterval: time.Second, QoSMaxRetries: 5}, metrics: metrics}
+	b := &Broker{cfg: Config{QoSRetryInterval: time.Second, QoSMaxRetries: 5}}
+	b.ext.Store(&extensions{metrics: metrics})
 	server, peer := net.Pipe()
 	defer func() { _ = server.Close(); _ = peer.Close() }()
 

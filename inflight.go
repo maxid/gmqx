@@ -425,7 +425,7 @@ func (c *client) retransmitDue() {
 	c.mu.Unlock()
 
 	for i := 0; i < exhausted; i++ {
-		c.broker.metrics.RecordDroppedMessage("retry_exhausted")
+		c.broker.metrics().RecordDroppedMessage("retry_exhausted")
 	}
 	c.resendInflight(batch)
 }
@@ -549,7 +549,7 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 		id, ok := c.nextPacketIDLocked()
 		if !ok {
 			qos = 0
-			c.broker.metrics.RecordOverflow("packet_ids")
+			c.broker.metrics().RecordOverflow("packet_ids")
 		} else {
 			packetID = id
 			registered = &inflightMessage{
@@ -668,8 +668,8 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 		// A clean session trades durability for statelessness: there is no queue to
 		// keep the delivery in, so it is dropped — visibly, and never silently.
 		c.mu.Unlock()
-		c.broker.metrics.RecordDroppedMessage("inflight_overflow_clean")
-		c.broker.metrics.RecordOverflow("inflight")
+		c.broker.metrics().RecordDroppedMessage("inflight_overflow_clean")
+		c.broker.metrics().RecordOverflow("inflight")
 		c.warn("gmqx dropped a delivery at a full inflight queue of a clean session",
 			"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow_clean",
 			"qos", qos, "topic", topic, "queue", limit)
@@ -682,7 +682,7 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 	c.collectLocked(pendingMessage{topic: topic, payload: payload, qos: qos, retain: retain, props: props})
 	c.handoff = handoffCollecting
 	c.mu.Unlock()
-	c.broker.metrics.RecordOverflow("inflight_overflow")
+	c.broker.metrics().RecordOverflow("inflight_overflow")
 	c.warn("gmqx taking a session offline at a full inflight queue",
 		"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow",
 		"qos", qos, "topic", topic, "queue", limit)
@@ -705,7 +705,7 @@ func (c *client) collectLocked(m pendingMessage) {
 		dropped := len(c.pending) - limit
 		c.pending = c.pending[dropped:]
 		for i := 0; i < dropped; i++ {
-			c.broker.metrics.RecordDroppedMessage("offline_queue_full")
+			c.broker.metrics().RecordDroppedMessage("offline_queue_full")
 		}
 	}
 }
@@ -866,7 +866,7 @@ func (c *client) drainOfflineQueue() {
 			c.mu.Unlock()
 			if full {
 				qos = 0
-				c.broker.metrics.RecordOverflow("inflight")
+				c.broker.metrics().RecordOverflow("inflight")
 			}
 		}
 		if err := c.writePublish(msg.topic, msg.payload, qos, msg.retain, msg.props); err != nil {

@@ -155,7 +155,7 @@ func (c *client) runAuth(exchange AuthExchange, info ConnectInfo) (AuthStep, err
 			if challenges >= MaxAuthSteps {
 				c.warn("gmqx authentication exchange exceeded its step budget",
 					"client", info.ClientID, "method", method, "steps", MaxAuthSteps)
-				c.broker.metrics.RecordDroppedMessage("auth_steps")
+				c.broker.metrics().RecordDroppedMessage("auth_steps")
 				return AuthStep{}, rejectAuth(ReasonNotAuthorized,
 					fmt.Errorf("%w: more than %d challenges", errAuthDenied, MaxAuthSteps))
 			}
@@ -209,7 +209,7 @@ func (c *client) callAuth(method string, call func(context.Context) (AuthStep, e
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			c.warn("gmqx authentication exchange deadline exceeded",
 				"client", c.id, "method", method, "timeout", timeout)
-			c.broker.metrics.RecordDroppedMessage("auth_timeout")
+			c.broker.metrics().RecordDroppedMessage("auth_timeout")
 			return AuthStep{}, fmt.Errorf("%w: authentication exchange timeout after %v", ErrUnauthorized, timeout)
 		}
 		return AuthStep{}, fmt.Errorf("%w: connection closed during authentication", ErrUnauthorized)

@@ -213,8 +213,8 @@ func (s *shapedConn) wait(d time.Duration, deadline time.Time) error {
 
 // countThrottled reports bytes whose transfer had to wait.
 func (s *shapedConn) countThrottled(direction string, n int) {
-	s.broker.metrics.RecordOverflow("byte_rate_" + direction)
-	if m, ok := s.broker.metrics.(ByteRateMetrics); ok {
+	s.broker.metrics().RecordOverflow("byte_rate_" + direction)
+	if m, ok := s.broker.metrics().(ByteRateMetrics); ok {
 		m.RecordThrottledBytes(direction, n)
 	}
 }

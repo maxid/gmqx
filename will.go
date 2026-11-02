@@ -122,7 +122,7 @@ func (c *client) willDelay(will *mqtt.Will) time.Duration {
 	delay := time.Duration(seconds) * c.broker.second()
 	if limit := c.broker.maxWillDelayInterval(); limit > 0 && delay > limit {
 		delay = limit
-		c.broker.metrics.RecordOverflow("will_delay")
+		c.broker.metrics().RecordOverflow("will_delay")
 	}
 	// The will is published when the session ends at the latest, so a session
 	// that expires inside the delay publishes its will at the expiry.

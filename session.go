@@ -273,14 +273,14 @@ func (b *Broker) takeStoredSession(key string) (*session, bool) {
 	}
 	b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
 	if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
-		b.metrics.RecordDroppedMessage("session_expired")
+		b.metrics().RecordDroppedMessage("session_expired")
 		return nil, false
 	}
 	s, dropped := sessionFromState(state)
 	if dropped > 0 {
 		b.log.Warn("gmqx dropped queued messages with an undecodable property block",
 			"client", s.clientID, "count", dropped)
-		b.metrics.RecordDroppedMessage("offline_queue_corrupt")
+		b.metrics().RecordDroppedMessage("offline_queue_corrupt")
 	}
 	return s, true
 }
@@ -450,8 +450,8 @@ func (b *Broker) sweepExpiredSessions() {
 			// here any more: a presence-tracking cluster backend stops routing it to
 			// this node.
 			b.forgetClientPresence(current.ClientID)
-			b.metrics.RecordDroppedMessage("session_expired")
-			b.metrics.RecordQueueDepth("offline", b.offlineQueued)
+			b.metrics().RecordDroppedMessage("session_expired")
+			b.metrics().RecordQueueDepth("offline", b.offlineQueued)
 		}
 		b.mu.Unlock()
 	}
@@ -497,10 +497,10 @@ func (b *Broker) absorbPendingLocked(c *client) {
 	}
 	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(c.queue) > maxQueue {
 		c.queue = c.queue[len(c.queue)-maxQueue:]
-		b.metrics.RecordDroppedMessage("offline_queue_full")
+		b.metrics().RecordDroppedMessage("offline_queue_full")
 	}
 	for i := 0; i < rejected; i++ {
-		b.metrics.RecordDroppedMessage("offline_queue_total")
+		b.metrics().RecordDroppedMessage("offline_queue_total")
 	}
 }
 
@@ -510,7 +510,7 @@ func (b *Broker) absorbPendingLocked(c *client) {
 // b.mu and c.mu.
 func (b *Broker) dropPendingLocked(c *client, reason string) {
 	for range c.pending {
-		b.metrics.RecordDroppedMessage(reason)
+		b.metrics().RecordDroppedMessage(reason)
 	}
 	c.pending = nil
 }
@@ -535,18 +535,18 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 	state, ok := b.store.Load(key)
 	if !ok {
 		b.mu.Unlock()
-		b.metrics.RecordDroppedMessage("offline_session_missing")
+		b.metrics().RecordDroppedMessage("offline_session_missing")
 		return
 	}
 	if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
 		// The session is past its deadline and only waits for the sweeper.
 		b.mu.Unlock()
-		b.metrics.RecordDroppedMessage("offline_session_missing")
+		b.metrics().RecordDroppedMessage("offline_session_missing")
 		return
 	}
 	if limit := b.cfg.MaxTotalOfflineMessages; limit > 0 && b.offlineQueued >= limit {
 		b.mu.Unlock()
-		b.metrics.RecordDroppedMessage("offline_queue_total")
+		b.metrics().RecordDroppedMessage("offline_queue_total")
 		return
 	}
 	queue := make([]QueuedMessage, 0, len(state.Queue)+1)
@@ -584,7 +584,7 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 	b.mu.Unlock()
 
 	if evicted {
-		b.metrics.RecordDroppedMessage("offline_queue_full")
+		b.metrics().RecordDroppedMessage("offline_queue_full")
 	}
-	b.metrics.RecordQueueDepth("offline", depth)
+	b.metrics().RecordQueueDepth("offline", depth)
 }

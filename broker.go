@@ -15,18 +15,32 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/maxid/gnety"
 	"github.com/maxid/gnety/codec/mqtt"
+	"github.com/maxid/gplugin"
+
+	"github.com/maxid/gmqx/hook"
 )
 
 // Broker is a single-node MQTT 3.1.1 broker.
 type Broker struct {
-	cfg        Config
-	log        *slog.Logger
-	metrics    MetricsManager
+	cfg Config
+	log *slog.Logger
+	// ext is the current snapshot of the swappable extensions: auth, ACL, sink,
+	// metrics, interceptors and payload transcoders (see plugin.go). It is atomic
+	// because a plugin may swap one while the broker serves; extMu serialises the
+	// writers.
+	ext   atomic.Pointer[extensions]
+	extMu sync.Mutex
+	// codecs is the registry of payload encodings the loaded plugins contributed,
+	// and plugins the registry that controls them. The broker never picks a codec
+	// itself.
+	codecs     *hook.CodecSet
+	plugins    *gplugin.Registry[hook.Host]
 	limiter    *rateLimiter
 	nodeID     string
 	namespace  string
@@ -266,7 +280,6 @@ func New(cfg Config) (*Broker, error) {
 	b := &Broker{
 		cfg:       cfg,
 		log:       logger,
-		metrics:   cfg.Metrics,
 		namespace: cfg.Namespace,
 		clients:   make(map[string]*client),
 		store:     cfg.SessionStore,
@@ -277,6 +290,18 @@ func New(cfg Config) (*Broker, error) {
 		done:      make(chan struct{}),
 		nodeID:    cfg.NodeID,
 	}
+	// The swappable half of the configuration. Config keeps the initial values, so a
+	// broker created from a Config behaves exactly as before; the snapshot is what
+	// the serving path reads, which is what lets a plugin replace a hook at run time.
+	b.ext.Store(&extensions{
+		auth:         cfg.Auth,
+		acl:          cfg.ACL,
+		sink:         cfg.Sink,
+		metrics:      cfg.Metrics,
+		interceptors: interceptorSlots(cfg.Interceptors),
+	})
+	b.codecs = hook.NewCodecSet()
+	b.plugins = gplugin.NewRegistry[hook.Host](b)
 	// The broker-wide half of the byte-rate shaping: one bucket each for every
 	// byte read from and written to every connection of this process. A disabled
 	// limit (negative) is a nil bucket, which the shaper skips.
@@ -541,7 +566,7 @@ func fallbackAddrs(addr string, extra int) []string {
 
 func (b *Broker) handleRaw(conn net.Conn) {
 	if b.limiter != nil && !b.limiter.allow() {
-		b.metrics.RecordDroppedMessage("connection_rate_limit")
+		b.metrics().RecordDroppedMessage("connection_rate_limit")
 		_ = conn.Close()
 		return
 	}
@@ -550,8 +575,8 @@ func (b *Broker) handleRaw(conn net.Conn) {
 		n := len(b.clients)
 		b.mu.RUnlock()
 		if n >= b.cfg.MaxConnections {
-			b.metrics.RecordDroppedMessage("max_connections")
-			b.metrics.RecordOverflow("connections")
+			b.metrics().RecordDroppedMessage("max_connections")
+			b.metrics().RecordOverflow("connections")
 			_ = conn.Close()
 			return
 		}
@@ -626,8 +651,8 @@ func (b *Broker) receiveMaximum() int {
 // open: the client is expected to retransmit the QoS 1 publish later, and a QoS 2
 // one was answered with PUBREC 0x97 and never started an exchange.
 func (b *Broker) receiveMaxFull(topic string) {
-	b.metrics.RecordDroppedMessage("receive_maximum_full")
-	b.metrics.RecordOverflow("receive_maximum")
+	b.metrics().RecordDroppedMessage("receive_maximum_full")
+	b.metrics().RecordOverflow("receive_maximum")
 	if b.log != nil {
 		b.log.Debug("gmqx inbound receive maximum full", "topic", topic, "limit", b.receiveMaximum())
 	}
@@ -758,7 +783,7 @@ func (b *Broker) register(c *client) error {
 		}
 		if !b.takeoverAllowed(old) {
 			b.mu.Unlock()
-			b.metrics.RecordDroppedMessage("takeover_rate_limit")
+			b.metrics().RecordDroppedMessage("takeover_rate_limit")
 			return ErrTakeoverRateExceeded
 		}
 		delete(b.clients, key)
@@ -865,10 +890,10 @@ func (b *Broker) register(c *client) error {
 		b.presence.clientConnected(c.id)
 	}
 
-	b.metrics.IncrementConnections()
-	b.metrics.RecordConnections(n)
-	if b.cfg.Sink != nil {
-		b.cfg.Sink.OnConnect(c.context(), c.info)
+	b.metrics().IncrementConnections()
+	b.metrics().RecordConnections(n)
+	if b.sink() != nil {
+		b.sink().OnConnect(c.context(), c.info)
 	}
 	return nil
 }
@@ -1002,21 +1027,21 @@ func (b *Broker) unregister(c *client) {
 		}
 	}
 
-	b.metrics.DecrementConnections()
-	b.metrics.IncrementDisconnectEvents()
-	b.metrics.RecordConnections(n)
+	b.metrics().DecrementConnections()
+	b.metrics().IncrementDisconnectEvents()
+	b.metrics().RecordConnections(n)
 	if hadSubscriptions {
 		// The session's filters left the routing summary with it.
 		b.subscriptionsChanged()
 	}
-	if b.cfg.Sink != nil {
+	if b.sink() != nil {
 		// The disconnect hooks observe the cancelled connection context (the
 		// connection is already gone) but it still carries its ConnInfo, so a hook
 		// can attribute the event to the exact connection.
 		if c.lost {
-			b.cfg.Sink.OnConnectionLost(c.context(), c.id, c.closeErr)
+			b.sink().OnConnectionLost(c.context(), c.id, c.closeErr)
 		} else {
-			b.cfg.Sink.OnDisconnect(c.context(), c.id, c.closeErr)
+			b.sink().OnDisconnect(c.context(), c.id, c.closeErr)
 		}
 	}
 }
@@ -1031,14 +1056,14 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 		aclFilter = shared.filter
 	}
 	if !b.checkACL(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, aclFilter, AclSubscribe) {
-		b.metrics.RecordDroppedMessage("acl_subscribe")
+		b.metrics().RecordDroppedMessage("acl_subscribe")
 		return subscribeFailure(c.version, ReasonNotAuthorized), false
 	}
 	c.mu.Lock()
 	_, exists := c.subs[filter]
 	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions && !exists {
 		c.mu.Unlock()
-		b.metrics.RecordDroppedMessage("max_subscriptions")
+		b.metrics().RecordDroppedMessage("max_subscriptions")
 		return subscribeFailure(c.version, ReasonQuotaExceeded), exists
 	}
 	c.subs[filter] = sub
@@ -1046,7 +1071,7 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 	// The subscription is routable before the SUBACK is written: the connection
 	// goroutine updates the index here, and the SUBACK follows in handleSubscribe.
 	b.index.add(namespaceKey(b.namespace, c.id), c, filter, sub)
-	b.metrics.IncrementSubscribeEvents()
+	b.metrics().IncrementSubscribeEvents()
 	if !exists {
 		b.subscriptionsChanged()
 	}
@@ -1071,7 +1096,7 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 	if existed {
 		// The filter stops routing before the UNSUBACK is written.
 		b.index.removeFilter(namespaceKey(b.namespace, c.id), c, filter)
-		b.metrics.DecrementSubscribeEvents()
+		b.metrics().DecrementSubscribeEvents()
 		b.subscriptionsChanged()
 	}
 }
@@ -1131,7 +1156,7 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 		return
 	}
 	if _, exists := b.retained[key]; !exists && b.cfg.MaxRetainMessages > 0 && int64(len(b.retained)) >= b.cfg.MaxRetainMessages {
-		b.metrics.RecordDroppedMessage("max_retain")
+		b.metrics().RecordDroppedMessage("max_retain")
 		return
 	}
 	m := retainedMessage{namespace: namespace, topic: topic, payload: append([]byte(nil), payload...), qos: qos, props: props}
@@ -1177,7 +1202,7 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 			remaining := m.expiresAt.Sub(now)
 			if remaining <= 0 {
 				delete(b.retained, key)
-				b.metrics.RecordDroppedMessage("retained_expired")
+				b.metrics().RecordDroppedMessage("retained_expired")
 				continue
 			}
 			props.MessageExpiryInterval = b.expiryInterval(remaining)
@@ -1188,7 +1213,7 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 	for _, m := range msgs {
 		props, dropped := withSubscriptionIDs(m.props, ids)
 		if dropped {
-			b.metrics.RecordDroppedMessage("subscription_identifier_limit")
+			b.metrics().RecordDroppedMessage("subscription_identifier_limit")
 		}
 		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true, props)
 	}
@@ -1227,12 +1252,12 @@ func (b *Broker) publish(from origin, ev PublishEvent, props mqtt.Properties) Pu
 	ev.ConnectionID = from.connID
 	ev.ClientID = from.clientID
 	if !b.checkACL(ctx, SessionInfo{ClientID: from.clientID, Username: from.username}, ev.Topic, AclPublish) {
-		b.metrics.RecordDroppedMessage("acl_publish")
+		b.metrics().RecordDroppedMessage("acl_publish")
 		return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 	}
-	for _, it := range b.cfg.Interceptors {
-		if !it.OnPublish(ctx, from.clientID, ev.Topic, ev.Payload, ev.QoS) {
-			b.metrics.RecordDroppedMessage("interceptor")
+	for _, it := range b.exts().interceptors {
+		if !it.fn.OnPublish(ctx, from.clientID, ev.Topic, ev.Payload, ev.QoS) {
+			b.metrics().RecordDroppedMessage("interceptor")
 			return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 		}
 	}
@@ -1241,15 +1266,30 @@ func (b *Broker) publish(from origin, ev PublishEvent, props mqtt.Properties) Pu
 		if res.Disposition == PublishRetryable {
 			reason = "sink_retryable"
 		}
-		b.metrics.RecordDroppedMessage(reason)
+		b.metrics().RecordDroppedMessage(reason)
 		return res
+	}
+	// Payload transcoding is the application's encoding seam (JSON in, binary out):
+	// it runs after the sink accepted the publication, so a rejected or retryable
+	// message is never transformed, and it changes only the payload — topic, QoS,
+	// retain and properties stay what the client sent, which is what keeps MQTT
+	// semantics intact. A broker without transcoders skips this entirely.
+	if trans := b.exts().transcoders; len(trans) > 0 {
+		for _, tr := range trans {
+			payload, ok := tr.fn.Transcode(ctx, ev)
+			if !ok {
+				b.metrics().RecordDroppedMessage("transcoder")
+				return PublishResult{Disposition: PublishRejected}
+			}
+			ev.Payload = payload
+		}
 	}
 	// Retain is stored only for accepted publishes: a rejected message must not
 	// become the retained value new subscribers receive.
 	if ev.Retain {
 		b.storeRetained(from.namespace, ev.Topic, ev.Payload, ev.QoS, props)
 	}
-	b.metrics.IncrementPublishedMessages()
+	b.metrics().IncrementPublishedMessages()
 
 	pub := Publication{
 		Namespace:        from.namespace,
@@ -1287,17 +1327,17 @@ type origin struct {
 // given the benefit of the doubt. The built-in AllowAll cannot block, so it takes
 // the synchronous path and keeps the hot publish path free of a goroutine.
 func (b *Broker) checkACL(ctx context.Context, session SessionInfo, topic string, action AclAction) bool {
-	if _, builtin := b.cfg.ACL.(AllowAll); builtin {
-		return b.cfg.ACL.Check(ctx, session, topic, action)
+	if _, builtin := b.acl().(AllowAll); builtin {
+		return b.acl().Check(ctx, session, topic, action)
 	}
 	timeout := b.cfg.AuthTimeout
 	if timeout <= 0 {
-		return b.cfg.ACL.Check(ctx, session, topic, action)
+		return b.acl().Check(ctx, session, topic, action)
 	}
 	aclCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	done := make(chan bool, 1)
-	go func() { done <- b.cfg.ACL.Check(aclCtx, session, topic, action) }()
+	go func() { done <- b.acl().Check(aclCtx, session, topic, action) }()
 	select {
 	case allowed := <-done:
 		return allowed
@@ -1307,7 +1347,7 @@ func (b *Broker) checkACL(ctx context.Context, session SessionInfo, topic string
 				b.log.Warn("gmqx ACL check deadline exceeded", "client", session.ClientID,
 					"topic", topic, "action", action, "timeout", timeout)
 			}
-			b.metrics.RecordDroppedMessage("acl_timeout")
+			b.metrics().RecordDroppedMessage("acl_timeout")
 		}
 		return false
 	}
@@ -1317,18 +1357,18 @@ func (b *Broker) checkACL(ctx context.Context, session SessionInfo, topic string
 // call is an authentication failure: a client whose Authenticator does not answer
 // in time is refused, never admitted.
 func (b *Broker) authenticate(ctx context.Context, info ConnectInfo) error {
-	switch b.cfg.Auth.(type) {
+	switch b.auth().(type) {
 	case AllowAll, DenyAll:
-		return b.cfg.Auth.Authenticate(ctx, info)
+		return b.auth().Authenticate(ctx, info)
 	}
 	timeout := b.cfg.AuthTimeout
 	if timeout <= 0 {
-		return b.cfg.Auth.Authenticate(ctx, info)
+		return b.auth().Authenticate(ctx, info)
 	}
 	authCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- b.cfg.Auth.Authenticate(authCtx, info) }()
+	go func() { done <- b.auth().Authenticate(authCtx, info) }()
 	select {
 	case err := <-done:
 		return err
@@ -1338,7 +1378,7 @@ func (b *Broker) authenticate(ctx context.Context, info ConnectInfo) error {
 				b.log.Warn("gmqx authentication deadline exceeded", "client", info.ClientID,
 					"remote", info.RemoteAddr, "timeout", timeout)
 			}
-			b.metrics.RecordDroppedMessage("auth_timeout")
+			b.metrics().RecordDroppedMessage("auth_timeout")
 			return fmt.Errorf("%w: authentication timeout after %v", ErrUnauthorized, timeout)
 		}
 		return fmt.Errorf("%w: connection closed during authentication", ErrUnauthorized)
@@ -1350,17 +1390,17 @@ func (b *Broker) authenticate(ctx context.Context, info ConnectInfo) error {
 // caller's connection context parents the bounded wait, so a connection that
 // ends stops the wait as well.
 func (b *Broker) callSink(ctx context.Context, ev PublishEvent) PublishResult {
-	if b.cfg.Sink == nil {
+	if b.sink() == nil {
 		return PublishResult{Disposition: PublishAccepted}
 	}
 	timeout := b.cfg.PublishCallbackTimeout
 	if timeout <= 0 {
-		return b.cfg.Sink.OnPublish(ctx, ev)
+		return b.sink().OnPublish(ctx, ev)
 	}
 	sinkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	done := make(chan PublishResult, 1)
-	go func() { done <- b.cfg.Sink.OnPublish(sinkCtx, ev) }()
+	go func() { done <- b.sink().OnPublish(sinkCtx, ev) }()
 	select {
 	case res := <-done:
 		return res
@@ -1458,7 +1498,7 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 	var dropped bool
 	props, dropped = withSubscriptionIDs(props, target.subscriptionIDs)
 	if dropped {
-		b.metrics.RecordDroppedMessage("subscription_identifier_limit")
+		b.metrics().RecordDroppedMessage("subscription_identifier_limit")
 	}
 	if target.client == nil {
 		b.enqueueOffline(target, pub, props)
@@ -1576,7 +1616,7 @@ func (b *Broker) PublishToClient(ctx context.Context, clientID string, pub Publi
 		return err
 	}
 	if b.cfg.ClusterBackend == nil {
-		b.metrics.RecordDroppedMessage("target_unknown")
+		b.metrics().RecordDroppedMessage("target_unknown")
 		return nil
 	}
 	return b.spreadTarget(ctx, clientID, pub)
@@ -1696,7 +1736,7 @@ func (b *Broker) spreadKick(ctx context.Context, clientID string, connectTime ti
 // replayed the value.
 func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 	if msg.Namespace != b.namespace {
-		b.metrics.RecordDroppedMessage("cluster_namespace")
+		b.metrics().RecordDroppedMessage("cluster_namespace")
 		b.log.Debug("gmqx remote publish dropped", "namespace", msg.Namespace, "topic", msg.Topic)
 		return
 	}
@@ -1766,7 +1806,7 @@ func (b *Broker) OnRemotePublish(msg ClusterMessage) {
 // share the id.
 func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 	if msg.Namespace != b.namespace {
-		b.metrics.RecordDroppedMessage("cluster_namespace")
+		b.metrics().RecordDroppedMessage("cluster_namespace")
 		b.log.Debug("gmqx remote kick dropped", "namespace", msg.Namespace, "client", msg.ClientID)
 		return
 	}
@@ -1783,7 +1823,7 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 
 	verdict := b.kickVerdict(msg, c != nil, incumbent)
 	if verdict != kickApply && verdict != kickLegacy {
-		b.metrics.RecordDroppedMessage(verdict.dropReason())
+		b.metrics().RecordDroppedMessage(verdict.dropReason())
 		b.log.Debug("gmqx remote kick refused",
 			"reason", verdict.dropReason(), "client", msg.ClientID, "origin", kickOrigin(msg),
 			"kick_time", msg.ConnectTime, "incumbent_time", incumbent.UnixNano())
@@ -1793,7 +1833,7 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 		// Applied, not dropped: the counter exists so an operator can see a cluster
 		// that still holds a peer from before kick epochs, whose kicks cannot be
 		// ordered.
-		b.metrics.RecordDroppedMessage(verdict.dropReason())
+		b.metrics().RecordDroppedMessage(verdict.dropReason())
 		b.log.Debug("gmqx remote kick applied without an epoch", "client", msg.ClientID, "origin", kickOrigin(msg))
 	}
 
@@ -1924,12 +1964,12 @@ func kickOrigin(msg ClusterMessage) string {
 // it is delivered to one session, not routed again.
 func (b *Broker) OnRemoteTarget(msg ClusterMessage) {
 	if msg.Namespace != b.namespace {
-		b.metrics.RecordDroppedMessage("cluster_namespace")
+		b.metrics().RecordDroppedMessage("cluster_namespace")
 		b.log.Debug("gmqx remote target dropped", "namespace", msg.Namespace, "client", msg.ClientID)
 		return
 	}
 	if msg.ClientID == "" {
-		b.metrics.RecordDroppedMessage("target_unknown")
+		b.metrics().RecordDroppedMessage("target_unknown")
 		return
 	}
 	props, err := decodePropertyBlock(msg.Props)
@@ -1950,7 +1990,7 @@ func (b *Broker) OnRemoteTarget(msg ClusterMessage) {
 	ctx := b.lifecycleContext()
 	delivered, err := b.deliverLocal(ctx, msg.ClientID, pub)
 	if !delivered {
-		b.metrics.RecordDroppedMessage("target_unknown")
+		b.metrics().RecordDroppedMessage("target_unknown")
 		b.log.Debug("gmqx cluster target dropped", "client", msg.ClientID, "reason", "no local session")
 		return
 	}

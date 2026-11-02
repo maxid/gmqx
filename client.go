@@ -387,7 +387,7 @@ func (c *client) checkPacketSize(m mqtt.Message) error {
 	if uint32(size) <= limit {
 		return nil
 	}
-	c.broker.metrics.RecordDroppedMessage("max_packet_size_too_large")
+	c.broker.metrics().RecordDroppedMessage("max_packet_size_too_large")
 	c.warn("gmqx dropped a packet over the client maximum packet size",
 		"client", c.id, "connection", string(c.connID), "packet", m.Type(),
 		"size", size, "limit", limit, "reason", "max_packet_size_too_large")
@@ -714,9 +714,9 @@ func (c *client) enqueue(p outboundPacket) error {
 		return nil
 	default:
 	}
-	c.broker.metrics.RecordOverflow("outbound_queue")
+	c.broker.metrics().RecordOverflow("outbound_queue")
 	if p.droppable {
-		c.broker.metrics.RecordDroppedMessage("outbound_queue_full")
+		c.broker.metrics().RecordDroppedMessage("outbound_queue_full")
 		return errOutboundQueueFull
 	}
 	c.dropSlowConsumer()
@@ -738,7 +738,7 @@ func (c *client) enqueueAck(kind uint8, pid uint16) error {
 		// The client's Maximum Packet Size forbids even an acknowledgement. The
 		// packet is dropped and counted, exactly like every other oversize packet
 		// (see checkPacketSize); the connection stays usable.
-		c.broker.metrics.RecordDroppedMessage("max_packet_size_too_large")
+		c.broker.metrics().RecordDroppedMessage("max_packet_size_too_large")
 		c.warn("gmqx dropped a packet over the client maximum packet size",
 			"client", c.id, "connection", string(c.connID), "packet", ackType(kind),
 			"size", ackFrameLen, "limit", limit, "reason", "max_packet_size_too_large")
@@ -773,7 +773,7 @@ func (c *client) sendPublishFrame(m *mqtt.Publish) error {
 // unregisters the session.
 func (c *client) dropSlowConsumer() {
 	c.slowOnce.Do(func() {
-		c.broker.metrics.RecordDroppedMessage("slow_consumer")
+		c.broker.metrics().RecordDroppedMessage("slow_consumer")
 		c.warn("gmqx disconnecting slow consumer",
 			"client", c.id, "connection", string(c.connID), "remote", c.remoteAddr(),
 			"reason", "slow_consumer", "queue", cap(c.outq))
@@ -891,7 +891,7 @@ func (c *client) handshake() error {
 		// and each call into it is bounded by Config.AuthTimeout.
 		exchange := c.broker.authExchange(info.AuthMethod)
 		if exchange == nil {
-			c.broker.metrics.RecordDroppedMessage("auth_method")
+			c.broker.metrics().RecordDroppedMessage("auth_method")
 			_ = c.writeConnack(connackBadAuthMethod(c.version), "")
 			return fmt.Errorf("%w: %q", ErrBadAuthMethod, info.AuthMethod)
 		}
@@ -1281,12 +1281,12 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 	// deliveries that subscription causes (subscription_id.go).
 	ids, dropped, ok := normalizeSubscriptionIDs(m.Properties.SubscriptionIdentifiers)
 	if !ok {
-		c.broker.metrics.RecordDroppedMessage("subscription_identifier")
+		c.broker.metrics().RecordDroppedMessage("subscription_identifier")
 		c.protocolError(ReasonProtocolError)
 		return
 	}
 	if dropped > 0 {
-		c.broker.metrics.RecordDroppedMessage("subscription_identifier_limit")
+		c.broker.metrics().RecordDroppedMessage("subscription_identifier_limit")
 	}
 	codes := make([]byte, 0, len(m.Subscriptions))
 	existed := make([]bool, 0, len(m.Subscriptions))
@@ -1310,7 +1310,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 					c.protocolError(0)
 					return
 				}
-				c.broker.metrics.RecordDroppedMessage("shared_subscription")
+				c.broker.metrics().RecordDroppedMessage("shared_subscription")
 				codes = append(codes, 0x8f)
 				existed = append(existed, false)
 				continue
