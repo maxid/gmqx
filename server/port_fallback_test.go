@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -102,6 +103,30 @@ func TestPortFallbackBindsNextPort(t *testing.T) {
 	c.disconnect()
 }
 
+// TestAddrInUse pins the three shapes the port fallback has to recognise: the Unix
+// errno, the Winsock errno (10048, which is not syscall.EADDRINUSE on Windows), and
+// an error that only carries the message. The Windows job used to fail on the raw
+// syscall comparison in TestPortFallbackDisabledFails, not in the broker.
+func TestAddrInUse(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unix errno", &net.OpError{Op: "listen", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}, true},
+		{"winsock errno", &net.OpError{Op: "listen", Err: os.NewSyscallError("bind", syscall.Errno(wsaEAddrInUse))}, true},
+		{"message only", errors.New("listen tcp 127.0.0.1:1883: bind: address already in use"), true},
+		{"windows message", errors.New("Only one usage of each socket address is normally permitted"), true},
+		{"other", errors.New("listen tcp: permission denied"), false},
+	}
+	for _, tc := range cases {
+		if got := addrInUse(tc.err); got != tc.want {
+			t.Errorf("addrInUse(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestPortFallbackDisabledFails(t *testing.T) {
 	port, busy := occupyPortWithFreeNext(t)
 	defer func() { _ = busy.Close() }()
@@ -115,7 +140,11 @@ func TestPortFallbackDisabledFails(t *testing.T) {
 		_ = b.Stop(context.Background())
 		t.Fatal("Start succeeded on a busy port with the fallback disabled")
 	}
-	if !errors.Is(err, syscall.EADDRINUSE) {
+	// addrInUse is the production predicate: it covers the Unix errno and the
+	// Windows message, whose WSAEADDRINUSE does not compare equal to
+	// syscall.EADDRINUSE. Asserting the raw syscall here is what used to make the
+	// Windows CI job fail on every run.
+	if !addrInUse(err) {
 		t.Fatalf("Start error = %v, want an address-in-use error", err)
 	}
 	// A failed Start leaves nothing running behind.

@@ -509,16 +509,27 @@ func (b *Broker) bindListener(ctx context.Context, spec listenerSpec) (*gnety.Se
 	return nil, spec.addr, lastErr
 }
 
+// wsaEAddrInUse is WSAEADDRINUSE, the Winsock error of a busy port. It is not
+// syscall.EADDRINUSE: on Windows the latter is an invented MSVCRT value
+// (APPLICATION_ERROR+2), so the two do not compare equal.
+const wsaEAddrInUse = 10048
+
 // addrInUse reports whether err is the "address already in use" failure of a bind,
-// the only listener error a port fallback can fix. The syscall comparison covers
-// the Unix systems; the message check covers Windows, whose socket error
-// (WSAEADDRINUSE) does not compare equal to syscall.EADDRINUSE.
+// the only listener error a port fallback can fix. Three shapes reach this: the
+// Unix errno, the Winsock errno (a plain comparison, because it has no portable
+// name in package syscall), and an error that only carries the message (a wrapped
+// or synthesized error). The message fallback is last because it is the fragile
+// one: Windows localizes it, and the numeric checks do not.
 func addrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, syscall.EADDRINUSE) {
 		return true
 	}
-	if err == nil {
-		return false
+	var errno syscall.Errno
+	if errors.As(err, &errno) && uintptr(errno) == wsaEAddrInUse {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "address already in use") ||
