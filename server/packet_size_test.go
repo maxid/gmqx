@@ -159,11 +159,6 @@ func TestClientMaximumPacketSizeKeepsQoS2ExchangeUsable(t *testing.T) {
 	c := b.clients["maxpacket-qos2"]
 	b.mu.RUnlock()
 	waitFor(t, "the dropped delivery to leave no inflight exchange", func() bool {
-		if c == nil {
-			return false
-		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return len(c.inflight) == 0
+		return c != nil && c.InflightDepth() == 0
 	})
 }

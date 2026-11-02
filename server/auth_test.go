@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/maxid/gmqx/conn"
 	"io"
 	"net"
 	"sync"
@@ -117,9 +118,9 @@ func readRawFrame(t *testing.T, c *confClient) []byte {
 }
 
 // liveClient returns the registered connection of a client id.
-func liveClient(t *testing.T, b *Broker, clientID string) *client {
+func liveClient(t *testing.T, b *Broker, clientID string) *conn.Client {
 	t.Helper()
-	var found *client
+	var found *conn.Client
 	waitFor(t, "session "+clientID, func() bool {
 		b.mu.RLock()
 		defer b.mu.RUnlock()
@@ -200,8 +201,8 @@ func TestEnhancedAuthOneStep(t *testing.T) {
 	// The session lives under the identity the exchange returned, not under the
 	// client id of the CONNECT.
 	live := liveClient(t, b, "device-42")
-	if live.username != "device-42" {
-		t.Fatalf("session username = %q, want device-42", live.username)
+	if live.Username() != "device-42" {
+		t.Fatalf("session username = %q, want device-42", live.Username())
 	}
 	b.mu.RLock()
 	_, wireID := b.clients["wire-id"]
@@ -284,8 +285,8 @@ func TestEnhancedAuthTwoStep(t *testing.T) {
 	if calls := exchange.continueCalls(); len(calls) != 1 || string(calls[0]) != "answer" {
 		t.Fatalf("Continue calls = %q, want [answer]", calls)
 	}
-	if live := liveClient(t, b, "two-step"); live.username != "" {
-		t.Fatalf("session username = %q, want the CONNECT's empty username", live.username)
+	if live := liveClient(t, b, "two-step"); live.Username() != "" {
+		t.Fatalf("session username = %q, want the CONNECT's empty username", live.Username())
 	}
 }
 
@@ -473,8 +474,8 @@ func TestEnhancedAuthReauthenticate(t *testing.T) {
 			ack.Properties.AuthenticationMethod, ack.Properties.AuthenticationData)
 	}
 	live := liveClient(t, b, "reauth")
-	if live.username != "device-1" {
-		t.Fatalf("session username = %q, want device-1", live.username)
+	if live.Username() != "device-1" {
+		t.Fatalf("session username = %q, want device-1", live.Username())
 	}
 	if codes := subscribe(t, c, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "reauth/keep", QoS: 1}).ReasonCodes; len(codes) != 1 || codes[0] != 1 {
 		t.Fatalf("SUBACK codes %v, want [1]", codes)
@@ -503,9 +504,7 @@ func TestEnhancedAuthReauthenticate(t *testing.T) {
 	}
 	// The identity the second exchange authenticated replaced the first.
 	waitFor(t, "the re-authenticated username", func() bool {
-		live.mu.Lock()
-		defer live.mu.Unlock()
-		return live.username == "device-2"
+		return live.Username() == "device-2"
 	})
 
 	// The session is untouched: the subscription still delivers.

@@ -28,64 +28,10 @@ import (
 
 	"github.com/maxid/gnety/codec/mqtt"
 
+	"github.com/maxid/gmqx/conn"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	sessionstate "github.com/maxid/gmqx/session"
 )
-
-// restoreQoS2State hands the QoS 2 state of a resumed session to the connection
-// that takes it over: the inbound packet ids the client has not released and the
-// outbound exchanges it has not confirmed. The outbound exchanges are scheduled
-// for retransmission exactly like a freshly registered one, and resumeInflight
-// re-sends them after the CONNACK.
-func (c *client) restoreQoS2State(s *sessionstate.State) {
-	for _, id := range s.InboundQoS2 {
-		c.inboundQoS2[id] = struct{}{}
-	}
-	retry := c.broker.cfg.QoSRetryInterval
-	if retry <= 0 {
-		retry = defaultQoSRetryInterval
-	}
-	now := time.Now()
-	for _, stored := range s.Inflight {
-		m := &inflightMessage{
-			packetID: stored.PacketID,
-			topic:    stored.Topic,
-			payload:  stored.Payload,
-			qos:      stored.QoS,
-			retain:   stored.Retain,
-			props:    stored.Props,
-			state:    liveInflightState(stored.Stage),
-		}
-		if c.broker.cfg.QoSMaxRetries >= 0 {
-			m.due = now.Add(retry)
-		}
-		c.addInflightLocked(m.packetID, m)
-		c.restoredInflight = append(c.restoredInflight, m.packetID)
-	}
-}
-
-// snapshotQoS2 returns the connection's QoS 2 state for a store in the projection
-// a session carries. The caller holds c.mu, which is what makes the snapshot
-// consistent with the acknowledgements the connection is processing.
-func (c *client) snapshotQoS2Locked() ([]uint16, []sessionstate.Inflight) {
-	inbound := make([]uint16, 0, len(c.inboundQoS2))
-	for id := range c.inboundQoS2 {
-		inbound = append(inbound, id)
-	}
-	inflight := make([]sessionstate.Inflight, 0, len(c.inflight))
-	for _, m := range c.inflight {
-		inflight = append(inflight, sessionstate.Inflight{
-			PacketID: m.packetID,
-			Topic:    m.topic,
-			Payload:  m.payload,
-			QoS:      m.qos,
-			Retain:   m.retain,
-			Props:    m.props,
-			Stage:    inflightStage(m.state),
-		})
-	}
-	return inbound, inflight
-}
 
 // takeStoredSession removes the stored session of key and hands it to a
 // connection. The caller holds b.mu. The global offline-queue counter follows the
@@ -151,15 +97,16 @@ func (b *Broker) deleteStoredSession(key string) {
 	b.index.Remove(key)
 }
 
-// saveStoredSession writes the state the connection c leaves behind: its
-// subscriptions, the messages of the queue it did not manage to drain, and its
-// expiry deadline. The caller holds b.mu and c.mu, and c.queue is handed over to
-// the store.
+// saveStoredSession writes the state the connection c handed over: its
+// subscriptions, the queue it did not manage to drain plus the deliveries it
+// still owed, and its expiry deadline. The caller holds b.mu, and the connection
+// runs it from inside conn.Client.HandOff, so no delivery can observe the handoff
+// before the state is stored.
 //
 // The session's filters move from live to stored in the routing index here: from
 // this point a matching publication is queued for it instead of written to a
 // connection, and no store call is needed to find out that it is a target.
-func (b *Broker) saveStoredSession(key string, c *client) {
+func (b *Broker) saveStoredSession(key string, h *conn.Handoff) {
 	if stale, ok := b.store.Load(key); ok {
 		// Defensive: a stored session of a live connection should not exist, but
 		// the counter must follow what the store actually holds.
@@ -167,22 +114,56 @@ func (b *Broker) saveStoredSession(key string, c *client) {
 	}
 	// One deadline for both halves: the store the sweeper enforces and the index
 	// that decides whether a publication still finds a target.
-	expiresAt := c.sessionExpiryDeadline()
-	inboundQoS2, inflight := c.snapshotQoS2Locked()
+	queue := b.adoptQueue(h)
 	state := (&sessionstate.State{
-		ClientID:    c.id,
-		Subs:        c.subs,
-		Queue:       c.queue,
-		ExpiresAt:   expiresAt,
-		InboundQoS2: inboundQoS2,
-		Inflight:    inflight,
+		ClientID:    h.ClientID,
+		Subs:        h.Subs,
+		Queue:       queue,
+		ExpiresAt:   h.ExpiresAt,
+		InboundQoS2: h.InboundQoS2,
+		Inflight:    h.Inflight,
 	}).Stored()
 	b.store.Save(key, state)
-	b.offlineQueued += len(c.queue)
-	c.queue = nil
+	b.offlineQueued += len(queue)
 	// The index is fed the same subscription set the store just got, so a publish
 	// that matches the session is routed exactly like a restored one.
-	b.index.SetStored(key, state.ClientID, state.Subscriptions, expiresAt)
+	b.index.SetStored(key, state.ClientID, state.Subscriptions, h.ExpiresAt)
+}
+
+// adoptQueue merges the deliveries a connection still owed its inflight window
+// into the queue it hands over, in the order they were queued. They were
+// acknowledged to their publisher and never written, so a persistent session must
+// not lose them with the connection: they take their place behind whatever the
+// offline queue still holds, which is where the next CONNECT drains them from.
+//
+// This queue is what a persistent session gets instead of a drop when its inflight
+// queue overflows (see conn's sendPublish), and it is also what a connection that
+// simply went away leaves behind. The queue's own bounds apply exactly as they do
+// to a message published while the session is offline — Config.MaxOfflineQueueSize
+// drops the oldest messages of the combined queue, Config.MaxTotalOfflineMessages
+// rejects the newest — and they are counted with the same reasons
+// ("offline_queue_full", "offline_queue_total"), so the offline queue's capacity
+// stays the single, documented loss point of a persistent session.
+//
+// The caller holds b.mu.
+func (b *Broker) adoptQueue(h *conn.Handoff) []sessionstate.Pending {
+	queue := h.Queue
+	rejected := 0
+	for _, m := range h.Pending {
+		if limit := b.cfg.MaxTotalOfflineMessages; limit > 0 && b.offlineQueued+len(queue) >= limit {
+			rejected++
+			continue
+		}
+		queue = append(queue, m)
+	}
+	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(queue) > maxQueue {
+		queue = queue[len(queue)-maxQueue:]
+		b.metrics().RecordDroppedMessage("offline_queue_full")
+	}
+	for i := 0; i < rejected; i++ {
+		b.metrics().RecordDroppedMessage("offline_queue_total")
+	}
+	return queue
 }
 
 // loadStoredSessions indexes the sessions a store already held when the broker
@@ -207,23 +188,6 @@ func (b *Broker) loadStoredSessions() {
 		}
 		b.index.SetStored(key, state.ClientID, state.Subscriptions, state.ExpiresAt)
 	}
-}
-
-// sessionExpiryDeadline is the deadline the sweeper enforces for the session a
-// closing connection leaves behind.
-//
-// MQTT 3.1.1 has no Session Expiry Interval, so its persistent sessions keep the
-// previous behavior and never expire (the zero time). MQTT 5 stamps
-// now + Session Expiry Interval; a zero interval does not reach this point
-// because such a session is not persistent at all — the session ends with the
-// connection, which is also why a CONNECT with a zero interval can resume a
-// stored session but never creates one. The interval is counted in the broker's
-// protocol second (Config.unit), which is time.Second outside the tests.
-func (c *client) sessionExpiryDeadline() time.Time {
-	if c.version != mqtt.Version5 || c.info.SessionExpiry == 0 {
-		return time.Time{}
-	}
-	return time.Now().Add(time.Duration(c.info.SessionExpiry) * c.broker.second())
 }
 
 // maxSessionSweepPerTick bounds how many stored sessions one sweep tick examines,
@@ -292,64 +256,6 @@ func (b *Broker) sweepExpiredSessions() {
 	}
 }
 
-// absorbPendingLocked moves the deliveries a connection still owed its inflight
-// window into the session queue it leaves behind, in the order they were queued.
-// They were acknowledged to their publisher and never written, so a persistent
-// session must not lose them with the connection: they take their place behind
-// whatever the offline queue still holds, which is where the next CONNECT drains
-// them from.
-//
-// This is the queue a persistent session gets instead of a drop when its inflight
-// queue overflows (see client.sendPublish), and it is also what a connection that
-// simply went away leaves behind. The queue's own bounds apply exactly as they do
-// to a message published while the session is offline — Config.MaxOfflineQueueSize
-// drops the oldest messages of the combined queue, Config.MaxTotalOfflineMessages
-// rejects the newest — and they are counted with the same reasons
-// ("offline_queue_full", "offline_queue_total"), so the offline queue's capacity
-// stays the single, documented loss point of a persistent session.
-//
-// The caller holds b.mu and c.mu, and has not saved the session yet: the counter
-// of queued messages follows len(c.queue) when saveStoredSession stores it.
-func (b *Broker) absorbPendingLocked(c *client) {
-	if len(c.pending) == 0 {
-		return
-	}
-	pending := c.pending
-	c.pending = nil
-	rejected := 0
-	for _, m := range pending {
-		if limit := b.cfg.MaxTotalOfflineMessages; limit > 0 && b.offlineQueued+len(c.queue) >= limit {
-			rejected++
-			continue
-		}
-		c.queue = append(c.queue, sessionstate.Pending{
-			Topic:   m.topic,
-			Payload: m.payload,
-			QoS:     m.qos,
-			Retain:  m.retain,
-			Props:   m.props,
-		})
-	}
-	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(c.queue) > maxQueue {
-		c.queue = c.queue[len(c.queue)-maxQueue:]
-		b.metrics().RecordDroppedMessage("offline_queue_full")
-	}
-	for i := 0; i < rejected; i++ {
-		b.metrics().RecordDroppedMessage("offline_queue_total")
-	}
-}
-
-// dropPendingLocked discards the deliveries a connection still owed, counting each
-// one with reason. It is the last resort: a session that another node owns (or that
-// was taken over here) has no queue on this node to keep them in. The caller holds
-// b.mu and c.mu.
-func (b *Broker) dropPendingLocked(c *client, reason string) {
-	for range c.pending {
-		b.metrics().RecordDroppedMessage(reason)
-	}
-	c.pending = nil
-}
-
 // enqueueOffline appends one publication to the queue of the persistent session
 // target names. It is the write half of an offline LocalTarget.
 //
@@ -364,7 +270,7 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 	if live, ok := b.clients[key]; ok {
 		b.mu.Unlock()
 		// A live connection owns the session now, so delivery is live again.
-		_ = live.sendPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
+		_ = live.DeliverPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
 		return
 	}
 	state, ok := b.store.Load(key)

@@ -201,12 +201,7 @@ func waitInflightEmpty(t *testing.T, b *Broker, clientID string) {
 		b.mu.RLock()
 		c := b.clients[clientID]
 		b.mu.RUnlock()
-		if c == nil {
-			return false
-		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return len(c.inflight) == 0
+		return c != nil && c.InflightDepth() == 0
 	})
 }
 

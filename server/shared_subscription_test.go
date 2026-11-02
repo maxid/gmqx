@@ -345,8 +345,7 @@ func BenchmarkSharedTargetSelection(b *testing.B) {
 			const group = "$share/bench/jobs/+"
 			for i := 0; i < members; i++ {
 				id := fmt.Sprintf("bench-%06d", i)
-				c := &client{id: id, connID: ConnectionID("conn-" + id)}
-				broker.index.SetLive(namespaceKey(broker.namespace, id), c, map[string]sessionstate.Subscription{
+				broker.index.SetLive(namespaceKey(broker.namespace, id), testEndpoint{id: id}, map[string]sessionstate.Subscription{
 					group: {QoS: 1},
 				})
 			}

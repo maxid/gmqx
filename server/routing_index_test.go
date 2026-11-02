@@ -13,6 +13,7 @@ package server
 
 import (
 	"fmt"
+	"github.com/maxid/gmqx/conn"
 	"sort"
 	"sync"
 	"testing"
@@ -272,7 +273,7 @@ func installRoutingSubs(t *testing.T, b *Broker, subs []routingSub) {
 }
 
 // clientByID returns the live connection the broker registered for clientID.
-func (b *Broker) clientByID(clientID string) *client {
+func (b *Broker) clientByID(clientID string) *conn.Client {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.clients[clientID]
@@ -287,7 +288,7 @@ func liveConnID(t *testing.T, b *Broker, clientID string) ConnectionID {
 	if c == nil {
 		t.Fatalf("client %q is not connected", clientID)
 	}
-	return c.connID
+	return c.ConnID()
 }
 
 // checkTargets compares the target set with the expectation, independent of the
@@ -569,6 +570,20 @@ func TestPublishDoesNotConsultSessionStore(t *testing.T) {
 	}
 }
 
+// testEndpoint is a live connection as the routing index sees it: an identity and
+// a delivery handle, with no broker behind it. The benchmarks build index entries
+// with it, so they measure the table and not a connection.
+type testEndpoint struct {
+	id     string
+	connID ConnectionID
+}
+
+func (e testEndpoint) ClientID() string           { return e.id }
+func (e testEndpoint) ConnectionID() ConnectionID { return e.connID }
+func (e testEndpoint) DeliverPublish(string, []byte, byte, bool, mqtt.Properties) error {
+	return nil
+}
+
 // benchTargets keeps the benchmark result observable, so the loop is not optimized
 // away.
 var benchTargets []LocalTarget
@@ -584,15 +599,13 @@ func benchBroker(size, wildcards int) (*Broker, Publication) {
 	}
 	for i := 0; i < size; i++ {
 		id := fmt.Sprintf("bench-%06d", i)
-		c := &client{id: id, connID: ConnectionID("conn-" + id)}
-		b.index.SetLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
+		b.index.SetLive(namespaceKey(b.namespace, id), testEndpoint{id: id}, map[string]sessionstate.Subscription{
 			fmt.Sprintf("plant/%06d/temp", i): {QoS: 1},
 		})
 	}
 	for j := 0; j < wildcards; j++ {
 		id := fmt.Sprintf("wild-%04d", j)
-		c := &client{id: id, connID: ConnectionID("conn-" + id)}
-		b.index.SetLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
+		b.index.SetLive(namespaceKey(b.namespace, id), testEndpoint{id: id}, map[string]sessionstate.Subscription{
 			fmt.Sprintf("other%04d/+/temp", j): {QoS: 1},
 		})
 	}

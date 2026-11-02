@@ -71,9 +71,7 @@ func waitWriterWedged(t *testing.T, b *Broker, clientID string) {
 		if c == nil {
 			return false
 		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return len(c.inflight)+len(c.pending) >= 2
+		return c.InflightDepth()+c.PendingDepth() >= 2
 	})
 }
 

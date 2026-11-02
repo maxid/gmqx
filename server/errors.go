@@ -3,37 +3,35 @@ package server
 import (
 	"errors"
 
-	"github.com/maxid/gnety/codec/mqtt"
-
 	"github.com/maxid/gmqx/cluster"
+	"github.com/maxid/gmqx/conn"
 )
 
 var (
-	// ErrUnauthorized is returned when authentication fails.
-	ErrUnauthorized = errors.New("gmqx: unauthorized")
+	// The connect-refusal errors are gmqx/conn's: the connection maps them onto
+	// MQTT reason codes, the broker returns them, and re-exporting them here keeps
+	// one identity under the gmqx name (errors.Is works across both spellings).
+	ErrUnauthorized = conn.ErrUnauthorized
 	// ErrBadAuthMethod is returned when a CONNECT names an MQTT 5 Authentication
-	// Method this broker has no exchange for (Config.Authenticator returns nil, or
-	// the method is outside Config.AuthMethods). The CONNACK that accompanies it is
+	// Method the broker has no exchange for. The CONNACK that accompanies it is
 	// 0x8C (Bad authentication method) on MQTT 5.
-	ErrBadAuthMethod = errors.New("gmqx: bad authentication method")
+	ErrBadAuthMethod = conn.ErrBadAuthMethod
 	// ErrMalformedPacket indicates an invalid MQTT packet.
-	// It aliases the wire codec error so callers can match either sentinel.
-	ErrMalformedPacket = mqtt.ErrMalformedPacket
-	// ErrUnsupportedProtocol indicates a CONNECT whose protocol name or level
-	// this broker does not speak. MQTT 3.1, 3.1.1 and 5 are supported; the codec
-	// reports any other version and gmqx keeps the sentinel on top.
-	ErrUnsupportedProtocol = errors.New("gmqx: unsupported protocol level")
+	ErrMalformedPacket = conn.ErrMalformedPacket
+	// ErrUnsupportedProtocol indicates a CONNECT whose protocol name or level this
+	// broker does not speak. MQTT 3.1, 3.1.1 and 5 are supported.
+	ErrUnsupportedProtocol = conn.ErrUnsupportedProtocol
 	// ErrClientIDInUse is returned in ConnectModeUnique when the clientId exists.
-	ErrClientIDInUse = errors.New("gmqx: client id already in use")
+	ErrClientIDInUse = conn.ErrClientIDInUse
 	// ErrMaxConnections is returned when the configured connection limit is reached.
-	ErrMaxConnections = errors.New("gmqx: max connections reached")
+	ErrMaxConnections = conn.ErrMaxConnections
 	// ErrTakeoverRateExceeded is returned in ConnectModeKick when a CONNECT would
 	// displace a live connection that began less than Config.NotKickSeconds ago:
 	// the anti-flap window refuses the take-over instead of letting two ends of one
 	// client id displace each other in a loop. The CONNACK that accompanies it is
 	// 0x9F (Connection rate exceeded) on MQTT 5 and return code 3 (Server
 	// unavailable) on MQTT 3.1.1.
-	ErrTakeoverRateExceeded = errors.New("gmqx: takeover inside the NotKickSeconds window")
+	ErrTakeoverRateExceeded = conn.ErrTakeoverRateExceeded
 	// ErrClientIDRequired reports that Broker.PublishToClient was called without a
 	// client id: a directed publish has no other way to name its target.
 	ErrClientIDRequired = errors.New("gmqx: client id is required")

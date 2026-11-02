@@ -1,10 +1,10 @@
-package server
+package conn
 
 import (
 	"testing"
 	"time"
 
-	sessionstate "github.com/maxid/gmqx/session"
+	"github.com/maxid/gmqx/session"
 )
 
 // TestResumeInflightResendsOnlyRestored pins the selection resumeInflight makes.
@@ -14,16 +14,16 @@ import (
 // Windows CI failure this split was made for. Only the exchanges restoreQoS2State
 // carried over from the previous connection may be resent.
 func TestResumeInflightResendsOnlyRestored(t *testing.T) {
-	b := &Broker{cfg: Config{QoSRetryInterval: time.Minute, QoSMaxRetries: 5}}
-	c := &client{
-		broker:   b,
+	h := &testHost{limits: Limits{QoSRetryInterval: time.Minute, QoSMaxRetries: 5}}
+	c := &Client{
+		host:     h,
 		inflight: make(map[uint16]*inflightMessage),
 	}
 
 	// A persistent session whose connection ended with one unconfirmed QoS 1
 	// exchange: restoreQoS2State carries it over.
-	c.restoreQoS2State(&sessionstate.State{Inflight: []sessionstate.Inflight{{
-		PacketID: 1, QoS: 1, Topic: "resume/x", Payload: []byte("restored"), Stage: sessionstate.InflightAwaitPuback,
+	c.restoreQoS2Locked(&session.State{Inflight: []session.Inflight{{
+		PacketID: 1, QoS: 1, Topic: "resume/x", Payload: []byte("restored"), Stage: session.InflightAwaitPuback,
 	}}})
 
 	// A delivery that reached this fresh connection after the CONNACK and before

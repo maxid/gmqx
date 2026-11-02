@@ -97,7 +97,7 @@ func connectTimeOf(t *testing.T, b *Broker, clientID string) time.Time {
 	if !ok {
 		t.Fatalf("client %q is not connected", clientID)
 	}
-	return c.connectedAt
+	return c.ConnectedAt()
 }
 
 // kickFor builds the kick a peer would send for a connection that started at

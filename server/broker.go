@@ -6,8 +6,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +21,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 	"github.com/maxid/gplugin"
 
+	"github.com/maxid/gmqx/conn"
 	"github.com/maxid/gmqx/hook"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	ns "github.com/maxid/gmqx/internal/namespace"
@@ -79,7 +78,7 @@ type Broker struct {
 
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
-	clients  map[string]*client
+	clients  map[string]*conn.Client
 	retained *retainedstore.Store
 	servers  []*gnety.Server
 	addrs    map[string]string
@@ -203,7 +202,7 @@ func New(cfg Config) (*Broker, error) {
 		}
 	}
 	if cfg.NodeID == "" {
-		cfg.NodeID = randomID()
+		cfg.NodeID = conn.RandomID()
 	}
 	if cfg.SessionStore == nil {
 		cfg.SessionStore = NewMemorySessionStore()
@@ -270,7 +269,7 @@ func New(cfg Config) (*Broker, error) {
 		cfg:       cfg,
 		log:       logger,
 		namespace: cfg.Namespace.Name,
-		clients:   make(map[string]*client),
+		clients:   make(map[string]*conn.Client),
 		store:     cfg.SessionStore,
 		index:     routing.NewIndex(),
 		retained:  retainedstore.NewStore(),
@@ -698,7 +697,7 @@ func (b *Broker) Stop(ctx context.Context) error {
 	b.closed = true
 	close(b.done)
 	servers := append([]*gnety.Server(nil), b.servers...)
-	clients := make([]*client, 0, len(b.clients))
+	clients := make([]*conn.Client, 0, len(b.clients))
 	for _, c := range b.clients {
 		clients = append(clients, c)
 	}
@@ -716,7 +715,7 @@ func (b *Broker) Stop(ctx context.Context) error {
 		}
 	}
 	for _, c := range clients {
-		c.close(false)
+		c.Close()
 	}
 	// The wills whose delay has not elapsed go with the broker: there is nowhere
 	// left to publish them, and their timers must not outlive Stop.
@@ -727,31 +726,31 @@ func (b *Broker) Stop(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-func (b *Broker) serve(conn net.Conn) {
+func (b *Broker) serve(netConn net.Conn) {
 	// Byte-rate shaping is applied by the transport wrapper, so every byte read
 	// from or written to this connection — the CONNECT phase, the packet codec
 	// and the shutdown DISCONNECT alike — passes one bucket (see byte_rate.go).
-	conn = b.shapeConn(conn)
-	c := newClient(b, conn)
+	netConn = b.shapeConn(netConn)
+	c := conn.New(b, netConn)
 	// A safety net: close cancels the context as soon as the connection is gone,
 	// this covers a connection that failed before close was reached.
-	defer c.stopContext()
+	defer c.StopContext()
 	// The writer goroutine is joined as well: a connection that never reaches
 	// close (a handshake that fails after the CONNACK) still ends it here.
-	defer c.stopWriter()
-	if err := c.handshake(); err != nil {
-		if c.registered {
+	defer c.StopWriter()
+	if err := c.Handshake(); err != nil {
+		if c.Registered() {
 			// The connection is gone, so the disconnect hook observes the cancelled
 			// context, exactly as it does on the normal path.
-			c.stopContext()
+			c.StopContext()
 			b.unregister(c)
 		}
-		b.log.Debug("gmqx handshake failed", "remote", conn.RemoteAddr(), "err", err)
-		_ = conn.Close()
+		b.log.Debug("gmqx handshake failed", "remote", netConn.RemoteAddr(), "err", err)
+		_ = netConn.Close()
 		return
 	}
 	defer b.unregister(c)
-	c.loop()
+	c.Loop()
 }
 
 // register enforces connect mode and connection limits, then records the
@@ -772,8 +771,8 @@ func (b *Broker) serve(conn net.Conn) {
 // ConnectModeUnique it is refused. Either way the connection that wins the client
 // id spreads a kick to the cluster, so a duplicate connection on another node is
 // closed instead of surviving until its keep-alive expires (see spreadKick).
-func (b *Broker) register(c *client) error {
-	key := namespaceKey(b.namespace, c.id)
+func (b *Broker) register(c *conn.Client) error {
+	key := namespaceKey(b.namespace, c.ID())
 	b.mu.Lock()
 	var takeover *sessionstate.State
 	if old, ok := b.clients[key]; ok && old != c {
@@ -790,38 +789,32 @@ func (b *Broker) register(c *client) error {
 		// In KICK mode the replacement takes the old session over. The old
 		// connection must neither save that state again nor erase the new
 		// session when its own serve goroutine unwinds.
-		old.mu.Lock()
-		old.superseded = true
-		if old.persistentSession() {
-			if stored, ok := b.takeStoredSession(key); ok {
-				takeover = stored
-			} else {
+		old.MarkSuperseded()
+		if old.PersistentSession() {
+			old.TakeOver(func(h *conn.Handoff) bool {
+				if stored, ok := b.takeStoredSession(key); ok {
+					takeover = stored
+					return false
+				}
 				// The old connection owns the state, so the replacement takes it over
 				// directly — the QoS 2 state of both directions included, exactly as a
 				// store would have carried it. The deliveries it still owed its inflight
 				// window move into the queue it hands over instead of being lost with
 				// it: a client that reconnects before unregister has stored the session
 				// gets them now, one that reconnects later takes them from the store.
-				inboundQoS2, inflight := old.snapshotQoS2Locked()
-				b.absorbPendingLocked(old)
 				takeover = &sessionstate.State{
-					ClientID:    old.id,
-					Subs:        sessionstate.CopySubscriptions(old.subs),
-					Queue:       old.queue,
-					InboundQoS2: inboundQoS2,
-					Inflight:    inflight,
+					ClientID:    h.ClientID,
+					Subs:        h.Subs,
+					Queue:       b.adoptQueue(h),
+					ExpiresAt:   h.ExpiresAt,
+					InboundQoS2: h.InboundQoS2,
+					Inflight:    h.Inflight,
 				}
-				old.queue = nil
-			}
-			// The pending queue of the displaced connection now belongs to the
-			// replacement (or to nothing at all, when the session came from the store),
-			// so a delivery that still reaches it is queued through the offline path
-			// instead of being dropped (see client.sendPublish).
-			old.handoff = handoffStored
+				return true
+			})
 		}
-		old.mu.Unlock()
 		b.mu.Unlock()
-		old.displace()
+		old.Displace()
 		b.mu.Lock()
 	}
 	if b.cfg.MaxConnections > 0 && len(b.clients) >= b.cfg.MaxConnections {
@@ -829,38 +822,29 @@ func (b *Broker) register(c *client) error {
 		return ErrMaxConnections
 	}
 
-	if c.resumesSession() {
+	if c.ResumesSession() {
 		if stored, ok := b.takeStoredSession(key); ok {
-			c.subs = stored.Subs
-			c.queue = stored.Queue
-			c.restoreQoS2State(stored)
-			c.sessionPresent = true
+			c.Adopt(stored)
 		} else if takeover != nil {
-			c.subs = takeover.Subs
-			c.queue = takeover.Queue
-			c.restoreQoS2State(takeover)
-			c.sessionPresent = true
+			c.Adopt(takeover)
 		}
 	} else {
 		b.deleteStoredSession(key)
 	}
-	if c.subs == nil {
-		// A resumed session without subscriptions (or a store that returns none)
-		// must still be able to accept a SUBSCRIBE.
-		c.subs = make(map[string]sessionstate.Subscription)
-	}
+	// A resumed session without subscriptions (or a store that returns none) must
+	// still be able to accept a SUBSCRIBE.
+	c.EnsureSubscriptions()
 
 	b.clients[key] = c
-	c.registered = true
-	c.connectedAt = time.Now()
+	c.MarkRegistered(time.Now())
 	// The routing table follows the session into the connection: the filters it
 	// restored (or the empty set of a clean session) are routable before the
 	// CONNACK goes out, and the stored entries of a session that was taken over
 	// stop being targets here, under the same lock that moves the session.
-	b.index.SetLive(key, c, c.subs)
+	b.index.SetLive(key, c, c.Subscriptions())
 	n := len(b.clients)
 	b.mu.Unlock()
-	if len(c.subs) > 0 {
+	if c.HasSubscriptions() {
 		b.subscriptionsChanged()
 	}
 
@@ -868,7 +852,7 @@ func (b *Broker) register(c *client) error {
 	// asked to delay: MQTT 5 forbids publishing it once the session is resumed. A
 	// CONNECT that discards the session instead (Clean Start set) ends it right
 	// here, so the pending will of that session goes out now.
-	if c.resumesSession() {
+	if c.ResumesSession() {
 		b.cancelPendingWill(key)
 	} else {
 		b.flushPendingWill(key)
@@ -881,19 +865,19 @@ func (b *Broker) register(c *client) error {
 	// event names a client id, not a topic, and the built-in backends stamp it
 	// with this node's identity, namespace and sequence number, so their
 	// deduplication and namespace rules apply unchanged (see spreadKick).
-	b.spreadKick(c.context(), c.id, c.connectedAt)
+	b.spreadKick(c.Context(), c.ID(), c.ConnectedAt())
 	// A backend that tracks client-id presence is told about the connection, so a
 	// directed publish for this id can address this node instead of every node.
 	// The call only enqueues the presence write: no store or network call runs on
 	// the CONNECT path under the broker lock (see clientPresence).
 	if b.presence != nil {
-		b.presence.ClientConnected(c.id)
+		b.presence.ClientConnected(c.ID())
 	}
 
 	b.metrics().IncrementConnections()
 	b.metrics().RecordConnections(n)
 	if b.sink() != nil {
-		b.sink().OnConnect(c.context(), c.info)
+		b.sink().OnConnect(c.Context(), c.Info())
 	}
 	return nil
 }
@@ -904,8 +888,8 @@ func (b *Broker) register(c *client) error {
 // for that long, so two ends of one client id cannot displace each other in a
 // loop. The caller holds b.mu, which is what orders the write of connectedAt in
 // register with this read.
-func (b *Broker) takeoverAllowed(old *client) bool {
-	return !b.insideNotKickWindow(old.connectedAt)
+func (b *Broker) takeoverAllowed(old *conn.Client) bool {
+	return !b.insideNotKickWindow(old.ConnectedAt())
 }
 
 // insideNotKickWindow reports whether a connection that began at startedAt is
@@ -931,22 +915,20 @@ func (b *Broker) insideNotKickWindow(startedAt time.Time) bool {
 	return time.Since(startedAt) <= time.Duration(window)*b.second()
 }
 
-func (b *Broker) unregister(c *client) {
-	if !c.registered {
+func (b *Broker) unregister(c *conn.Client) {
+	if !c.MarkUnregistered() {
 		return
 	}
-	c.registered = false
-	key := namespaceKey(b.namespace, c.id)
+	key := namespaceKey(b.namespace, c.ID())
 	b.mu.Lock()
 	if current, ok := b.clients[key]; ok && current == c {
 		delete(b.clients, key)
 	}
 	n := len(b.clients)
-	c.mu.Lock()
-	hadSubscriptions := len(c.subs) > 0
-	superseded := c.superseded
-	kicked := c.kicked
-	persistent := c.persistentSession()
+	hadSubscriptions := c.HasSubscriptions()
+	superseded := c.Superseded()
+	kicked := c.Kicked()
+	persistent := c.PersistentSession()
 	// movedAway reports that the session of this connection is not this node's any
 	// more: a local take-over installed a replacement here, or a peer's kick moved
 	// the client id away. With a store the nodes share, the node that holds the
@@ -966,30 +948,27 @@ func (b *Broker) unregister(c *client) {
 		// local one — and a clean session, which has no queue anywhere, ends with the
 		// connection as it always did.
 		if persistent {
-			b.dropPendingLocked(c, "offline_session_missing")
-			c.handoff = handoffStored
+			dropped := c.Discard()
+			for i := 0; i < dropped; i++ {
+				b.metrics().RecordDroppedMessage("offline_session_missing")
+			}
 		} else {
-			c.pending = nil
+			c.DropPending()
 		}
 	case persistent:
 		// The deliveries the connection still owed its inflight window are not lost
-		// with it: they join the session queue before it is stored
-		// (absorbPendingLocked), so an inflight overflow — which is what takes a
-		// session offline in the first place — keeps what the publisher was already
-		// acknowledged for.
-		b.absorbPendingLocked(c)
-		b.saveStoredSession(key, c)
-		// The session is stored: a delivery that still arrives here with a stale
-		// target of this connection is queued for it through the offline path
-		// instead of being dropped (see client.sendPublish).
-		c.handoff = handoffStored
+		// with it: they join the session queue before it is stored (adoptQueue), so
+		// an inflight overflow — which is what takes a session offline in the first
+		// place — keeps what the publisher was already acknowledged for. The store
+		// write and the handoff happen under the connection's lock, so no delivery
+		// can slip between them.
+		c.HandOff(func(h *conn.Handoff) { b.saveStoredSession(key, h) })
 	default:
 		b.deleteStoredSession(key)
 		// A clean session has no queue and no store entry: what it still owed ends
 		// with the connection, which is what declaring the session clean means.
-		c.pending = nil
+		c.DropPending()
 	}
-	c.mu.Unlock()
 	if movedAway {
 		// A displaced connection whose replacement is not on this node (a peer's
 		// connect-time kick moved the session away) must not leave a live routing
@@ -1023,7 +1002,7 @@ func (b *Broker) unregister(c *client) {
 		_, connected := b.clients[key]
 		b.mu.RUnlock()
 		if !connected {
-			b.forgetClientPresence(c.id)
+			b.forgetClientPresence(c.ID())
 		}
 	}
 
@@ -1038,15 +1017,15 @@ func (b *Broker) unregister(c *client) {
 		// The disconnect hooks observe the cancelled connection context (the
 		// connection is already gone) but it still carries its ConnInfo, so a hook
 		// can attribute the event to the exact connection.
-		if c.lost {
-			b.sink().OnConnectionLost(c.context(), c.id, c.closeErr)
+		if c.Lost() {
+			b.sink().OnConnectionLost(c.Context(), c.ID(), c.CloseErr())
 		} else {
-			b.sink().OnDisconnect(c.context(), c.id, c.closeErr)
+			b.sink().OnDisconnect(c.Context(), c.ID(), c.CloseErr())
 		}
 	}
 }
 
-func (b *Broker) subscribe(c *client, filter string, sub sessionstate.Subscription) (byte, bool) {
+func (b *Broker) subscribe(c *conn.Client, filter string, sub sessionstate.Subscription) (byte, bool) {
 	// A shared subscription is authorized by the filter it delivers: "$share/g/t"
 	// receives the publications of "t", so an ACL that allows "t" allows it and a
 	// rule written for the group name would not be consulted. The full filter is
@@ -1055,22 +1034,18 @@ func (b *Broker) subscribe(c *client, filter string, sub sessionstate.Subscripti
 	if shared, isShared, ok := topicmatch.ParseSharedFilter(filter); isShared && ok {
 		aclFilter = shared.Filter
 	}
-	if !b.checkACL(c.context(), SessionInfo{ClientID: c.id, Username: c.username}, aclFilter, AclSubscribe) {
+	if !b.checkACL(c.Context(), SessionInfo{ClientID: c.ID(), Username: c.Username()}, aclFilter, AclSubscribe) {
 		b.metrics().RecordDroppedMessage("acl_subscribe")
-		return subscribeFailure(c.version, ReasonNotAuthorized), false
+		return subscribeFailure(c.Version(), ReasonNotAuthorized), false
 	}
-	c.mu.Lock()
-	_, exists := c.subs[filter]
-	if b.cfg.MaxTopicSubscriptions > 0 && len(c.subs) >= b.cfg.MaxTopicSubscriptions && !exists {
-		c.mu.Unlock()
+	granted, exists := c.InstallSubscription(filter, sub, b.cfg.MaxTopicSubscriptions)
+	if !granted {
 		b.metrics().RecordDroppedMessage("max_subscriptions")
-		return subscribeFailure(c.version, ReasonQuotaExceeded), exists
+		return subscribeFailure(c.Version(), ReasonQuotaExceeded), exists
 	}
-	c.subs[filter] = sub
-	c.mu.Unlock()
 	// The subscription is routable before the SUBACK is written: the connection
 	// goroutine updates the index here, and the SUBACK follows in handleSubscribe.
-	b.index.Add(namespaceKey(b.namespace, c.id), c, filter, sub)
+	b.index.Add(namespaceKey(b.namespace, c.ID()), c, filter, sub)
 	b.metrics().IncrementSubscribeEvents()
 	if !exists {
 		b.subscriptionsChanged()
@@ -1088,14 +1063,10 @@ func subscribeFailure(version, reason byte) byte {
 	return 0x80
 }
 
-func (b *Broker) unsubscribe(c *client, filter string) {
-	c.mu.Lock()
-	_, existed := c.subs[filter]
-	delete(c.subs, filter)
-	c.mu.Unlock()
-	if existed {
+func (b *Broker) unsubscribe(c *conn.Client, filter string) {
+	if c.RemoveSubscription(filter) {
 		// The filter stops routing before the UNSUBACK is written.
-		b.index.RemoveFilter(namespaceKey(b.namespace, c.id), c, filter)
+		b.index.RemoveFilter(namespaceKey(b.namespace, c.ID()), c, filter)
 		b.metrics().DecrementSubscribeEvents()
 		b.subscriptionsChanged()
 	}
@@ -1182,7 +1153,7 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 // the interval it has left, rounded up: the property counts from the publish and
 // the subscriber has to see the time the message may still live here, and a
 // rounding down to zero would mean "never expires" on the wire.
-func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublished bool, ids []uint32) {
+func (b *Broker) sendRetained(c *conn.Client, filter string, qos byte, retainAsPublished bool, ids []uint32) {
 	now := time.Now()
 	type replay struct {
 		topic   string
@@ -1192,7 +1163,7 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 	}
 	var msgs []replay
 	b.retained.Range(func(key string, m retainedstore.Message) bool {
-		if m.Namespace != c.namespace {
+		if m.Namespace != c.Namespace() {
 			return true
 		}
 		if !topicmatch.Match(filter, m.Topic) {
@@ -1215,7 +1186,7 @@ func (b *Broker) sendRetained(c *client, filter string, qos byte, retainAsPublis
 		if dropped {
 			b.metrics().RecordDroppedMessage("subscription_identifier_limit")
 		}
-		_ = c.sendPublish(m.topic, m.payload, minQoS(qos, m.qos), true, props)
+		_ = c.DeliverPublish(m.topic, m.payload, minQoS(qos, m.qos), true, props)
 	}
 }
 
@@ -1247,16 +1218,16 @@ func (b *Broker) expiryInterval(remaining time.Duration) uint32 {
 // whose connection is long gone brings the context its scheduler captured
 // instead (see will.go). Retained state is written here, before routing: a
 // Dispatcher decides where an accepted publication goes, not what is retained.
-func (b *Broker) publish(from origin, ev PublishEvent, props mqtt.Properties) PublishResult {
-	ctx := from.ctx
-	ev.ConnectionID = from.connID
-	ev.ClientID = from.clientID
-	if !b.checkACL(ctx, SessionInfo{ClientID: from.clientID, Username: from.username}, ev.Topic, AclPublish) {
+func (b *Broker) publish(from conn.Origin, ev PublishEvent, props mqtt.Properties) PublishResult {
+	ctx := from.Context
+	ev.ConnectionID = from.ConnID
+	ev.ClientID = from.ClientID
+	if !b.checkACL(ctx, SessionInfo{ClientID: from.ClientID, Username: from.Username}, ev.Topic, AclPublish) {
 		b.metrics().RecordDroppedMessage("acl_publish")
 		return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 	}
 	for _, it := range b.exts().interceptors {
-		if !it.fn.OnPublish(ctx, from.clientID, ev.Topic, ev.Payload, ev.QoS) {
+		if !it.fn.OnPublish(ctx, from.ClientID, ev.Topic, ev.Payload, ev.QoS) {
 			b.metrics().RecordDroppedMessage("interceptor")
 			return PublishResult{Disposition: PublishRejected, ReasonCode: ReasonNotAuthorized}
 		}
@@ -1287,19 +1258,19 @@ func (b *Broker) publish(from origin, ev PublishEvent, props mqtt.Properties) Pu
 	// Retain is stored only for accepted publishes: a rejected message must not
 	// become the retained value new subscribers receive.
 	if ev.Retain {
-		b.storeRetained(from.namespace, ev.Topic, ev.Payload, ev.QoS, props)
+		b.storeRetained(from.Namespace, ev.Topic, ev.Payload, ev.QoS, props)
 	}
 	b.metrics().IncrementPublishedMessages()
 
 	pub := Publication{
-		Namespace:        from.namespace,
+		Namespace:        from.Namespace,
 		Topic:            ev.Topic,
 		Payload:          ev.Payload,
 		QoS:              ev.QoS,
 		Retain:           ev.Retain,
 		Dup:              ev.Dup,
-		FromClientID:     from.clientID,
-		FromConnectionID: string(from.connID),
+		FromClientID:     from.ClientID,
+		FromConnectionID: string(from.ConnID),
 		Props:            ev.Properties,
 		props:            props,
 		propsSet:         true,
@@ -1314,13 +1285,6 @@ func (b *Broker) publish(from origin, ev PublishEvent, props mqtt.Properties) Pu
 // hands in its own (client.origin), and a will that outlived its connection hands
 // in the one captured when it was scheduled, because the connection context is
 // cancelled by then.
-type origin struct {
-	ctx       context.Context
-	clientID  string
-	connID    ConnectionID
-	username  string
-	namespace string
-}
 
 // checkACL runs the ACL hook of an authorization decision under Config.AuthTimeout.
 // An expired call is a denial: a client whose ACL cannot answer in time is not
@@ -1803,7 +1767,7 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 	c := b.clients[key]
 	var incumbent time.Time
 	if c != nil {
-		incumbent = c.connectedAt
+		incumbent = c.ConnectedAt()
 	}
 	b.mu.RUnlock()
 
@@ -1830,7 +1794,7 @@ func (b *Broker) OnRemoteKick(msg ClusterMessage) {
 	if c != nil {
 		// The displaced connection's teardown drops the routing entry and the
 		// presence claim of this node (see unregister).
-		c.displace()
+		c.Displace()
 		return
 	}
 	// No connection here holds the id. A stored session of this node stays behind
@@ -2008,12 +1972,6 @@ func minQoS(a, b byte) byte {
 		return a
 	}
 	return b
-}
-
-func randomID() string {
-	buf := make([]byte, 8)
-	_, _ = rand.Read(buf)
-	return "gmqx-" + hex.EncodeToString(buf)
 }
 
 // rateLimiter is a simple token bucket used for connection rate limiting.

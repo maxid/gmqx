@@ -1,4 +1,4 @@
-package server
+package conn
 
 // Outbound QoS 1/2 delivery
 //
@@ -59,9 +59,9 @@ import (
 
 	"github.com/maxid/gnety/codec/mqtt"
 
-	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	ns "github.com/maxid/gmqx/internal/namespace"
 	"github.com/maxid/gmqx/routing"
-	sessionstate "github.com/maxid/gmqx/session"
+	"github.com/maxid/gmqx/session"
 )
 
 var (
@@ -107,24 +107,24 @@ const (
 
 // inflightStage is the projection of a live exchange's stage into the form a
 // session carries across a disconnect.
-func inflightStage(state inflightState) sessionstate.InflightStage {
+func inflightStage(state inflightState) session.InflightStage {
 	switch state {
 	case awaitPubrec:
-		return sessionstate.InflightAwaitPubrec
+		return session.InflightAwaitPubrec
 	case awaitPubcomp:
-		return sessionstate.InflightAwaitPubcomp
+		return session.InflightAwaitPubcomp
 	default:
-		return sessionstate.InflightAwaitPuback
+		return session.InflightAwaitPuback
 	}
 }
 
 // liveInflightState is the inverse of inflightStage. session.State normalises an
 // unknown stored stage to InflightAwaitPuback, so the default is only a guard.
-func liveInflightState(stage sessionstate.InflightStage) inflightState {
+func liveInflightState(stage session.InflightStage) inflightState {
 	switch stage {
-	case sessionstate.InflightAwaitPubrec:
+	case session.InflightAwaitPubrec:
 		return awaitPubrec
-	case sessionstate.InflightAwaitPubcomp:
+	case session.InflightAwaitPubcomp:
 		return awaitPubcomp
 	default:
 		return awaitPuback
@@ -183,7 +183,7 @@ func retryDelay(base time.Duration, attempt int) time.Duration {
 // nextPacketIDLocked reserves the next packet id no inflight exchange of this
 // connection holds, so a retransmission can never collide with a new message. It
 // reports false when every one of the 65535 ids is in use. The caller holds c.mu.
-func (c *client) nextPacketIDLocked() (uint16, bool) {
+func (c *Client) nextPacketIDLocked() (uint16, bool) {
 	for i := 0; i < 65536; i++ {
 		c.outPID++
 		if c.outPID == 0 {
@@ -198,18 +198,18 @@ func (c *client) nextPacketIDLocked() (uint16, bool) {
 }
 
 // inflightLimit is the configured window of qos; zero or less means unlimited.
-func (c *client) inflightLimit(qos byte) int {
+func (c *Client) inflightLimit(qos byte) int {
 	if qos == 2 {
-		return c.broker.cfg.MaxInflightQoS2
+		return c.host.Limits().MaxInflightQoS2
 	}
-	return c.broker.cfg.MaxInflightQoS1
+	return c.host.Limits().MaxInflightQoS1
 }
 
 // clientReceiveMaximum is the MQTT 5 Receive Maximum of this connection: how many
 // QoS 1/2 PUBLISHes may be outstanding toward the client at once. The absent
 // property means the protocol default 65535, which the handshake already folded
 // into the field.
-func (c *client) clientReceiveMaximum() int {
+func (c *Client) clientReceiveMaximum() int {
 	if c.receiveMaximum == 0 {
 		return maxReceiveMaximum
 	}
@@ -219,8 +219,8 @@ func (c *client) clientReceiveMaximum() int {
 // inflightQueueLimit is how many deliveries of this connection may wait for a
 // free inflight slot. It is always bounded: a non-positive configuration (or a
 // broker built without the Config defaulting) selects the documented default.
-func (c *client) inflightQueueLimit() int {
-	if limit := c.broker.cfg.MaxInflightQueueSize; limit > 0 {
+func (c *Client) inflightQueueLimit() int {
+	if limit := c.host.Limits().MaxInflightQueueSize; limit > 0 {
 		return limit
 	}
 	return defaultMaxInflightQueueSize
@@ -228,7 +228,7 @@ func (c *client) inflightQueueLimit() int {
 
 // addInflightLocked registers an outbound exchange and keeps the window counters
 // in step with the map. The caller holds c.mu.
-func (c *client) addInflightLocked(id uint16, m *inflightMessage) {
+func (c *Client) addInflightLocked(id uint16, m *inflightMessage) {
 	c.inflight[id] = m
 	switch m.qos {
 	case 1:
@@ -243,7 +243,7 @@ func (c *client) addInflightLocked(id uint16, m *inflightMessage) {
 
 // deleteInflightLocked removes an outbound exchange and keeps the window counters
 // in step. It reports whether the entry was there. The caller holds c.mu.
-func (c *client) deleteInflightLocked(id uint16) bool {
+func (c *Client) deleteInflightLocked(id uint16) bool {
 	m, ok := c.inflight[id]
 	if !ok {
 		return false
@@ -264,7 +264,7 @@ func (c *client) deleteInflightLocked(id uint16) bool {
 // confirmInflightLocked marks a QoS 2 exchange as confirmed by its PUBREC: the
 // PUBREL that follows is a separate exchange and no longer occupies the client's
 // Receive Maximum. The caller holds c.mu.
-func (c *client) confirmInflightLocked(m *inflightMessage) {
+func (c *Client) confirmInflightLocked(m *inflightMessage) {
 	if m.state == awaitPubcomp {
 		return
 	}
@@ -284,7 +284,7 @@ func (c *client) confirmInflightLocked(m *inflightMessage) {
 // Both answers come from the counters addInflightLocked/deleteInflightLocked
 // maintain, not from a scan of the inflight table: this runs once per delivery,
 // under the connection lock every publisher writing to the connection shares.
-func (c *client) windowFullLocked(qos byte) bool {
+func (c *Client) windowFullLocked(qos byte) bool {
 	if limit := c.inflightLimit(qos); limit > 0 {
 		if qos == 2 {
 			if c.inflightQoS2 >= limit {
@@ -299,25 +299,25 @@ func (c *client) windowFullLocked(qos byte) bool {
 
 // receiveMaximumFullLocked reports whether another QoS 1/2 PUBLISH would exceed
 // the Receive Maximum the client announced. The caller holds c.mu.
-func (c *client) receiveMaximumFullLocked() bool {
+func (c *Client) receiveMaximumFullLocked() bool {
 	limit := c.clientReceiveMaximum()
 	return limit < maxReceiveMaximum && c.inflightUnconfirmed >= limit
 }
 
 // inboundWindowFullLocked reports whether another inbound QoS 1/2 exchange would
-// exceed the broker's receive maximum (see Broker.receiveMaximum). The inbound
+// exceed the broker's receive maximum (see Host.Limits). The inbound
 // QoS 2 exchanges still waiting for their PUBREL are the ones that occupy the
 // window; a QoS 1 publish is acknowledged as soon as it is accepted, so it never
 // holds a slot. The caller holds c.mu.
-func (c *client) inboundWindowFullLocked() bool {
-	limit := c.broker.receiveMaximum()
+func (c *Client) inboundWindowFullLocked() bool {
+	limit := c.host.Limits().ReceiveMaximum
 	return limit > 0 && len(c.inboundQoS2) >= limit
 }
 
 // wakeRetransmitter asks the connection's retransmission timer to recompute its
 // deadline. The channel is buffered and the send never blocks, so it is safe from
 // any goroutine a delivery comes from.
-func (c *client) wakeRetransmitter() {
+func (c *Client) wakeRetransmitter() {
 	select {
 	case c.retryWake <- struct{}{}:
 	default:
@@ -326,7 +326,7 @@ func (c *client) wakeRetransmitter() {
 
 // startRetransmitter starts the connection's single retransmission timer. It is
 // called once, from the handshake, after the CONNACK has been written.
-func (c *client) startRetransmitter() {
+func (c *Client) startRetransmitter() {
 	go c.retransmitLoop()
 }
 
@@ -341,7 +341,7 @@ func (c *client) startRetransmitter() {
 // Waking the loop per delivery cost a goroutine wakeup, a scan of the whole
 // inflight table and a fresh time.Timer, all under the connection lock the
 // delivery path contends on.
-func (c *client) retransmitLoop() {
+func (c *Client) retransmitLoop() {
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	var armed time.Time
@@ -391,7 +391,7 @@ func (c *client) retransmitLoop() {
 // nextRetransmitDeadline is the earliest scheduled retransmission of the table,
 // and whether there is one. It records the answer in retryAt, which is what lets
 // a new exchange decide whether the sleeping loop has to be woken.
-func (c *client) nextRetransmitDeadline() (time.Time, bool) {
+func (c *Client) nextRetransmitDeadline() (time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var earliest time.Time
@@ -418,9 +418,9 @@ func (c *client) nextRetransmitDeadline() (time.Time, bool) {
 // its packet id stays reserved until the client confirms it or the connection
 // ends, which is what keeps a late confirmation from being mistaken for the
 // confirmation of a newer message.
-func (c *client) retransmitDue() {
+func (c *Client) retransmitDue() {
 	now := time.Now()
-	maxRetries := c.broker.cfg.QoSMaxRetries
+	maxRetries := c.host.Limits().QoSMaxRetries
 	var batch []inflightResend
 	exhausted := 0
 
@@ -450,12 +450,12 @@ func (c *client) retransmitDue() {
 			state:    m.state,
 			retain:   m.retain,
 		})
-		m.due = now.Add(retryDelay(c.broker.cfg.QoSRetryInterval, m.attempts))
+		m.due = now.Add(retryDelay(c.host.Limits().QoSRetryInterval, m.attempts))
 	}
 	c.mu.Unlock()
 
 	for i := 0; i < exhausted; i++ {
-		c.broker.metrics().RecordDroppedMessage("retry_exhausted")
+		c.host.Metrics().RecordDroppedMessage("retry_exhausted")
 	}
 	c.resendInflight(batch)
 }
@@ -481,7 +481,7 @@ type inflightResend struct {
 // A packet the client's Maximum Packet Size forbids can never be delivered, so the
 // exchange is given up instead of being retried forever: the packet id is released
 // (the drop itself was counted by enqueue) and the queue behind the window moves on.
-func (c *client) resendInflight(batch []inflightResend) {
+func (c *Client) resendInflight(batch []inflightResend) {
 	for _, r := range batch {
 		var err error
 		if r.state == awaitPubcomp {
@@ -530,7 +530,7 @@ func (c *client) resendInflight(batch []inflightResend) {
 // connection and §4.4 requires the retransmission under the original packet ids.
 // The new value applies to new deliveries, which wait in the inflight queue, not
 // to the completion of an exchange that is already in flight.
-func (c *client) resumeInflight() {
+func (c *Client) resumeInflight() {
 	c.mu.Lock()
 	batch := c.restoredBatchLocked()
 	c.mu.Unlock()
@@ -546,7 +546,7 @@ func (c *client) resumeInflight() {
 // DUP set (the Windows CI failure that led to this split).
 //
 // The caller holds c.mu.
-func (c *client) restoredBatchLocked() []inflightResend {
+func (c *Client) restoredBatchLocked() []inflightResend {
 	ids := c.restoredInflight
 	c.restoredInflight = nil
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
@@ -575,7 +575,7 @@ func (c *client) restoredBatchLocked() []inflightResend {
 // acknowledgement can never arrive for an unknown packet id. A QoS 1/2 message
 // that finds no free packet id is downgraded to QoS 0 and delivered rather than
 // dropped, which is also what the reference broker does when its ids run out.
-func (c *client) writePublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
+func (c *Client) writePublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.writeClosed.Load() {
@@ -587,14 +587,14 @@ func (c *client) writePublish(topic string, payload []byte, qos byte, retain boo
 // writePublishLocked is writePublish with the connection lock already held, so the
 // window check and the registration of the exchange are one step and a delivery
 // can never slip past a window that is full. The caller holds c.mu.
-func (c *client) writePublishLocked(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
+func (c *Client) writePublishLocked(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	packetID := uint16(0)
 	var registered *inflightMessage
 	if qos > 0 {
 		id, ok := c.nextPacketIDLocked()
 		if !ok {
 			qos = 0
-			c.broker.metrics().RecordOverflow("packet_ids")
+			c.host.Metrics().RecordOverflow("packet_ids")
 		} else {
 			packetID = id
 			registered = &inflightMessage{
@@ -609,8 +609,8 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 			if qos == 2 {
 				registered.state = awaitPubrec
 			}
-			if c.broker.cfg.QoSMaxRetries >= 0 {
-				registered.due = time.Now().Add(c.broker.cfg.QoSRetryInterval)
+			if c.host.Limits().QoSMaxRetries >= 0 {
+				registered.due = time.Now().Add(c.host.Limits().QoSRetryInterval)
 			}
 			c.addInflightLocked(id, registered)
 		}
@@ -653,7 +653,7 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 //     session is taken offline — the socket is closed, exactly as it is for a lost
 //     connection, so the read loop unwinds and unregister stores the session —
 //     and everything the connection still owed is stored with it (see
-//     Broker.absorbPendingLocked). The next CONNECT of that client id resumes the
+//     conn.Handoff). The next CONNECT of that client id resumes the
 //     session and drains the queue. Taking the session offline is counted with
 //     Metrics.RecordOverflow("inflight_overflow") and logged at Warn level with
 //     the client id and the reason "inflight_overflow"; nothing is dropped, so no
@@ -669,7 +669,7 @@ func (c *client) writePublishLocked(topic string, payload []byte, qos byte, reta
 // stored, are queued for it through the offline path the broker already has
 // (handoffStored), so a publisher that holds a target of a connection that just
 // went away loses nothing and never observes an error.
-func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
+func (c *Client) sendPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	c.mu.Lock()
 	switch c.handoff {
 	case handoffCollecting:
@@ -683,12 +683,12 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 		// The session is stored (or now belongs to another connection): the delivery
 		// is queued exactly like one that arrives while the session is offline,
 		// which may find the client already reconnected and deliver it live.
-		key := namespaceKey(c.namespace, c.id)
+		key := ns.Key(c.namespace, c.id)
 		clientID := c.id
 		c.mu.Unlock()
-		c.broker.enqueueOffline(
+		c.host.EnqueueOffline(
 			routing.OfflineTarget(clientID, key, qos, retain),
-			deliveryPublication(topic, payload, qos, retain, props), props)
+			Message{Topic: topic, Payload: payload, QoS: qos, Retain: retain, Props: props})
 		return nil
 	}
 	// writeClosed also covers a connection that is closing, whose socket failed or
@@ -713,8 +713,8 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 		// A clean session trades durability for statelessness: there is no queue to
 		// keep the delivery in, so it is dropped — visibly, and never silently.
 		c.mu.Unlock()
-		c.broker.metrics().RecordDroppedMessage("inflight_overflow_clean")
-		c.broker.metrics().RecordOverflow("inflight")
+		c.host.Metrics().RecordDroppedMessage("inflight_overflow_clean")
+		c.host.Metrics().RecordOverflow("inflight")
 		c.warn("gmqx dropped a delivery at a full inflight queue of a clean session",
 			"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow_clean",
 			"qos", qos, "topic", topic, "queue", limit)
@@ -727,7 +727,7 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 	c.collectLocked(pendingMessage{topic: topic, payload: payload, qos: qos, retain: retain, props: props})
 	c.handoff = handoffCollecting
 	c.mu.Unlock()
-	c.broker.metrics().RecordOverflow("inflight_overflow")
+	c.host.Metrics().RecordOverflow("inflight_overflow")
 	c.warn("gmqx taking a session offline at a full inflight queue",
 		"client", c.id, "connection", string(c.connID), "reason", "inflight_overflow",
 		"qos", qos, "topic", topic, "queue", limit)
@@ -743,22 +743,22 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 // drops ("offline_queue_full"). A deployment that disabled the cap still gets the
 // inflight queue's own bound, because a connection that is being taken offline
 // must not grow without one. The caller holds c.mu.
-func (c *client) collectLocked(m pendingMessage) {
+func (c *Client) collectLocked(m pendingMessage) {
 	c.pending = append(c.pending, m)
 	limit := c.collectLimit()
 	if len(c.pending) > limit {
 		dropped := len(c.pending) - limit
 		c.pending = c.pending[dropped:]
 		for i := 0; i < dropped; i++ {
-			c.broker.metrics().RecordDroppedMessage("offline_queue_full")
+			c.host.Metrics().RecordDroppedMessage("offline_queue_full")
 		}
 	}
 }
 
 // collectLimit is how many deliveries may wait in the pending queue while the
 // session is handed over to its offline queue.
-func (c *client) collectLimit() int {
-	if limit := c.broker.cfg.MaxOfflineQueueSize; limit > 0 {
+func (c *Client) collectLimit() int {
+	if limit := c.host.Limits().MaxOfflineQueueSize; limit > 0 {
 		return max(limit, c.inflightQueueLimit())
 	}
 	return c.inflightQueueLimit()
@@ -767,29 +767,14 @@ func (c *client) collectLimit() int {
 // closeOverflowed ends a connection whose session is being taken offline because
 // its inflight queue is full. It is the teardown of a lost connection: the socket
 // is closed, the read loop unwinds and the connection's serve goroutine runs the
-// normal unregister, which stores the session (see Broker.unregister). Nothing is
+// normal unregister, which stores the session (see Host.Unregister). Nothing is
 // written first on purpose — a client that stopped reading cannot receive a
 // DISCONNECT, and the publishing goroutine must not wait for one to be written; it
 // is the hang-up the client reconnects from, and the session queue, not the
 // connection, is where the messages are.
-func (c *client) closeOverflowed() {
+func (c *Client) closeOverflowed() {
 	c.writeClosed.Store(true)
 	_ = c.conn.Close()
-}
-
-// deliveryPublication rebuilds the Publication an outbound delivery came from, so
-// a session that has just been stored can be queued for through the offline path
-// (Broker.enqueueOffline) — the same path a publication that arrives while the
-// session is offline takes. The property block is re-encoded exactly as the live
-// delivery carried it, subscription identifiers included.
-func deliveryPublication(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) Publication {
-	wire, err := mqtt5.EncodePropertyBlock(props)
-	if err != nil {
-		// The typed properties are still valid; only their wire form is lost, which
-		// is what a delivery with an unencodable block degrades to.
-		wire = nil
-	}
-	return Publication{Topic: topic, Payload: payload, QoS: qos, Retain: retain, Props: wire}
 }
 
 // drainPendingLocked sends the queued deliveries whose window has room, in the
@@ -809,7 +794,7 @@ func deliveryPublication(topic string, payload []byte, qos byte, retain bool, pr
 // the client's Maximum Packet Size forbids is the one exception: it can never be
 // delivered, it was counted when it was queued, and it is skipped so it cannot
 // wedge the queue.
-func (c *client) drainPendingLocked() {
+func (c *Client) drainPendingLocked() {
 	if c.handoff != handoffNone {
 		return
 	}
@@ -833,7 +818,7 @@ func (c *client) drainPendingLocked() {
 // handlePuback completes an outbound QoS 1 exchange: the packet id is free again,
 // no retransmission follows, and the queue of deliveries that waited for the
 // window moves on.
-func (c *client) handlePuback(m *mqtt.Puback) {
+func (c *Client) handlePuback(m *mqtt.Puback) {
 	c.mu.Lock()
 	if entry, ok := c.inflight[m.PacketID]; ok && entry.state == awaitPuback {
 		c.deleteInflightLocked(m.PacketID)
@@ -846,7 +831,7 @@ func (c *client) handlePuback(m *mqtt.Puback) {
 // the broker answers with PUBREL and the retransmission timer now repeats that
 // PUBREL until PUBCOMP. A PUBREC with a reason code of 0x80 or above ends the
 // exchange without a PUBREL (MQTT 5).
-func (c *client) handlePubrec(m *mqtt.Pubrec) {
+func (c *Client) handlePubrec(m *mqtt.Pubrec) {
 	c.mu.Lock()
 	entry, ok := c.inflight[m.PacketID]
 	if !ok || entry.state != awaitPubrec {
@@ -860,9 +845,9 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 		return
 	}
 	c.confirmInflightLocked(entry)
-	if c.broker.cfg.QoSMaxRetries >= 0 {
+	if c.host.Limits().QoSMaxRetries >= 0 {
 		entry.attempts = 0
-		entry.due = time.Now().Add(c.broker.cfg.QoSRetryInterval)
+		entry.due = time.Now().Add(c.host.Limits().QoSRetryInterval)
 	} else {
 		entry.due = time.Time{}
 	}
@@ -874,7 +859,7 @@ func (c *client) handlePubrec(m *mqtt.Pubrec) {
 
 // handlePubcomp completes an outbound QoS 2 exchange and frees its packet id,
 // which also lets the queue of waiting deliveries move on.
-func (c *client) handlePubcomp(m *mqtt.Pubcomp) {
+func (c *Client) handlePubcomp(m *mqtt.Pubcomp) {
 	c.mu.Lock()
 	if entry, ok := c.inflight[m.PacketID]; ok && entry.state == awaitPubcomp {
 		c.deleteInflightLocked(m.PacketID)
@@ -893,7 +878,7 @@ func (c *client) handlePubcomp(m *mqtt.Pubcomp) {
 // degradation the reference broker applies when its packet ids run out. If a write
 // fails the message goes back to the head of the queue, and the connection's
 // unregister stores the queue again for the next CONNECT.
-func (c *client) drainOfflineQueue() {
+func (c *Client) drainOfflineQueue() {
 	for {
 		c.mu.Lock()
 		if c.closed || len(c.queue) == 0 {
@@ -911,7 +896,7 @@ func (c *client) drainOfflineQueue() {
 			c.mu.Unlock()
 			if full {
 				qos = 0
-				c.broker.metrics().RecordOverflow("inflight")
+				c.host.Metrics().RecordOverflow("inflight")
 			}
 		}
 		if err := c.writePublish(msg.Topic, msg.Payload, qos, msg.Retain, msg.Props); err != nil {
@@ -922,7 +907,7 @@ func (c *client) drainOfflineQueue() {
 				continue
 			}
 			c.mu.Lock()
-			c.queue = append([]sessionstate.Pending{msg}, c.queue...)
+			c.queue = append([]session.Pending{msg}, c.queue...)
 			c.mu.Unlock()
 			return
 		}

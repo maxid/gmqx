@@ -1,10 +1,22 @@
-package server
+package conn
+
+// The connection
+//
+// One Client is one physical connection to the broker, from the CONNECT to the
+// socket closing. It owns the wire: the read loop and its reusable buffers, the
+// write-behind queue and its writer goroutine, the outbound QoS 1/2 window with one
+// retransmission timer, and the teardown that hands the session back. It does not
+// own the broker: every decision that is not protocol — who this client is, what
+// its limits are, whether it may publish, where its session goes — is a Host call
+// (see host.go).
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,9 +30,34 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 	"github.com/maxid/gnety/codec/wire"
 
+	"github.com/maxid/gmqx/hook"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
-	sessionstate "github.com/maxid/gmqx/session"
+	"github.com/maxid/gmqx/session"
+)
+
+// The connect-refusal errors a host returns and the connection maps onto MQTT
+// reason codes. They are defined here because both sides compare against the same
+// value, and the broker (gmqx/server) re-exports them so a consumer still checks
+// gmqx.ErrClientIDInUse.
+var (
+	// ErrUnauthorized is returned when authentication fails.
+	ErrUnauthorized = errors.New("gmqx: unauthorized")
+	// ErrBadAuthMethod is returned by a CONNECT that names an MQTT 5 Authentication
+	// Method the broker does not support.
+	ErrBadAuthMethod = errors.New("gmqx: bad authentication method")
+	// ErrMalformedPacket indicates an invalid MQTT packet.
+	ErrMalformedPacket = mqtt.ErrMalformedPacket
+	// ErrUnsupportedProtocol indicates a CONNECT whose protocol name or level the
+	// broker does not speak.
+	ErrUnsupportedProtocol = errors.New("gmqx: unsupported protocol level")
+	// ErrClientIDInUse is returned in ConnectModeUnique when the client id exists.
+	ErrClientIDInUse = errors.New("gmqx: client id already in use")
+	// ErrMaxConnections is returned when the configured connection limit is reached.
+	ErrMaxConnections = errors.New("gmqx: max connections reached")
+	// ErrTakeoverRateExceeded is returned when a CONNECT would displace a connection
+	// that is still inside the NotKickSeconds anti-flap window.
+	ErrTakeoverRateExceeded = errors.New("gmqx: takeover inside the NotKickSeconds window")
 )
 
 var (
@@ -32,8 +69,8 @@ var (
 	errSlowConsumer = errors.New("gmqx: slow consumer disconnected")
 )
 
-type client struct {
-	broker *Broker
+type Client struct {
+	host   Host
 	conn   net.Conn
 	connID ConnectionID
 	r      *bufio.Reader
@@ -68,7 +105,7 @@ type client struct {
 	// namespace is the broker's isolation scope, fixed for the connection.
 	namespace string
 	// connCtx is the cancellable context of the connection. ctx is connCtx with
-	// ConnInfo attached: it is what every hook of this connection receives. Both
+	// hook.ConnInfo attached: it is what every hook of this connection receives. Both
 	// are written during the handshake, before the client is registered.
 	connCtx context.Context
 	ctx     context.Context
@@ -80,12 +117,12 @@ type client struct {
 
 	mu   sync.Mutex
 	id   string
-	info ConnectInfo
+	info hook.ConnectInfo
 	// connectedAt is when the session of this connection was registered. It is
 	// the reference point of the anti-flap window of a takeover
-	// (Config.NotKickSeconds): written and read under Broker.mu, never under c.mu.
+	// (Config.NotKickSeconds): written and read under the broker lock, never under c.mu.
 	connectedAt    time.Time
-	subs           map[string]sessionstate.Subscription
+	subs           map[string]session.Subscription
 	keepAlive      time.Duration
 	closed         bool
 	closeErr       error
@@ -98,7 +135,7 @@ type client struct {
 	// kicked is set when a peer's connect-time kick ended this connection:
 	// another node accepted the same client id, so the client itself is live
 	// elsewhere and this node must stop claiming its presence, even when its
-	// persistent session stays stored here (see Broker.unregister).
+	// persistent session stays stored here (see Host.Unregister).
 	kicked       bool
 	inboundQoS2  map[uint16]struct{}
 	topicAliases map[uint16]string
@@ -136,7 +173,7 @@ type client struct {
 	// a slot, bounded by Config.MaxInflightQueueSize. It is a live-connection
 	// queue, unlike the session queue below, and it ends with the connection —
 	// except for a persistent session, whose pending deliveries move into the
-	// session queue when the connection goes away (see Broker.absorbPendingLocked).
+	// session queue when the connection goes away (see conn.Handoff).
 	pending []pendingMessage
 	// handoff says where a persistent session of this connection stands while it
 	// moves to its offline queue. A delivery that arrives in that window waits in
@@ -148,7 +185,7 @@ type client struct {
 	// connection between register (which takes it from the store) and unregister
 	// (which stores what a failed drain left behind). Filled and read on the
 	// connection's goroutine only.
-	queue []sessionstate.Pending
+	queue []session.Pending
 
 	// readBuf is this connection's inbound PUBLISH buffer: the topic bytes and the
 	// payload of the packet being handled are slices of it, so a packet costs no
@@ -193,23 +230,23 @@ type client struct {
 	authData []byte
 }
 
-func newClient(b *Broker, conn net.Conn) *client {
-	connCtx, cancel := context.WithCancel(b.lifecycleContext())
-	queueSize := b.cfg.MaxOutboundQueueSize
+func New(h Host, netConn net.Conn) *Client {
+	connCtx, cancel := context.WithCancel(h.LifecycleContext())
+	queueSize := h.Limits().MaxOutboundQueueSize
 	if queueSize <= 0 {
 		queueSize = defaultMaxOutboundQueueSize
 	}
-	return &client{
-		broker:       b,
-		namespace:    b.namespace,
+	return &Client{
+		host:         h,
+		namespace:    h.Namespace(),
 		connCtx:      connCtx,
 		ctx:          connCtx,
 		cancel:       cancel,
 		parentCancel: cancel,
 		connID:       nextConnectionID(),
-		conn:         conn,
-		r:            bufio.NewReaderSize(conn, 4096),
-		subs:         make(map[string]sessionstate.Subscription),
+		conn:         netConn,
+		r:            bufio.NewReaderSize(netConn, 4096),
+		subs:         make(map[string]session.Subscription),
 		inboundQoS2:  make(map[uint16]struct{}),
 		topicAliases: make(map[uint16]string),
 		inflight:     make(map[uint16]*inflightMessage),
@@ -222,35 +259,35 @@ func newClient(b *Broker, conn net.Conn) *client {
 }
 
 // context returns the connection-scoped context every hook of this connection
-// receives. It carries ConnInfo and is cancelled by stopContext when the
+// receives. It carries hook.ConnInfo and is cancelled by stopContext when the
 // connection ends. It is never nil.
-func (c *client) context() context.Context { return c.ctx }
+func (c *Client) context() context.Context { return c.ctx }
 
 // attachConnectContext builds the connection context from the parsed CONNECT:
-// the optional Config.ConnContext hook enriches it once, and ConnInfo is attached
+// the optional Config.ConnContext hook enriches it once, and hook.ConnInfo is attached
 // so every hook can identify the connection without a thread-local request
 // scope. The context it creates is cancelled by stopContext, even when the hook
 // returns a context that is not derived from the one it was given.
-func (c *client) attachConnectContext(info ConnectInfo) {
+func (c *Client) attachConnectContext(info hook.ConnectInfo) {
 	ctx := c.connCtx
-	if hook := c.broker.cfg.ConnContext; hook != nil {
+	if hook := c.host.Limits().ConnContext; hook != nil {
 		if enriched := hook(ctx, info); enriched != nil {
 			enrichedCtx, cancel := context.WithCancel(enriched)
 			c.connCtx, c.cancel = enrichedCtx, cancel
 			ctx = enrichedCtx
 		}
 	}
-	c.ctx = ContextWithConn(ctx, c.connInfo(info))
+	c.ctx = hook.ContextWithConn(ctx, c.connInfo(info))
 }
 
-// setConnInfo refreshes the ConnInfo value after the broker assigned a client
+// setConnInfo refreshes the hook.ConnInfo value after the broker assigned a client
 // id. The connection context itself, and therefore its cancellation, is kept.
-func (c *client) setConnInfo(info ConnectInfo) {
-	c.ctx = ContextWithConn(c.connCtx, c.connInfo(info))
+func (c *Client) setConnInfo(info hook.ConnectInfo) {
+	c.ctx = hook.ContextWithConn(c.connCtx, c.connInfo(info))
 }
 
-func (c *client) connInfo(info ConnectInfo) ConnInfo {
-	return ConnInfo{
+func (c *Client) connInfo(info hook.ConnectInfo) hook.ConnInfo {
+	return hook.ConnInfo{
 		ClientID:        info.ClientID,
 		ConnectionID:    string(c.connID),
 		Namespace:       c.namespace,
@@ -264,7 +301,8 @@ func (c *client) connInfo(info ConnectInfo) ConnInfo {
 // and serve calls it again when its goroutine ends, so the cancellation happens
 // even for a connection that never got past the handshake. It is safe to call
 // more than once.
-func (c *client) stopContext() {
+// StopContext cancels the connection context. It is safe to call more than once.
+func (c *Client) StopContext() {
 	c.stopOnce.Do(func() {
 		c.parentCancel()
 		c.cancel()
@@ -275,7 +313,7 @@ func (c *client) stopContext() {
 // MQTT 3.1.1 keys it off Clean Session; MQTT 5 keys it off Clean Start plus a
 // non-zero Session Expiry Interval (the absent property means 0, so the session
 // ends with the connection).
-func (c *client) persistentSession() bool {
+func (c *Client) persistentSession() bool {
 	if c.info.CleanSession {
 		return false
 	}
@@ -288,17 +326,34 @@ func (c *client) persistentSession() bool {
 // resumesSession reports whether a CONNECT asks to resume existing state. A
 // zero Session Expiry Interval does not prevent resuming: it only means the
 // session ends again when this connection closes.
-func (c *client) resumesSession() bool { return !c.info.CleanSession }
+func (c *Client) resumesSession() bool { return !c.info.CleanSession }
 
 // header is the protocol level every packet this client sends carries.
-func (c *client) header() mqtt.MessageHeader {
+// SessionExpiryDeadline is the deadline the broker enforces for the session this
+// connection leaves behind, and the one its own expiry sweeper compares against.
+//
+// MQTT 3.1.1 has no Session Expiry Interval, so its persistent sessions keep the
+// previous behavior and never expire (the zero time). MQTT 5 stamps
+// now + Session Expiry Interval; a zero interval does not reach this point
+// because such a session is not persistent at all — the session ends with the
+// connection, which is also why a CONNECT with a zero interval can resume a
+// stored session but never creates one. The interval is counted in the broker's
+// protocol second (Config.unit), which is time.Second outside the tests.
+func (c *Client) SessionExpiryDeadline() time.Time {
+	if c.version != mqtt.Version5 || c.info.SessionExpiry == 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(c.info.SessionExpiry) * c.host.Second())
+}
+
+func (c *Client) header() mqtt.MessageHeader {
 	return mqtt.MessageHeader{Level: c.version}
 }
 
 // readMessage reads and decodes one control packet. The typed codec owns the
 // wire format, so gmqx never branches on a fixed-header byte.
-func (c *client) readMessage() (mqtt.Message, error) {
-	d := mqtt.Decoder{Version: c.version, MaxPacketSize: c.broker.cfg.MaxPacketSize}
+func (c *Client) readMessage() (mqtt.Message, error) {
+	d := mqtt.Decoder{Version: c.version, MaxPacketSize: c.host.Limits().MaxPacketSize}
 	return d.Decode(c.r)
 }
 
@@ -306,8 +361,8 @@ func (c *client) readMessage() (mqtt.Message, error) {
 // topic and the payload of the packet cost no allocation. ErrNotPublish means
 // the next packet is something else: the call consumed nothing and readMessage
 // reads it.
-func (c *client) readPublish() (mqtt.PublishView, error) {
-	view, err := mqtt.ReadPublishInto(c.r, c.version, c.broker.cfg.MaxPacketSize, c.readBuf)
+func (c *Client) readPublish() (mqtt.PublishView, error) {
+	view, err := mqtt.ReadPublishInto(c.r, c.version, c.host.Limits().MaxPacketSize, c.readBuf)
 	if err != nil {
 		return mqtt.PublishView{}, err
 	}
@@ -320,7 +375,7 @@ func (c *client) readPublish() (mqtt.PublishView, error) {
 // and the terminal server DISCONNECT use it: both must be on the wire before the
 // connection is closed, and neither may wait behind a queued delivery. Every
 // other packet goes through enqueue.
-func (c *client) writeMessage(m mqtt.Message) error {
+func (c *Client) writeMessage(m mqtt.Message) error {
 	if err := c.checkPacketSize(m); err != nil {
 		return err
 	}
@@ -330,7 +385,7 @@ func (c *client) writeMessage(m mqtt.Message) error {
 // writeMessageUnchecked writes a packet whose size was already checked: the writer
 // goroutine checks once, when the packet enters the queue (enqueue), and must not
 // encode it a second time just to measure it again.
-func (c *client) writeMessageUnchecked(m mqtt.Message) error {
+func (c *Client) writeMessageUnchecked(m mqtt.Message) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return c.writeLocked(m)
@@ -371,7 +426,7 @@ func encodedPacketSize(m mqtt.Message) (int, error) {
 // subscribed to is visible instead of silently starved. A client that announced no
 // limit (the common case) pays nothing: the size is only computed when a limit
 // exists.
-func (c *client) checkPacketSize(m mqtt.Message) error {
+func (c *Client) checkPacketSize(m mqtt.Message) error {
 	limit := c.maxPacketSize
 	if limit == 0 || m == nil {
 		return nil
@@ -384,7 +439,7 @@ func (c *client) checkPacketSize(m mqtt.Message) error {
 	if uint32(size) <= limit {
 		return nil
 	}
-	c.broker.metrics().RecordDroppedMessage("max_packet_size_too_large")
+	c.host.Metrics().RecordDroppedMessage("max_packet_size_too_large")
 	c.warn("gmqx dropped a packet over the client maximum packet size",
 		"client", c.id, "connection", string(c.connID), "packet", m.Type(),
 		"size", size, "limit", limit, "reason", "max_packet_size_too_large")
@@ -393,7 +448,7 @@ func (c *client) checkPacketSize(m mqtt.Message) error {
 
 // writeAckSync writes one acknowledgement frame directly, for the window before
 // the writer goroutine exists (see enqueue).
-func (c *client) writeAckSync(kind uint8, pid uint16) error {
+func (c *Client) writeAckSync(kind uint8, pid uint16) error {
 	var frame [ackFrameLen]byte
 	buf := appendAck(frame[:0], kind, pid)
 	_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout()))
@@ -406,7 +461,7 @@ func (c *client) writeAckSync(kind uint8, pid uint16) error {
 // writeLocked writes one packet with the connection's write deadline applied.
 // The caller holds wmu, which is what keeps the writer goroutine and a
 // synchronous write from interleaving on the socket.
-func (c *client) writeLocked(m mqtt.Message) error {
+func (c *Client) writeLocked(m mqtt.Message) error {
 	// A transport without write-deadline support is still usable; the deadline is
 	// the guard against a wedged peer, not a requirement of the protocol.
 	_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout()))
@@ -416,8 +471,8 @@ func (c *client) writeLocked(m mqtt.Message) error {
 // writeTimeout is the write deadline of one packet: Config.WriteTimeout, or the
 // documented default when the broker was built without the config defaulting
 // (New applies it, a bare Broker literal may not).
-func (c *client) writeTimeout() time.Duration {
-	if timeout := c.broker.cfg.WriteTimeout; timeout > 0 {
+func (c *Client) writeTimeout() time.Duration {
+	if timeout := c.host.Limits().WriteTimeout; timeout > 0 {
 		return timeout
 	}
 	return defaultWriteTimeout
@@ -464,7 +519,7 @@ const ackFrameLen = 4
 // connection is written by that goroutine, in the order the packets were queued,
 // so no caller — the publisher's read loop, a will publish, the cluster receive
 // goroutine — ever waits on this socket.
-func (c *client) startWriter() {
+func (c *Client) startWriter() {
 	c.writerMu.Lock()
 	if c.writerStarted || c.writerStopped {
 		c.writerMu.Unlock()
@@ -479,7 +534,8 @@ func (c *client) startWriter() {
 // stopWriter ends the writer goroutine and waits for it to return, so a closed
 // connection leaves no goroutine behind and Stop means every write is over. It
 // is safe to call more than once and safe to call before startWriter.
-func (c *client) stopWriter() {
+// StopWriter ends the writer goroutine and joins it. It is safe to call more than once.
+func (c *Client) StopWriter() {
 	c.writerMu.Lock()
 	if c.writerStopped {
 		c.writerMu.Unlock()
@@ -518,7 +574,7 @@ const (
 // A write that fails (a closed socket, an expired write deadline, a peer that
 // reset the connection) ends the connection: close then runs on the read
 // goroutine, which is what publishes the will and unregisters the session.
-func (c *client) writeLoop() {
+func (c *Client) writeLoop() {
 	defer close(c.writerDone)
 	batch := writeBatch{}
 	batch.frame.buf = make([]byte, 0, writeBatchInitial)
@@ -592,7 +648,7 @@ func (b *appendBuffer) Reset() { b.buf = b.buf[:0] }
 // writer may continue. It refuses to work once writeClosed is set: the connection
 // is closing (or was displaced), a server DISCONNECT may already be on the wire
 // and it has to be the last packet, so the rest of the queue is not written.
-func (c *client) appendOutbound(batch *writeBatch, p outboundPacket) bool {
+func (c *Client) appendOutbound(batch *writeBatch, p outboundPacket) bool {
 	if c.writeClosed.Load() {
 		return false
 	}
@@ -618,7 +674,7 @@ func appendAck(dst []byte, kind uint8, pid uint16) []byte {
 
 // flushBatch writes the encoded batch with one socket write, under the
 // connection's write deadline and wmu, and resets the batch for the next one.
-func (c *client) flushBatch(batch *writeBatch) error {
+func (c *Client) flushBatch(batch *writeBatch) error {
 	if batch.frame.Len() == 0 {
 		return nil
 	}
@@ -635,15 +691,15 @@ func (c *client) flushBatch(batch *writeBatch) error {
 // writeFailed ends a connection whose socket write failed. It never calls close:
 // closing the socket is enough to make the read goroutine return and run the
 // connection teardown, which joins this goroutine.
-func (c *client) writeFailed(err error) {
+func (c *Client) writeFailed(err error) {
 	c.writeClosed.Store(true)
 	switch {
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		c.warn("gmqx write deadline exceeded, closing connection",
 			"client", c.id, "connection", string(c.connID), "remote", c.remoteAddr(),
 			"timeout", c.writeTimeout())
-	case c.broker.log != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe):
-		c.broker.log.Debug("gmqx connection write failed",
+	case c.host.Logger() != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe):
+		c.host.Logger().Debug("gmqx connection write failed",
 			"client", c.id, "connection", string(c.connID), "remote", c.remoteAddr(), "err", err)
 	}
 	_ = c.conn.Close()
@@ -651,7 +707,7 @@ func (c *client) writeFailed(err error) {
 
 // remoteAddr is the peer address of the connection, "" when the transport has
 // none. It is immutable for the life of the connection.
-func (c *client) remoteAddr() string {
+func (c *Client) remoteAddr() string {
 	if addr := c.conn.RemoteAddr(); addr != nil {
 		return addr.String()
 	}
@@ -660,9 +716,9 @@ func (c *client) remoteAddr() string {
 
 // warn logs at Warn level. A broker built without Config.Logger (only tests do
 // that) has no logger, and a delivery guard must not panic there.
-func (c *client) warn(msg string, args ...any) {
-	if c.broker.log != nil {
-		c.broker.log.Warn(msg, args...)
+func (c *Client) warn(msg string, args ...any) {
+	if c.host.Logger() != nil {
+		c.host.Logger().Warn(msg, args...)
 	}
 }
 
@@ -688,7 +744,7 @@ func (c *client) warn(msg string, args ...any) {
 // packets that do not travel through the queue are the CONNACK (before the writer
 // exists) and a server DISCONNECT (the last packet of the connection, written
 // before close).
-func (c *client) enqueue(p outboundPacket) error {
+func (c *Client) enqueue(p outboundPacket) error {
 	if c.writeClosed.Load() {
 		return errClientClosed
 	}
@@ -711,9 +767,9 @@ func (c *client) enqueue(p outboundPacket) error {
 		return nil
 	default:
 	}
-	c.broker.metrics().RecordOverflow("outbound_queue")
+	c.host.Metrics().RecordOverflow("outbound_queue")
 	if p.droppable {
-		c.broker.metrics().RecordDroppedMessage("outbound_queue_full")
+		c.host.Metrics().RecordDroppedMessage("outbound_queue_full")
 		return errOutboundQueueFull
 	}
 	c.dropSlowConsumer()
@@ -722,7 +778,7 @@ func (c *client) enqueue(p outboundPacket) error {
 
 // send queues one packet that must not be dropped: an acknowledgement, a
 // PINGRESP, a SUBACK, a retransmission. A full queue disconnects the connection.
-func (c *client) send(m mqtt.Message) error {
+func (c *Client) send(m mqtt.Message) error {
 	return c.enqueue(outboundPacket{msg: m})
 }
 
@@ -730,12 +786,12 @@ func (c *client) send(m mqtt.Message) error {
 // reason code and no properties. It is the hot acknowledgement path (one per
 // inbound QoS 1 publish and two per inbound QoS 2 publish) and it allocates
 // nothing: the writer encodes the four-byte frame from the packet id.
-func (c *client) enqueueAck(kind uint8, pid uint16) error {
+func (c *Client) enqueueAck(kind uint8, pid uint16) error {
 	if limit := c.maxPacketSize; limit != 0 && limit < ackFrameLen {
 		// The client's Maximum Packet Size forbids even an acknowledgement. The
 		// packet is dropped and counted, exactly like every other oversize packet
 		// (see checkPacketSize); the connection stays usable.
-		c.broker.metrics().RecordDroppedMessage("max_packet_size_too_large")
+		c.host.Metrics().RecordDroppedMessage("max_packet_size_too_large")
 		c.warn("gmqx dropped a packet over the client maximum packet size",
 			"client", c.id, "connection", string(c.connID), "packet", ackType(kind),
 			"size", ackFrameLen, "limit", limit, "reason", "max_packet_size_too_large")
@@ -759,7 +815,7 @@ func ackType(kind uint8) byte {
 
 // sendPublishFrame queues one PUBLISH. A QoS 0 PUBLISH is the one packet a full
 // queue may discard; a QoS 1/2 one disconnects the slow consumer instead.
-func (c *client) sendPublishFrame(m *mqtt.Publish) error {
+func (c *Client) sendPublishFrame(m *mqtt.Publish) error {
 	return c.enqueue(outboundPacket{msg: m, droppable: m.QoS == 0})
 }
 
@@ -768,9 +824,9 @@ func (c *client) sendPublishFrame(m *mqtt.Publish) error {
 // closing the socket makes the read goroutine run the normal teardown, which
 // publishes the will (the connection did not end in an orderly DISCONNECT) and
 // unregisters the session.
-func (c *client) dropSlowConsumer() {
+func (c *Client) dropSlowConsumer() {
 	c.slowOnce.Do(func() {
-		c.broker.metrics().RecordDroppedMessage("slow_consumer")
+		c.host.Metrics().RecordDroppedMessage("slow_consumer")
 		c.warn("gmqx disconnecting slow consumer",
 			"client", c.id, "connection", string(c.connID), "remote", c.remoteAddr(),
 			"reason", "slow_consumer", "queue", cap(c.outq))
@@ -786,8 +842,8 @@ func (c *client) dropSlowConsumer() {
 // a 3.1 body is rewritten to its 3.1.1 spelling and decoded by the codec like
 // any other packet. v31 reports that the client asked for 3.1, which only the
 // client-id rule cares about.
-func (c *client) readConnect() (connect *mqtt.Connect, v31 bool, err error) {
-	header, body, err := mqtt.ReadPacket(c.r, c.broker.cfg.MaxPacketSize)
+func (c *Client) readConnect() (connect *mqtt.Connect, v31 bool, err error) {
+	header, body, err := mqtt.ReadPacket(c.r, c.host.Limits().MaxPacketSize)
 	if err != nil {
 		return nil, false, err
 	}
@@ -797,7 +853,7 @@ func (c *client) readConnect() (connect *mqtt.Connect, v31 bool, err error) {
 	body, v31 = normalizeV31Connect(body)
 	frame := mqtt.AppendRemainingLength([]byte{header}, len(body))
 	frame = append(frame, body...)
-	d := mqtt.Decoder{MaxPacketSize: c.broker.cfg.MaxPacketSize}
+	d := mqtt.Decoder{MaxPacketSize: c.host.Limits().MaxPacketSize}
 	msg, err := d.Decode(bufio.NewReader(bytes.NewReader(frame)))
 	if err != nil {
 		return nil, false, connectError(err)
@@ -837,12 +893,12 @@ func connectError(err error) error {
 	return err
 }
 
-// connectInfo maps a decoded CONNECT onto the public ConnectInfo the SPI sees.
+// connectInfo maps a decoded CONNECT onto the public hook.ConnectInfo the SPI sees.
 // The MQTT 5 authentication properties travel with it: AuthMethod selects the
 // enhanced-authentication path and AuthData is the client's first exchange
 // message.
-func connectInfo(m *mqtt.Connect) ConnectInfo {
-	info := ConnectInfo{
+func connectInfo(m *mqtt.Connect) hook.ConnectInfo {
+	info := hook.ConnectInfo{
 		ClientID:      string(m.ClientID),
 		Username:      string(m.Username),
 		Password:      m.Password,
@@ -859,12 +915,15 @@ func connectInfo(m *mqtt.Connect) ConnectInfo {
 	return info
 }
 
-func (c *client) handshake() error {
+// Handshake runs the CONNECT exchange up to the point the connection is ready to
+// serve: it reads and validates the CONNECT, authenticates, registers the session
+// and writes the CONNACK.
+func (c *Client) Handshake() error {
 	// The CONNECT phase runs under its own read deadline: a socket that is opened
 	// and then says nothing must not hold a connection slot, a goroutine and a
 	// session until the peer goes away. The read loop replaces this deadline with
 	// the keep-alive one as soon as the handshake is through.
-	_ = c.conn.SetReadDeadline(time.Now().Add(c.broker.connectTimeout()))
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.host.Limits().ConnectTimeout))
 	connect, v31, err := c.readConnect()
 	if err != nil {
 		return err
@@ -884,11 +943,11 @@ func (c *client) handshake() error {
 	case info.AuthMethod != "":
 		// MQTT 5 enhanced authentication: the exchange is the authentication of
 		// this connection, so AuthManager.Authenticate is skipped for it (see
-		// AuthExchange). The whole exchange runs inside the CONNECT read deadline,
+		// hook.AuthExchange). The whole exchange runs inside the CONNECT read deadline,
 		// and each call into it is bounded by Config.AuthTimeout.
-		exchange := c.broker.authExchange(info.AuthMethod)
+		exchange := c.host.AuthExchange(info.AuthMethod)
 		if exchange == nil {
-			c.broker.metrics().RecordDroppedMessage("auth_method")
+			c.host.Metrics().RecordDroppedMessage("auth_method")
 			_ = c.writeConnack(connackBadAuthMethod(c.version), "")
 			return fmt.Errorf("%w: %q", ErrBadAuthMethod, info.AuthMethod)
 		}
@@ -908,7 +967,7 @@ func (c *client) handshake() error {
 		c.authMethod = info.AuthMethod
 		c.authData = step.Data
 	default:
-		if err := c.broker.authenticate(c.context(), info); err != nil {
+		if err := c.host.Authenticate(c.context(), info); err != nil {
 			_ = c.writeConnack(connackNotAuthorized(c.version), "")
 			return fmt.Errorf("%w: %v", ErrUnauthorized, err)
 		}
@@ -919,7 +978,7 @@ func (c *client) handshake() error {
 			_ = c.writeConnack(connackClientIDInvalid(c.version), "")
 			return fmt.Errorf("%w: empty client id is not allowed", ErrMalformedPacket)
 		}
-		info.ClientID = randomID()
+		info.ClientID = RandomID()
 		assigned = info.ClientID
 	}
 	if v31 && len(info.ClientID) > 23 {
@@ -958,10 +1017,10 @@ func (c *client) handshake() error {
 		c.will = &will
 	}
 	c.mu.Unlock()
-	// The client id can be assigned by the broker, so ConnInfo is refreshed with
+	// The client id can be assigned by the broker, so hook.ConnInfo is refreshed with
 	// the final identity before anything else observes the connection.
 	c.setConnInfo(info)
-	if err := c.broker.register(c); err != nil {
+	if err := c.host.Register(c); err != nil {
 		code := byte(5)
 		switch {
 		case errors.Is(err, ErrClientIDInUse):
@@ -994,7 +1053,9 @@ func (c *client) handshake() error {
 	return nil
 }
 
-func (c *client) loop() {
+// Loop serves the connection until it ends: it reads packets, dispatches them and
+// runs the teardown.
+func (c *Client) Loop() {
 	for {
 		deadline := time.Time{}
 		c.mu.Lock()
@@ -1041,8 +1102,8 @@ func (c *client) loop() {
 			c.handleUnsubscribe(m)
 		case *mqtt.Pingreq:
 			_ = c.send(&mqtt.Pingresp{MessageHeader: c.header()})
-			if c.broker.cfg.Sink != nil {
-				c.broker.cfg.Sink.OnPing(c.context(), c.id)
+			if sink := c.host.Sink(); sink != nil {
+				sink.OnPing(c.context(), c.id)
 			}
 		case *mqtt.Disconnect:
 			// A DISCONNECT with reason code 0x04 asks the server to publish the
@@ -1062,7 +1123,7 @@ func (c *client) loop() {
 			// so it is ordered with every other packet of the client.
 			c.handleAuth(m)
 		default:
-			c.broker.log.Debug("gmqx ignoring packet type", "type", msg.Type())
+			c.host.Logger().Debug("gmqx ignoring packet type", "type", msg.Type())
 		}
 	}
 }
@@ -1070,7 +1131,7 @@ func (c *client) loop() {
 // readFailed ends the connection after a read that did not produce a packet: it
 // marks the connection lost (so the will is published), tells an MQTT 5 client why
 // when the error is a protocol violation, and closes.
-func (c *client) readFailed(err error) {
+func (c *Client) readFailed(err error) {
 	c.mu.Lock()
 	c.lost = true
 	c.mu.Unlock()
@@ -1082,7 +1143,7 @@ func (c *client) readFailed(err error) {
 // MQTT 3.1.1 client cannot be told: the protocol has no server DISCONNECT, so
 // the connection is simply closed. Transport errors (a closed connection or an
 // expired keep-alive deadline) are not protocol errors and stay silent.
-func (c *client) failProtocol(err error) {
+func (c *Client) failProtocol(err error) {
 	if c.version != mqtt.Version5 {
 		return
 	}
@@ -1094,7 +1155,7 @@ func (c *client) failProtocol(err error) {
 		reason = 0x95 // Packet too large
 	}
 	if zeroSubscriptionIdentifier(err) {
-		reason = ReasonProtocolError
+		reason = hook.ReasonProtocolError
 	}
 	c.sendDisconnect(reason)
 }
@@ -1110,14 +1171,14 @@ func zeroSubscriptionIdentifier(err error) bool {
 
 // protocolError answers an MQTT 5 protocol violation with a DISCONNECT and ends
 // the connection. MQTT 3.1.1 closes the connection without a packet.
-func (c *client) protocolError(reason byte) {
+func (c *Client) protocolError(reason byte) {
 	if c.version == mqtt.Version5 {
 		c.sendDisconnect(reason)
 	}
 	c.close(true)
 }
 
-func (c *client) sendDisconnect(reason byte) {
+func (c *Client) sendDisconnect(reason byte) {
 	// The DISCONNECT is the last packet of the connection and close follows it
 	// immediately, so it is written synchronously (under the write deadline)
 	// instead of being queued behind deliveries that will never be sent.
@@ -1127,7 +1188,7 @@ func (c *client) sendDisconnect(reason byte) {
 // handlePubrel releases an inbound QoS 2 publish: the client waits for the
 // PUBCOMP before it reuses the packet id. Completing the flow forgets the packet
 // id, so the next PUBLISH that reuses it is delivered as a new message.
-func (c *client) handlePubrel(m *mqtt.Pubrel) {
+func (c *Client) handlePubrel(m *mqtt.Pubrel) {
 	c.mu.Lock()
 	delete(c.inboundQoS2, m.PacketID)
 	c.mu.Unlock()
@@ -1142,8 +1203,8 @@ func (c *client) handlePubrel(m *mqtt.Pubrel) {
 // them — the topic name becomes a string (which is what routing indexes on) and
 // the MQTT 5 properties are already owned by the view — so the payload the
 // publication is given is the one copy this path makes: see the call to
-// Broker.publish.
-func (c *client) handlePublish(v mqtt.PublishView) {
+// Host.Publish.
+func (c *Client) handlePublish(v mqtt.PublishView) {
 	topic := string(v.Topic)
 	var props mqtt.Properties
 	if v.Properties != nil {
@@ -1209,9 +1270,9 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 			// message is not delivered and the packet id is not remembered; MQTT 3.1.1
 			// has no reason code, so the PUBLISH is left unacknowledged and the client
 			// retries (the same rule the broker applies to a publish it cannot accept).
-			c.broker.receiveMaxFull(topic)
+			c.host.ReceiveMaxFull(topic)
 			if c.version == mqtt.Version5 {
-				_ = c.writePublishAck(2, v.PacketID, ReasonQuotaExceeded)
+				_ = c.writePublishAck(2, v.PacketID, hook.ReasonQuotaExceeded)
 			}
 			return
 		}
@@ -1229,14 +1290,14 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 		full := c.inboundWindowFullLocked()
 		c.mu.Unlock()
 		if full {
-			c.broker.receiveMaxFull(topic)
+			c.host.ReceiveMaxFull(topic)
 			return
 		}
 	}
 	// This is where the payload stops being a view of the read buffer and becomes
 	// an owned publication, and it is the only place the broker copies it: every
 	// consumer below may read it after this connection has read the next packet —
-	// the ACL, the interceptors and the EventSink (which a configured
+	// the ACL, the interceptors and the hook.EventSink (which a configured
 	// Config.PublishCallbackTimeout calls on its own goroutine, so a shared buffer
 	// would be a data race and not merely a stale read), the retained store, the
 	// offline queue of a persistent session, the cluster spread, and the writer
@@ -1246,7 +1307,7 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 	// — an unknown topic alias, a wildcard topic name, a full inbound window — is
 	// never copied at all.
 	payload := bytes.Clone(v.Payload)
-	res := c.broker.publish(c.origin(), PublishEvent{
+	res := c.host.Publish(c.origin(), hook.PublishEvent{
 		ConnectionID: c.connID,
 		ClientID:     c.id,
 		Topic:        topic,
@@ -1274,19 +1335,19 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 // things the routing table needs from a live connection, and nothing else. They are
 // exported on an unexported type on purpose — the interface is what gmqx/routing
 // names, while the connection state machine stays in the engine.
-func (c *client) ClientID() string { return c.id }
+func (c *Client) ClientID() string { return c.id }
 
 // ConnectionID implements routing.Endpoint.
-func (c *client) ConnectionID() ConnectionID { return c.connID }
+func (c *Client) ConnectionID() ConnectionID { return c.connID }
 
 // DeliverPublish implements routing.Endpoint by writing (or, when its hand-off
 // window has begun, queueing) one PUBLISH with the delivery rules of this
 // connection.
-func (c *client) DeliverPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
+func (c *Client) DeliverPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
 	return c.sendPublish(topic, payload, qos, retain, props)
 }
 
-func (c *client) handleSubscribe(m *mqtt.Subscribe) {
+func (c *Client) handleSubscribe(m *mqtt.Subscribe) {
 	// Subscription Identifiers are accepted: the CONNACK this connection was
 	// admitted with advertises Subscription Identifier Available 1 (props.go). A
 	// value of 0 is a Protocol Error (§3.8.2.1.2) and ends the connection; the
@@ -1294,17 +1355,17 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 	// deliveries that subscription causes (subscription_id.go).
 	ids, dropped, ok := mqtt5.NormalizeSubscriptionIDs(m.Properties.SubscriptionIdentifiers)
 	if !ok {
-		c.broker.metrics().RecordDroppedMessage("subscription_identifier")
-		c.protocolError(ReasonProtocolError)
+		c.host.Metrics().RecordDroppedMessage("subscription_identifier")
+		c.protocolError(hook.ReasonProtocolError)
 		return
 	}
 	if dropped > 0 {
-		c.broker.metrics().RecordDroppedMessage("subscription_identifier_limit")
+		c.host.Metrics().RecordDroppedMessage("subscription_identifier_limit")
 	}
 	codes := make([]byte, 0, len(m.Subscriptions))
 	existed := make([]bool, 0, len(m.Subscriptions))
 	for _, req := range m.Subscriptions {
-		sub := sessionstate.Subscription{
+		sub := session.Subscription{
 			QoS:               req.QoS,
 			NoLocal:           req.NoLocal,
 			RetainAsPublished: req.RetainAsPublished,
@@ -1323,7 +1384,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 					c.protocolError(0)
 					return
 				}
-				c.broker.metrics().RecordDroppedMessage("shared_subscription")
+				c.host.Metrics().RecordDroppedMessage("shared_subscription")
 				codes = append(codes, 0x8f)
 				existed = append(existed, false)
 				continue
@@ -1341,7 +1402,7 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 			existed = append(existed, false)
 			continue
 		}
-		code, had := c.broker.subscribe(c, req.Filter, sub)
+		code, had := c.host.Subscribe(c, req.Filter, sub)
 		codes = append(codes, code)
 		existed = append(existed, had)
 	}
@@ -1364,16 +1425,16 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 		if _, isShared, _ := topicmatch.ParseSharedFilter(req.Filter); isShared {
 			continue
 		}
-		c.broker.sendRetained(c, req.Filter, req.QoS, req.RetainAsPublished, ids)
+		c.host.SendRetained(c, req.Filter, req.QoS, req.RetainAsPublished, ids)
 	}
 }
 
-func (c *client) handleUnsubscribe(m *mqtt.Unsubscribe) {
+func (c *Client) handleUnsubscribe(m *mqtt.Unsubscribe) {
 	// MQTT 5 answers with one reason code per filter, all Success: a filter that
 	// was not subscribed is a no-op for this broker. MQTT 3.1.1 carries none.
 	codes := make([]byte, len(m.Filters))
 	for i, filter := range m.Filters {
-		c.broker.unsubscribe(c, filter)
+		c.host.Unsubscribe(c, filter)
 		codes[i] = 0
 	}
 	_ = c.send(&mqtt.Unsuback{
@@ -1383,19 +1444,19 @@ func (c *client) handleUnsubscribe(m *mqtt.Unsubscribe) {
 	})
 }
 
-func (c *client) writeConnack(code byte, assignedClientID string) error {
+func (c *Client) writeConnack(code byte, assignedClientID string) error {
 	ack := &mqtt.Connack{MessageHeader: c.header(), ReasonCode: code}
 	if code == 0 {
 		ack.SessionPresent = c.sessionPresent
 	}
 	if c.version == mqtt.Version5 && code == 0 {
-		ack.Properties = mqtt5.ConnackProperties(assignedClientID, uint32(c.broker.cfg.MaxPacketSize),
-			uint16(c.broker.receiveMaximum()), c.authMethod, c.authData)
+		ack.Properties = mqtt5.ConnackProperties(assignedClientID, uint32(c.host.Limits().MaxPacketSize),
+			uint16(c.host.Limits().ReceiveMaximum), c.authMethod, c.authData)
 	}
 	return c.writeMessage(ack)
 }
 
-func (c *client) close(withWill bool) {
+func (c *Client) close(withWill bool) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -1405,7 +1466,7 @@ func (c *client) close(withWill bool) {
 	// A persistent session outlives this connection, so the deliveries it still
 	// owes its inflight window are not lost with it: they wait in pending from here
 	// on and unregister moves them into the session queue (see
-	// Broker.absorbPendingLocked). A clean session keeps the previous behavior —
+	// conn.Handoff and the host's queue limits). A clean session keeps the previous behavior —
 	// its state ends with the connection.
 	if c.handoff == handoffNone && c.persistentSession() {
 		c.handoff = handoffCollecting
@@ -1419,7 +1480,7 @@ func (c *client) close(withWill bool) {
 	}
 	c.mu.Unlock()
 	_ = c.conn.Close()
-	if will != nil && c.broker != nil {
+	if will != nil && c.host != nil {
 		// The will is published right away, or scheduled when the client asked
 		// for a Will Delay Interval (MQTT 5); see will.go for when the delay is
 		// cut short or cancelled.
@@ -1428,11 +1489,11 @@ func (c *client) close(withWill bool) {
 	// The will exchange above still runs on a live connection context; once the
 	// connection is gone, every later observer (the disconnect hooks) sees the
 	// cancelled context.
-	c.stopContext()
+	c.StopContext()
 	// The writer goroutine is joined last: closing the socket above already ends a
 	// write in progress, and this makes close mean "no write of this connection is
 	// still running".
-	c.stopWriter()
+	c.StopWriter()
 }
 
 // displace ends this connection because another CONNECT took its session over.
@@ -1446,13 +1507,13 @@ func (c *client) close(withWill bool) {
 // connection. The write (and close) is bounded by Config.WriteTimeout, whether
 // the caller is the handshake of the new connection or the cluster receive
 // goroutine.
-func (c *client) displace() {
+func (c *Client) displace() {
 	c.mu.Lock()
 	c.kicked = true
 	c.mu.Unlock()
 	c.writeClosed.Store(true)
 	if c.version == mqtt.Version5 {
-		c.sendDisconnect(ReasonSessionTakenOver)
+		c.sendDisconnect(hook.ReasonSessionTakenOver)
 	}
 	c.close(false)
 }
@@ -1486,7 +1547,7 @@ func connackNotAuthorized(version byte) byte {
 // authentication.
 func connackBadAuthMethod(version byte) byte {
 	if version == mqtt.Version5 {
-		return ReasonBadAuthMethod
+		return hook.ReasonBadAuthMethod
 	}
 	return 5
 }
@@ -1495,7 +1556,7 @@ func connackBadAuthMethod(version byte) byte {
 // before the connection is admitted (MQTT 5 §3.2.2.2: 0x82 Protocol Error).
 func connackProtocolError(version byte) byte {
 	if version == mqtt.Version5 {
-		return ReasonProtocolError
+		return hook.ReasonProtocolError
 	}
 	return 5
 }
@@ -1531,7 +1592,7 @@ func connackQuotaExceeded(version byte) byte {
 // connection is unavailable right now, and the client may retry.
 func connackRateExceeded(version byte) byte {
 	if version == mqtt.Version5 {
-		return ReasonConnectionRateExceeded
+		return hook.ReasonConnectionRateExceeded
 	}
 	return 3
 }
@@ -1540,17 +1601,17 @@ func connackRateExceeded(version byte) byte {
 // gets no success ACK: MQTT 3.1.1 has no negative PUBACK, and an optimistic ACK
 // would claim durability the broker does not have. MQTT 5 clients get the reason
 // code instead.
-func (c *client) ackPublish(qos byte, pid uint16, res PublishResult) {
+func (c *Client) ackPublish(qos byte, pid uint16, res hook.PublishResult) {
 	if res.Accepted() {
 		_ = c.writePublishAck(qos, pid, 0)
 		return
 	}
 	code := res.ReasonCode
 	if code == 0 {
-		if res.Disposition == PublishRetryable {
-			code = ReasonQuotaExceeded
+		if res.Disposition == hook.PublishRetryable {
+			code = hook.ReasonQuotaExceeded
 		} else {
-			code = ReasonUnspecified
+			code = hook.ReasonUnspecified
 		}
 	}
 	if c.version == mqtt.Version5 {
@@ -1560,7 +1621,7 @@ func (c *client) ackPublish(qos byte, pid uint16, res PublishResult) {
 
 // writePublishAck writes the PUBACK of a QoS 1 publish or the PUBREC of a QoS 2
 // one. The reason code is only encoded on MQTT 5.
-func (c *client) writePublishAck(qos byte, pid uint16, reason byte) error {
+func (c *Client) writePublishAck(qos byte, pid uint16, reason byte) error {
 	if reason == 0 {
 		// The acknowledgement every accepted publish gets: four bytes, no typed
 		// packet and no allocation (see enqueueAck).
@@ -1580,4 +1641,12 @@ var connSeq atomic.Uint64
 // nextConnectionID returns a process-unique connection identifier.
 func nextConnectionID() ConnectionID {
 	return ConnectionID(strconv.FormatUint(connSeq.Add(1), 10))
+}
+
+// RandomID returns a short random identifier, used for a node id and for the
+// client id the broker assigns to an empty CONNECT.
+func RandomID() string {
+	buf := make([]byte, 8)
+	_, _ = rand.Read(buf)
+	return "gmqx-" + hex.EncodeToString(buf)
 }

@@ -22,6 +22,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/maxid/gmqx/conn"
 	"net"
 	"runtime"
 	"strings"
@@ -594,7 +595,7 @@ func TestInflightOverflowLeavesNoGoroutineAndNoWriteAfterClose(t *testing.T) {
 	// Hold on to the broker-side connections: after the hand-off it must be
 	// impossible to write to them.
 	b.mu.RLock()
-	conns := make([]*client, len(ids))
+	conns := make([]*conn.Client, len(ids))
 	for i, id := range ids {
 		conns[i] = b.clients[namespaceKey(b.namespace, id)]
 	}
@@ -624,18 +625,13 @@ func TestInflightOverflowLeavesNoGoroutineAndNoWriteAfterClose(t *testing.T) {
 		if c == nil {
 			t.Fatalf("connection %q was not registered", id)
 		}
-		if !c.writeClosed.Load() {
+		if !c.WritesClosed() {
 			t.Fatalf("connection %q still accepts writes after the hand-off", id)
 		}
-		select {
-		case <-c.writerDone:
-		default:
+		if !c.WriterStopped() {
 			t.Fatalf("the writer goroutine of %q is still running after the hand-off", id)
 		}
-		c.mu.Lock()
-		left := len(c.pending)
-		c.mu.Unlock()
-		if left != 0 {
+		if left := c.PendingDepth(); left != 0 {
 			t.Fatalf("connection %q still holds %d pending deliveries after the hand-off", id, left)
 		}
 	}
