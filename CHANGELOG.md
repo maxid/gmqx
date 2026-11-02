@@ -117,6 +117,20 @@
   re-exported, so `errors.Is`, the error values and the root package's exported API
   are unchanged.
 
+- **`gmqx/server` is the assembly layer, five files.** The last cut of the role
+  split moved the two things that were roles of their own out of the engine: the
+  byte-rate shaper is `gmqx/conn`'s (it wraps one connection's `net.Conn`; the
+  broker keeps the per-listener settings and the broker-wide buckets and calls
+  `conn.Shape`), and everything that was a facet of the Broker — the `conn.Host`
+  implementation, the session bookkeeping, the pending-will map and its timers,
+  the plugin host, the public programming surface with the hook aliases, the
+  session store facade and the auth exchange factory — became sections of
+  `broker.go`; the shared-subscription distribution joined `cluster.go`. The
+  directory now says "assembly" before a file is opened: `broker.go`,
+  `cluster.go`, `config.go`, `errors.go`, `doc.go`. No behavior changes; the root
+  package's exported API is byte-identical (`go doc -all`), and `ByteRateMetrics`
+  is an alias of conn's identical interface.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,

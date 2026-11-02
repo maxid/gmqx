@@ -51,6 +51,14 @@
   ~4k 行。连接拒绝错误与 `MaxAuthSteps` 随产生它们的代码走并在 server 重新导出，`errors.Is`、错误值
   与根包公开 API 均不变。
 
+- **`gmqx/server` 成为装配层，只剩五个文件。** 角色拆分的最后一刀把两件本就是独立角色的事搬出引擎：
+  字节速率整形归 `gmqx/conn`（它包住的是一条连接的 `net.Conn`；broker 只保留每监听器设置与全局桶，
+  调用 `conn.Shape`）；其余属于 Broker 的各个侧面——`conn.Host` 实现、会话簿记、待发 will 表与定时器、
+  插件宿主、公开编程面与 hook 别名、会话 store 门面、auth exchange 工厂——都成为 `broker.go` 的分节；
+  共享订阅分发并入 `cluster.go`。目录在打开任何文件前就回答“这里是装配层”：`broker.go`、
+  `cluster.go`、`config.go`、`errors.go`、`doc.go`。行为零变化；根包公开 API 逐字节相同
+  （`go doc -all`），`ByteRateMetrics` 是 conn 同名接口的别名。
+
 ### 新增
 
 - `hook.SinkFuncs`：只实现关心的事件；nil 字段跳过，没写 publish 钩子的 sink 表示接受。
