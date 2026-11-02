@@ -8,3 +8,12 @@
 
 # Go build/test cache used in sandboxed environments
 .gocache/
+
+# `go build <pkg>` writes the binary into the current directory, not the package
+# directory (AGENTS.md §6). These are the binaries building this module in place
+# produces; they are never sources.
+/gmqx
+/broker-demo
+/client-demo
+/cluster-node
+/plugin-codec
