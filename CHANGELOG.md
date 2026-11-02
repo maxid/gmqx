@@ -68,6 +68,22 @@
   brokers sharing one Redis land in the same isolation domain by accident. gmqx now
   depends on gns, a leaf library (R15).
 
+- **The live session state lives in `gmqx/session`, not in the engine.**
+  `server/session.go` declared the unexported type `session` next to the store's
+  `SessionState`, and the package it lived in was also called `session` — the
+  same-name debt of `docs/design/source-layout.md` §4.2. The type is now
+  `session.State`: the subscriptions (`session.Subscription`), the queued messages
+  (`session.Pending`), the inbound QoS 2 packet ids and the outbound exchanges as an
+  `Inflight` projection of the persisted fields. `State.Stored` and
+  `StateFromStored` are the single place where typed MQTT 5 properties become the
+  wire blocks a store persists, and they are what
+  `session/state_test.go` pins: the round trip, the packet-id ordering that makes a
+  stored session reproducible, and what a broker refuses to trust from a store it
+  did not write (an exchange that cannot have been a QoS 1/2 PUBLISH, an undecodable
+  property block, an unknown stage). `server/session.go` keeps only the broker side —
+  take, save, sweep and the offline queue's caps — so the stored format, the wire
+  behavior and the public API are unchanged.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,

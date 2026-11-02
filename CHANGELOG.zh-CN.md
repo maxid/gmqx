@@ -21,6 +21,16 @@
   `client` 的方法，路由索引持有 `*client`）。根包把公开类型全部别名导出并转发构造函数，消费方零改动；
   根实现文件降到 8 个（全是门面），`libcheck` 的 gmqx 欠账条目随之删除。`server/` 是落脚点不是终点：
   后续按角色（会话状态、routing、conn）的拆分计划记在 `docs/design/source-layout.md` §4.3。
+- **在线会话状态进了 `gmqx/session`，不再留在引擎里。** `server/session.go` 原来在 store 的
+  `SessionState` 旁边又声明了一个未导出类型 `session`，而它所在的包也叫 `session`——这就是
+  `docs/design/source-layout.md` §4.2 记下的同名债务。该类型现在是 `session.State`：订阅
+  （`session.Subscription`）、离线队列（`session.Pending`）、入站 QoS 2 的 packet id，以及出站
+  exchange 的 `Inflight` 投影。`State.Stored` / `StateFromStored` 是带类型的 MQTT 5 属性与 store
+  所存字节块之间唯一的转换处，`session/state_test.go` 钉住往返、让保存形态可复现的 packet-id 排序，
+  以及 broker 不会盲信非本进程写入的 store 的三件事（不可能是 QoS 1/2 PUBLISH 的 exchange、
+  解不出的属性块、未知 stage）。`server/session.go` 只留 broker 侧（take/save/sweep 与离线队列上限），
+  存储格式、线上行为与公开 API 都不变。
+
 ### 新增
 
 - `hook.SinkFuncs`：只实现关心的事件；nil 字段跳过，没写 publish 钩子的 sink 表示接受。
