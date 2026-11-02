@@ -20,6 +20,7 @@ import (
 
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 var (
@@ -30,20 +31,6 @@ var (
 	// connection's writer queue full: the connection is disconnected instead.
 	errSlowConsumer = errors.New("gmqx: slow consumer disconnected")
 )
-
-// subscription stores MQTT 5 subscription options.
-type subscription struct {
-	qos               byte
-	noLocal           bool
-	retainAsPublished bool
-	retainHandling    byte
-	// subscriptionIDs are the Subscription Identifiers the SUBSCRIBE that created
-	// or modified this subscription carried (at most one per packet, §3.8.2.1.2,
-	// but the field is a slice because it is part of the session state the
-	// SessionStore round-trips). They are attached to every PUBLISH delivered
-	// because of this subscription; see subscription_id.go.
-	subscriptionIDs []uint32
-}
 
 type client struct {
 	broker *Broker
@@ -98,7 +85,7 @@ type client struct {
 	// the reference point of the anti-flap window of a takeover
 	// (Config.NotKickSeconds): written and read under Broker.mu, never under c.mu.
 	connectedAt    time.Time
-	subs           map[string]subscription
+	subs           map[string]sessionstate.Subscription
 	keepAlive      time.Duration
 	closed         bool
 	closeErr       error
@@ -161,7 +148,7 @@ type client struct {
 	// connection between register (which takes it from the store) and unregister
 	// (which stores what a failed drain left behind). Filled and read on the
 	// connection's goroutine only.
-	queue []queuedMessage
+	queue []sessionstate.Pending
 
 	// readBuf is this connection's inbound PUBLISH buffer: the topic bytes and the
 	// payload of the packet being handled are slices of it, so a packet costs no
@@ -222,7 +209,7 @@ func newClient(b *Broker, conn net.Conn) *client {
 		connID:       nextConnectionID(),
 		conn:         conn,
 		r:            bufio.NewReaderSize(conn, 4096),
-		subs:         make(map[string]subscription),
+		subs:         make(map[string]sessionstate.Subscription),
 		inboundQoS2:  make(map[uint16]struct{}),
 		topicAliases: make(map[uint16]string),
 		inflight:     make(map[uint16]*inflightMessage),
@@ -1301,12 +1288,12 @@ func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 	codes := make([]byte, 0, len(m.Subscriptions))
 	existed := make([]bool, 0, len(m.Subscriptions))
 	for _, req := range m.Subscriptions {
-		sub := subscription{
-			qos:               req.QoS,
-			noLocal:           req.NoLocal,
-			retainAsPublished: req.RetainAsPublished,
-			retainHandling:    req.RetainHandling,
-			subscriptionIDs:   ids,
+		sub := sessionstate.Subscription{
+			QoS:               req.QoS,
+			NoLocal:           req.NoLocal,
+			RetainAsPublished: req.RetainAsPublished,
+			RetainHandling:    req.RetainHandling,
+			SubscriptionIDs:   ids,
 		}
 		if _, isShared, wellFormed := topicmatch.ParseSharedFilter(req.Filter); isShared {
 			// A "$share/<shareName>/<filter>" subscription, MQTT 5 §4.8.2. The

@@ -28,6 +28,7 @@ import (
 	ns "github.com/maxid/gmqx/internal/namespace"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
 	retainedstore "github.com/maxid/gmqx/retained"
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 // Broker is a single-node MQTT 3.1.1 broker.
@@ -98,19 +99,6 @@ type Broker struct {
 	// across a publish, so a will timer can publish while a connection connects.
 	wills  map[string]*pendingWill
 	willMu sync.Mutex
-}
-
-// copySubscriptions returns a detached copy of a session's subscription map, so
-// a stored session and a live connection never share one.
-func copySubscriptions(subs map[string]subscription) map[string]subscription {
-	if len(subs) == 0 {
-		return nil
-	}
-	out := make(map[string]subscription, len(subs))
-	for filter, sub := range subs {
-		out[filter] = sub
-	}
-	return out
 }
 
 // Defaults for the delivery limits Config leaves at zero. They are bounded on
@@ -787,7 +775,7 @@ func (b *Broker) serve(conn net.Conn) {
 func (b *Broker) register(c *client) error {
 	key := namespaceKey(b.namespace, c.id)
 	b.mu.Lock()
-	var takeover *session
+	var takeover *sessionstate.State
 	if old, ok := b.clients[key]; ok && old != c {
 		if b.cfg.ConnectMode == ConnectModeUnique {
 			b.mu.Unlock()
@@ -816,12 +804,12 @@ func (b *Broker) register(c *client) error {
 				// gets them now, one that reconnects later takes them from the store.
 				inboundQoS2, inflight := old.snapshotQoS2Locked()
 				b.absorbPendingLocked(old)
-				takeover = &session{
-					clientID:    old.id,
-					subs:        copySubscriptions(old.subs),
-					queue:       old.queue,
-					inboundQoS2: inboundQoS2,
-					inflight:    inflight,
+				takeover = &sessionstate.State{
+					ClientID:    old.id,
+					Subs:        sessionstate.CopySubscriptions(old.subs),
+					Queue:       old.queue,
+					InboundQoS2: inboundQoS2,
+					Inflight:    inflight,
 				}
 				old.queue = nil
 			}
@@ -843,13 +831,13 @@ func (b *Broker) register(c *client) error {
 
 	if c.resumesSession() {
 		if stored, ok := b.takeStoredSession(key); ok {
-			c.subs = stored.subs
-			c.queue = stored.queue
+			c.subs = stored.Subs
+			c.queue = stored.Queue
 			c.restoreQoS2State(stored)
 			c.sessionPresent = true
 		} else if takeover != nil {
-			c.subs = takeover.subs
-			c.queue = takeover.queue
+			c.subs = takeover.Subs
+			c.queue = takeover.Queue
 			c.restoreQoS2State(takeover)
 			c.sessionPresent = true
 		}
@@ -859,7 +847,7 @@ func (b *Broker) register(c *client) error {
 	if c.subs == nil {
 		// A resumed session without subscriptions (or a store that returns none)
 		// must still be able to accept a SUBSCRIBE.
-		c.subs = make(map[string]subscription)
+		c.subs = make(map[string]sessionstate.Subscription)
 	}
 
 	b.clients[key] = c
@@ -1058,7 +1046,7 @@ func (b *Broker) unregister(c *client) {
 	}
 }
 
-func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bool) {
+func (b *Broker) subscribe(c *client, filter string, sub sessionstate.Subscription) (byte, bool) {
 	// A shared subscription is authorized by the filter it delivers: "$share/g/t"
 	// receives the publications of "t", so an ACL that allows "t" allows it and a
 	// rule written for the group name would not be consulted. The full filter is
@@ -1087,7 +1075,7 @@ func (b *Broker) subscribe(c *client, filter string, sub subscription) (byte, bo
 	if !exists {
 		b.subscriptionsChanged()
 	}
-	return sub.qos, exists
+	return sub.QoS, exists
 }
 
 // subscribeFailure maps a subscription refusal onto the protocol level: MQTT 5

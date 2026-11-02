@@ -60,6 +60,7 @@ import (
 
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 // subscriptionIndex is the broker's routing table. See the file comment for the
@@ -120,14 +121,14 @@ type indexedSession struct {
 	expiresAt time.Time
 	// subs is the session's subscription set. It is only read and written while
 	// the index lock is held.
-	subs map[string]subscription
+	subs map[string]sessionstate.Subscription
 }
 
 // routedSubscription is one (filter, session) entry: the subscription that makes
 // the session a target of a publication matching filter.
 type routedSubscription struct {
 	session *indexedSession
-	sub     subscription
+	sub     sessionstate.Subscription
 }
 
 func newSubscriptionIndex() *subscriptionIndex {
@@ -158,7 +159,7 @@ func (idx *subscriptionIndex) bucket(filter string) map[string]*routedSubscripti
 // the session had before. It is called when a connection is registered (which is
 // also where a resumed session takes its stored subscriptions over) and it is the
 // only transition that can turn a stored session into a live one.
-func (idx *subscriptionIndex) setLive(key string, c *client, subs map[string]subscription) {
+func (idx *subscriptionIndex) setLive(key string, c *client, subs map[string]sessionstate.Subscription) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.replaceLocked(&indexedSession{
@@ -166,21 +167,21 @@ func (idx *subscriptionIndex) setLive(key string, c *client, subs map[string]sub
 		clientID: c.id,
 		client:   c,
 		connID:   c.connID,
-		subs:     copySubscriptions(subs),
+		subs:     sessionstate.CopySubscriptions(subs),
 	})
 }
 
 // setStored installs the subscriptions of a stored (offline) session, replacing
 // whatever the session had before. The session is indexed even when it has no
 // filters, so a directed publish can find it and queue the publication.
-func (idx *subscriptionIndex) setStored(key, clientID string, subs map[string]subscription, expiresAt time.Time) {
+func (idx *subscriptionIndex) setStored(key, clientID string, subs map[string]sessionstate.Subscription, expiresAt time.Time) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.replaceLocked(&indexedSession{
 		key:       key,
 		clientID:  clientID,
 		expiresAt: expiresAt,
-		subs:      copySubscriptions(subs),
+		subs:      sessionstate.CopySubscriptions(subs),
 	})
 }
 
@@ -197,7 +198,7 @@ func (idx *subscriptionIndex) remove(key string) {
 // index no longer attributes to the session — one that a take-over displaced — is
 // ignored: the displaced connection's SUBSCRIBE must not steal the routing of the
 // session its replacement now owns.
-func (idx *subscriptionIndex) add(key string, c *client, filter string, sub subscription) {
+func (idx *subscriptionIndex) add(key string, c *client, filter string, sub sessionstate.Subscription) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	s := idx.sessions[key]
@@ -205,7 +206,7 @@ func (idx *subscriptionIndex) add(key string, c *client, filter string, sub subs
 		return
 	}
 	if s.subs == nil {
-		s.subs = make(map[string]subscription, 1)
+		s.subs = make(map[string]sessionstate.Subscription, 1)
 	}
 	s.subs[filter] = sub
 	idx.putLocked(filter, key, &routedSubscription{session: s, sub: sub})
@@ -323,21 +324,21 @@ func (idx *subscriptionIndex) collectTargets(topic string, from ConnectionID, pu
 			// A stored session has no connection, so no-local cannot name one and
 			// never excludes an offline target; a publication without an origin
 			// connection (a remote event, a will) excludes nothing either.
-			if from != "" && rs.sub.noLocal && rs.session.connID == from {
+			if from != "" && rs.sub.NoLocal && rs.session.connID == from {
 				continue
 			}
 			m, ok := matched[rs.session.key]
 			if !ok {
-				matched[rs.session.key] = &match{session: rs.session, qos: rs.sub.qos, rap: rs.sub.retainAsPublished, ids: rs.sub.subscriptionIDs}
+				matched[rs.session.key] = &match{session: rs.session, qos: rs.sub.QoS, rap: rs.sub.RetainAsPublished, ids: rs.sub.SubscriptionIDs}
 				continue
 			}
-			if rs.sub.qos > m.qos {
-				m.qos = rs.sub.qos
+			if rs.sub.QoS > m.qos {
+				m.qos = rs.sub.QoS
 			}
-			if rs.sub.retainAsPublished {
+			if rs.sub.RetainAsPublished {
 				m.rap = true
 			}
-			m.ids = mqtt5.MergeSubscriptionIDs(m.ids, rs.sub.subscriptionIDs)
+			m.ids = mqtt5.MergeSubscriptionIDs(m.ids, rs.sub.SubscriptionIDs)
 		}
 	}
 	for _, m := range matched {
@@ -352,10 +353,10 @@ func (idx *subscriptionIndex) collectTargets(topic string, from ConnectionID, pu
 // same topic, to dst. The caller holds idx.mu for reading.
 func (idx *subscriptionIndex) appendEntries(dst []LocalTarget, now time.Time, entries map[string]*routedSubscription, from ConnectionID, pubQoS byte, pubRetain bool) []LocalTarget {
 	for _, rs := range entries {
-		if from != "" && rs.sub.noLocal && rs.session.connID == from {
+		if from != "" && rs.sub.NoLocal && rs.session.connID == from {
 			continue
 		}
-		if target, ok := rs.session.localTarget(now, pubQoS, pubRetain, rs.sub.qos, rs.sub.retainAsPublished, rs.sub.subscriptionIDs); ok {
+		if target, ok := rs.session.localTarget(now, pubQoS, pubRetain, rs.sub.QoS, rs.sub.RetainAsPublished, rs.sub.SubscriptionIDs); ok {
 			dst = append(dst, target)
 		}
 	}
@@ -403,7 +404,7 @@ func (idx *subscriptionIndex) sharedTarget(group string, pubQoS byte, pubRetain 
 		if rs == nil {
 			continue
 		}
-		if target, ok := rs.session.localTarget(now, pubQoS, pubRetain, rs.sub.qos, rs.sub.retainAsPublished, rs.sub.subscriptionIDs); ok {
+		if target, ok := rs.session.localTarget(now, pubQoS, pubRetain, rs.sub.QoS, rs.sub.RetainAsPublished, rs.sub.SubscriptionIDs); ok {
 			return target, true
 		}
 	}
@@ -565,18 +566,18 @@ func (idx *subscriptionIndex) deleteLocked(filter, key string) {
 }
 
 // indexedSubscriptions converts a stored subscription set into the index's form.
-func indexedSubscriptions(subs map[string]SessionSubscription) map[string]subscription {
+func indexedSubscriptions(subs map[string]SessionSubscription) map[string]sessionstate.Subscription {
 	if len(subs) == 0 {
 		return nil
 	}
-	out := make(map[string]subscription, len(subs))
+	out := make(map[string]sessionstate.Subscription, len(subs))
 	for filter, sub := range subs {
-		out[filter] = subscription{
-			qos:               sub.QoS,
-			noLocal:           sub.NoLocal,
-			retainAsPublished: sub.RetainAsPublished,
-			retainHandling:    sub.RetainHandling,
-			subscriptionIDs:   sub.SubscriptionIdentifiers,
+		out[filter] = sessionstate.Subscription{
+			QoS:               sub.QoS,
+			NoLocal:           sub.NoLocal,
+			RetainAsPublished: sub.RetainAsPublished,
+			RetainHandling:    sub.RetainHandling,
+			SubscriptionIDs:   sub.SubscriptionIdentifiers,
 		}
 	}
 	return out

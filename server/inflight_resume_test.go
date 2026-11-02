@@ -3,6 +3,8 @@ package server
 import (
 	"testing"
 	"time"
+
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 // TestResumeInflightResendsOnlyRestored pins the selection resumeInflight makes.
@@ -20,8 +22,8 @@ func TestResumeInflightResendsOnlyRestored(t *testing.T) {
 
 	// A persistent session whose connection ended with one unconfirmed QoS 1
 	// exchange: restoreQoS2State carries it over.
-	c.restoreQoS2State(&session{inflight: []*inflightMessage{{
-		packetID: 1, qos: 1, topic: "resume/x", payload: []byte("restored"), state: awaitPuback,
+	c.restoreQoS2State(&sessionstate.State{Inflight: []sessionstate.Inflight{{
+		PacketID: 1, QoS: 1, Topic: "resume/x", Payload: []byte("restored"), Stage: sessionstate.InflightAwaitPuback,
 	}}})
 
 	// A delivery that reached this fresh connection after the CONNACK and before

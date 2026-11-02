@@ -1,21 +1,22 @@
 package server
 
-// Persistent-session state
+// Persistent-session bookkeeping
 //
-// A session is the state a client asked the server to keep while it is away:
-// the subscriptions to restore, the messages published to those subscriptions
-// while there was no connection, the QoS 2 state of both directions (the packet ids
-// the client published without releasing them and the outbound exchanges it has not
-// confirmed) and the deadline after which the state ends.
+// The state itself — the subscriptions to restore, the messages queued while the
+// session was offline, the QoS 2 state of both directions and the expiry deadline —
+// lives in gmqx/session (State, with Stored/StateFromStored as the projection to
+// the SessionStore form). This file is the broker side of it: when the state is
+// taken from a store, written back, swept, and how the offline queue and its caps
+// follow it.
 //
-// The broker stores that state only for a session with no live connection. While
-// a connection owns the session its subscriptions live on the client and the
-// client has taken the queued messages over (they drain right after the CONNACK),
-// so the store and Broker.clients never hold the same key at the same time. That
-// invariant is what makes a publication reach an offline session exactly once:
-// LocalTargets reads the offline half, SendLocal re-checks it, and a session that
-// reconnected in between receives the message on its live connection instead of
-// a stale queue.
+// The broker stores a session only when it has no live connection. While a
+// connection owns the session its subscriptions live on the connection and the
+// connection has taken the queued messages over (they drain right after the
+// CONNACK), so the store and Broker.clients never hold the same key at the same
+// time. That invariant is what makes a publication reach an offline session
+// exactly once: LocalTargets reads the offline half, SendLocal re-checks it, and a
+// session that reconnected in between receives the message on its live connection
+// instead of a stale queue.
 //
 // The reference broker of this family also queues for clean sessions; gmqx does
 // not, because a clean session is deleted with its connection and recreated empty
@@ -23,208 +24,21 @@ package server
 // declared it wanted none.
 
 import (
-	"sort"
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
 
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	sessionstate "github.com/maxid/gmqx/session"
 )
-
-// session is the broker's in-memory form of the stored state.
-type session struct {
-	clientID  string
-	subs      map[string]subscription
-	queue     []queuedMessage
-	expiresAt time.Time
-	// inboundQoS2 are the packet ids a client published at QoS 2 whose PUBREL has
-	// not arrived yet; they are handed back to the connection that resumes the
-	// session, so a retransmission is not delivered twice (see
-	// client.restoreQoS2State).
-	inboundQoS2 []uint16
-	// inflight are the outbound exchanges the session never confirmed; the
-	// resumed connection re-sends them under their original packet ids (see
-	// client.resumeInflight).
-	inflight []*inflightMessage
-}
-
-// queuedMessage is one message the broker owed a persistent session while it was
-// offline, with its MQTT 5 properties in typed form (the stored form keeps the
-// property block instead).
-type queuedMessage struct {
-	topic   string
-	payload []byte
-	qos     byte
-	retain  bool
-	props   mqtt.Properties
-}
-
-// sessionState converts the broker's form into the stored form. The QoS 2 state
-// of both directions travels with it: the inbound packet ids the client has not
-// released and the outbound exchanges the client has not confirmed are what makes
-// a reconnect continue the exchanges instead of restarting or losing them. The
-// outbound ones are written in packet-id order, so the stored form of a session is
-// reproducible.
-func sessionState(s *session) SessionState {
-	state := SessionState{ClientID: s.clientID, ExpiresAt: s.expiresAt}
-	if len(s.subs) > 0 {
-		state.Subscriptions = make(map[string]SessionSubscription, len(s.subs))
-		for filter, sub := range s.subs {
-			state.Subscriptions[filter] = SessionSubscription{
-				QoS:               sub.qos,
-				NoLocal:           sub.noLocal,
-				RetainAsPublished: sub.retainAsPublished,
-				RetainHandling:    sub.retainHandling,
-				// The subscription identifier is part of the session state, so a
-				// resumed session keeps tagging its deliveries (subscription_id.go).
-				SubscriptionIdentifiers: append([]uint32(nil), sub.subscriptionIDs...),
-			}
-		}
-	}
-	if len(s.queue) > 0 {
-		state.Queue = make([]QueuedMessage, 0, len(s.queue))
-		for _, msg := range s.queue {
-			props, err := mqtt5.EncodePropertyBlock(msg.props)
-			if err != nil {
-				// A message whose properties cannot be encoded still travels; it
-				// simply carries none, exactly like a will with invalid properties.
-				props = nil
-			}
-			state.Queue = append(state.Queue, QueuedMessage{
-				Topic:   msg.topic,
-				Payload: msg.payload,
-				QoS:     msg.qos,
-				Retain:  msg.retain,
-				Props:   props,
-			})
-		}
-	}
-	if len(s.inboundQoS2) > 0 {
-		state.InboundQoS2 = append([]uint16(nil), s.inboundQoS2...)
-		sort.Slice(state.InboundQoS2, func(i, j int) bool { return state.InboundQoS2[i] < state.InboundQoS2[j] })
-	}
-	if len(s.inflight) > 0 {
-		state.Inflight = make([]SessionInflight, 0, len(s.inflight))
-		for _, m := range s.inflight {
-			props, err := mqtt5.EncodePropertyBlock(m.props)
-			if err != nil {
-				props = nil
-			}
-			state.Inflight = append(state.Inflight, SessionInflight{
-				PacketID: m.packetID,
-				Topic:    m.topic,
-				Payload:  m.payload,
-				QoS:      m.qos,
-				Retain:   m.retain,
-				Props:    props,
-				Stage:    storedStage(m.state),
-			})
-		}
-		sort.Slice(state.Inflight, func(i, j int) bool { return state.Inflight[i].PacketID < state.Inflight[j].PacketID })
-	}
-	return state
-}
-
-// storedStage maps the live state of an exchange onto the stable form a store
-// persists.
-func storedStage(state inflightState) InflightStage {
-	switch state {
-	case awaitPubrec:
-		return InflightAwaitPubrec
-	case awaitPubcomp:
-		return InflightAwaitPubcomp
-	default:
-		return InflightAwaitPuback
-	}
-}
-
-// liveStage is the inverse of storedStage. An unknown value (a store written by a
-// build that knew another stage) is treated as a QoS 1 PUBLISH waiting for its
-// PUBACK, which re-sends the packet instead of dropping it.
-func liveStage(stage InflightStage) inflightState {
-	switch stage {
-	case InflightAwaitPubrec:
-		return awaitPubrec
-	case InflightAwaitPubcomp:
-		return awaitPubcomp
-	default:
-		return awaitPuback
-	}
-}
-
-// sessionFromState converts the stored form into the broker's form and reports
-// how many queued messages had to be dropped because their property block no
-// longer decodes. The QoS 2 state of both directions is restored with it; the
-// retransmission schedule of the outbound exchanges is set by the connection that
-// takes the session over (see client.restoreQoS2State).
-func sessionFromState(state SessionState) (*session, int) {
-	s := &session{clientID: state.ClientID, expiresAt: state.ExpiresAt, subs: make(map[string]subscription, len(state.Subscriptions))}
-	for filter, sub := range state.Subscriptions {
-		s.subs[filter] = subscription{
-			qos:               sub.QoS,
-			noLocal:           sub.NoLocal,
-			retainAsPublished: sub.RetainAsPublished,
-			retainHandling:    sub.RetainHandling,
-			subscriptionIDs:   sub.SubscriptionIdentifiers,
-		}
-	}
-	if len(state.InboundQoS2) > 0 {
-		s.inboundQoS2 = append([]uint16(nil), state.InboundQoS2...)
-	}
-	if len(state.Inflight) > 0 {
-		s.inflight = make([]*inflightMessage, 0, len(state.Inflight))
-		for _, stored := range state.Inflight {
-			if stored.PacketID == 0 || stored.QoS == 0 || stored.QoS > 2 {
-				// A store is an external input: an exchange that cannot have been a
-				// QoS 1/2 PUBLISH is dropped instead of being retransmitted with a
-				// shape the protocol does not allow.
-				continue
-			}
-			props, err := mqtt5.DecodePropertyBlock(stored.Props)
-			if err != nil {
-				// A property block that no longer decodes costs the properties, not
-				// the message: the exchange still has its topic, payload and packet id.
-				props = mqtt.Properties{}
-			}
-			s.inflight = append(s.inflight, &inflightMessage{
-				packetID: stored.PacketID,
-				topic:    stored.Topic,
-				payload:  stored.Payload,
-				qos:      stored.QoS,
-				retain:   stored.Retain,
-				props:    props,
-				state:    liveStage(stored.Stage),
-			})
-		}
-	}
-	dropped := 0
-	if len(state.Queue) > 0 {
-		s.queue = make([]queuedMessage, 0, len(state.Queue))
-		for _, msg := range state.Queue {
-			props, err := mqtt5.DecodePropertyBlock(msg.Props)
-			if err != nil {
-				dropped++
-				continue
-			}
-			s.queue = append(s.queue, queuedMessage{
-				topic:   msg.Topic,
-				payload: msg.Payload,
-				qos:     msg.QoS,
-				retain:  msg.Retain,
-				props:   props,
-			})
-		}
-	}
-	return s, dropped
-}
 
 // restoreQoS2State hands the QoS 2 state of a resumed session to the connection
 // that takes it over: the inbound packet ids the client has not released and the
 // outbound exchanges it has not confirmed. The outbound exchanges are scheduled
 // for retransmission exactly like a freshly registered one, and resumeInflight
 // re-sends them after the CONNACK.
-func (c *client) restoreQoS2State(s *session) {
-	for _, id := range s.inboundQoS2 {
+func (c *client) restoreQoS2State(s *sessionstate.State) {
+	for _, id := range s.InboundQoS2 {
 		c.inboundQoS2[id] = struct{}{}
 	}
 	retry := c.broker.cfg.QoSRetryInterval
@@ -232,7 +46,16 @@ func (c *client) restoreQoS2State(s *session) {
 		retry = defaultQoSRetryInterval
 	}
 	now := time.Now()
-	for _, m := range s.inflight {
+	for _, stored := range s.Inflight {
+		m := &inflightMessage{
+			packetID: stored.PacketID,
+			topic:    stored.Topic,
+			payload:  stored.Payload,
+			qos:      stored.QoS,
+			retain:   stored.Retain,
+			props:    stored.Props,
+			state:    liveInflightState(stored.Stage),
+		}
 		if c.broker.cfg.QoSMaxRetries >= 0 {
 			m.due = now.Add(retry)
 		}
@@ -241,18 +64,25 @@ func (c *client) restoreQoS2State(s *session) {
 	}
 }
 
-// snapshotQoS2 returns the connection's QoS 2 state for a store, in the broker's
-// in-memory form. The caller holds c.mu, which is what makes the snapshot
+// snapshotQoS2 returns the connection's QoS 2 state for a store in the projection
+// a session carries. The caller holds c.mu, which is what makes the snapshot
 // consistent with the acknowledgements the connection is processing.
-func (c *client) snapshotQoS2Locked() ([]uint16, []*inflightMessage) {
+func (c *client) snapshotQoS2Locked() ([]uint16, []sessionstate.Inflight) {
 	inbound := make([]uint16, 0, len(c.inboundQoS2))
 	for id := range c.inboundQoS2 {
 		inbound = append(inbound, id)
 	}
-	inflight := make([]*inflightMessage, 0, len(c.inflight))
+	inflight := make([]sessionstate.Inflight, 0, len(c.inflight))
 	for _, m := range c.inflight {
-		snapshot := *m
-		inflight = append(inflight, &snapshot)
+		inflight = append(inflight, sessionstate.Inflight{
+			PacketID: m.packetID,
+			Topic:    m.topic,
+			Payload:  m.payload,
+			QoS:      m.qos,
+			Retain:   m.retain,
+			Props:    m.props,
+			Stage:    inflightStage(m.state),
+		})
 	}
 	return inbound, inflight
 }
@@ -269,7 +99,7 @@ func (c *client) snapshotQoS2Locked() ([]uint16, []*inflightMessage) {
 // sessionTaker), so two nodes that reconnect the same client id cannot both be
 // handed the session. A node-local store is taken with Load followed by Delete,
 // which its own broker lock already serialises.
-func (b *Broker) takeStoredSession(key string) (*session, bool) {
+func (b *Broker) takeStoredSession(key string) (*sessionstate.State, bool) {
 	state, ok := b.takeSessionState(key)
 	if !ok {
 		return nil, false
@@ -279,10 +109,10 @@ func (b *Broker) takeStoredSession(key string) (*session, bool) {
 		b.metrics().RecordDroppedMessage("session_expired")
 		return nil, false
 	}
-	s, dropped := sessionFromState(state)
+	s, dropped := sessionstate.StateFromStored(state)
 	if dropped > 0 {
 		b.log.Warn("gmqx dropped queued messages with an undecodable property block",
-			"client", s.clientID, "count", dropped)
+			"client", s.ClientID, "count", dropped)
 		b.metrics().RecordDroppedMessage("offline_queue_corrupt")
 	}
 	return s, true
@@ -339,14 +169,14 @@ func (b *Broker) saveStoredSession(key string, c *client) {
 	// that decides whether a publication still finds a target.
 	expiresAt := c.sessionExpiryDeadline()
 	inboundQoS2, inflight := c.snapshotQoS2Locked()
-	state := sessionState(&session{
-		clientID:    c.id,
-		subs:        c.subs,
-		queue:       c.queue,
-		expiresAt:   expiresAt,
-		inboundQoS2: inboundQoS2,
-		inflight:    inflight,
-	})
+	state := (&sessionstate.State{
+		ClientID:    c.id,
+		Subs:        c.subs,
+		Queue:       c.queue,
+		ExpiresAt:   expiresAt,
+		InboundQoS2: inboundQoS2,
+		Inflight:    inflight,
+	}).Stored()
 	b.store.Save(key, state)
 	b.offlineQueued += len(c.queue)
 	c.queue = nil
@@ -490,12 +320,12 @@ func (b *Broker) absorbPendingLocked(c *client) {
 			rejected++
 			continue
 		}
-		c.queue = append(c.queue, queuedMessage{
-			topic:   m.topic,
-			payload: m.payload,
-			qos:     m.qos,
-			retain:  m.retain,
-			props:   m.props,
+		c.queue = append(c.queue, sessionstate.Pending{
+			Topic:   m.topic,
+			Payload: m.payload,
+			QoS:     m.qos,
+			Retain:  m.retain,
+			Props:   m.props,
 		})
 	}
 	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(c.queue) > maxQueue {

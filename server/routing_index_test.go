@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 // routingSub is one subscription a case installs before it publishes.
@@ -587,15 +589,15 @@ func benchBroker(size, wildcards int) (*Broker, Publication) {
 	for i := 0; i < size; i++ {
 		id := fmt.Sprintf("bench-%06d", i)
 		c := &client{id: id, connID: ConnectionID("conn-" + id)}
-		b.index.setLive(namespaceKey(b.namespace, id), c, map[string]subscription{
-			fmt.Sprintf("plant/%06d/temp", i): {qos: 1},
+		b.index.setLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
+			fmt.Sprintf("plant/%06d/temp", i): {QoS: 1},
 		})
 	}
 	for j := 0; j < wildcards; j++ {
 		id := fmt.Sprintf("wild-%04d", j)
 		c := &client{id: id, connID: ConnectionID("conn-" + id)}
-		b.index.setLive(namespaceKey(b.namespace, id), c, map[string]subscription{
-			fmt.Sprintf("other%04d/+/temp", j): {qos: 1},
+		b.index.setLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
+			fmt.Sprintf("other%04d/+/temp", j): {QoS: 1},
 		})
 	}
 	return b, Publication{Namespace: b.namespace, Topic: fmt.Sprintf("plant/%06d/temp", size/2), QoS: 1}

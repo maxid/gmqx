@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 // subscribeShared subscribes filter on c and requires the broker to grant qos.
@@ -346,8 +348,8 @@ func BenchmarkSharedTargetSelection(b *testing.B) {
 			for i := 0; i < members; i++ {
 				id := fmt.Sprintf("bench-%06d", i)
 				c := &client{id: id, connID: ConnectionID("conn-" + id)}
-				broker.index.setLive(namespaceKey(broker.namespace, id), c, map[string]subscription{
-					group: {qos: 1},
+				broker.index.setLive(namespaceKey(broker.namespace, id), c, map[string]sessionstate.Subscription{
+					group: {QoS: 1},
 				})
 			}
 			if len(broker.index.liveSharedGroups()) != 1 {

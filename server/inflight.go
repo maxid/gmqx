@@ -60,6 +60,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 var (
@@ -102,6 +103,32 @@ const (
 	// awaitPubcomp is a PUBREL waiting for its PUBCOMP.
 	awaitPubcomp
 )
+
+// inflightStage is the projection of a live exchange's stage into the form a
+// session carries across a disconnect.
+func inflightStage(state inflightState) sessionstate.InflightStage {
+	switch state {
+	case awaitPubrec:
+		return sessionstate.InflightAwaitPubrec
+	case awaitPubcomp:
+		return sessionstate.InflightAwaitPubcomp
+	default:
+		return sessionstate.InflightAwaitPuback
+	}
+}
+
+// liveInflightState is the inverse of inflightStage. session.State normalises an
+// unknown stored stage to InflightAwaitPuback, so the default is only a guard.
+func liveInflightState(stage sessionstate.InflightStage) inflightState {
+	switch stage {
+	case sessionstate.InflightAwaitPubrec:
+		return awaitPubrec
+	case sessionstate.InflightAwaitPubcomp:
+		return awaitPubcomp
+	default:
+		return awaitPuback
+	}
+}
 
 // inflightMessage is one outbound QoS 1/2 exchange the connection owes a
 // confirmation for. It keeps everything a retransmission needs, so the
@@ -876,7 +903,7 @@ func (c *client) drainOfflineQueue() {
 		c.queue = c.queue[1:]
 		c.mu.Unlock()
 
-		qos := msg.qos
+		qos := msg.QoS
 		if qos > 0 {
 			c.mu.Lock()
 			full := c.windowFullLocked(qos)
@@ -886,7 +913,7 @@ func (c *client) drainOfflineQueue() {
 				c.broker.metrics().RecordOverflow("inflight")
 			}
 		}
-		if err := c.writePublish(msg.topic, msg.payload, qos, msg.retain, msg.props); err != nil {
+		if err := c.writePublish(msg.Topic, msg.Payload, qos, msg.Retain, msg.Props); err != nil {
 			if errors.Is(err, errPacketTooLarge) {
 				// The client's Maximum Packet Size forbids this stored message. It was
 				// counted by enqueue and is skipped, so one oversize message cannot wedge
@@ -894,7 +921,7 @@ func (c *client) drainOfflineQueue() {
 				continue
 			}
 			c.mu.Lock()
-			c.queue = append([]queuedMessage{msg}, c.queue...)
+			c.queue = append([]sessionstate.Pending{msg}, c.queue...)
 			c.mu.Unlock()
 			return
 		}
