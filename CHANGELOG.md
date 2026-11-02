@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
+  `AuthExchange` (`AuthStatus`/`AuthStep`), `AclManager` (`AclAction`/`SessionInfo`),
+  `EventSink` (`PublishEvent`/`PublishResult`/`Disposition`), `MetricsManager`,
+  `Interceptor`, `ConnInfo` and the MQTT 5 reason codes are defined there and re-exported
+  by the root package as type aliases, so every existing import, name and type assertion
+  keeps working unchanged. The contracts now form one reviewable directory instead of a
+  section of `hooks.go`, and `gmqx/hook` imports nothing from the broker.
+
+### Added
+
+- `hook.SinkFuncs`: implement only the events that matter; a nil field is skipped and a
+  sink without a publish hook accepts the publication.
+- `hook.InterceptFunc`: a one-closure `Interceptor`.
+- `hook.NoopMetrics` (formerly `NoopMetrics` in the root package): embed it and override
+  only the counters that matter.
+
 - **The inbound PUBLISH no longer allocates a packet, a topic string and a payload
   per publish.** The read loop decodes a PUBLISH with `codec/mqtt`'s
   `ReadPublishInto` into one grow-only buffer per connection (`client.readBuf`,

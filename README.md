@@ -79,7 +79,8 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   and a bounded number of steps (see **Enhanced authentication** below)
 - Wire-level MQTT 3.1.1/5 conformance suite (`TestConformance`)
 - Pluggable hooks: `AuthManager`, `AclManager`, `EventSink` (lifecycle/messages),
-  `MetricsManager`, `Interceptor`
+  `MetricsManager`, `Interceptor` — the contracts live in
+  [`gmqx/hook`](hook/) and are re-exported here as aliases (see **Extension points**)
 - Pluggable routing: `Dispatcher` receives a `Publication` for every accepted
   publish and decides where it goes; the nil dispatcher keeps the built-in local
   delivery plus cluster spread (`DefaultDispatcher`), and the broker exposes a
@@ -140,6 +141,29 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   with DUP/PUBREL retransmission and inflight windows, reconnection with backoff
   and subscription restore, keepalive, MQTT 5 properties, and bounded ordered
   writer and delivery queues (see **MQTT client** below)
+
+## Extension points
+
+The hook contracts live in [`gmqx/hook`](hook/): `ConnectInfo`, `AuthManager`,
+`AuthExchange`, `AclManager`, `SessionInfo`, `EventSink`, `PublishEvent`,
+`PublishResult`, `MetricsManager`, `Interceptor`, `ConnInfo` and the MQTT 5 reason codes.
+The root package re-exports every one of them as a type alias, so the two import paths
+are the same types and existing code needs no change at all:
+
+```go
+var _ gmqx.EventSink = hook.SinkFuncs{ /* ... */ }  // literally the same type
+```
+
+Three adapters remove the boilerplate of the wide interfaces:
+
+- `hook.SinkFuncs` — implement only the events you care about; a nil field is skipped, and
+  a sink without a publish hook accepts the publication;
+- `hook.InterceptFunc` — a one-closure interceptor;
+- `hook.NoopMetrics` — embed it and override only the counters that matter.
+
+The routing seam (`Dispatcher`, `Publication`, `LocalTarget`) stays in the root package on
+purpose: it hands the broker's own routing primitives to a dispatcher, so it cannot move
+without exporting implementation details.
 
 ## Install
 

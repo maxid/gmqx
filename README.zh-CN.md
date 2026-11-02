@@ -58,7 +58,8 @@
   活动连接上可重新认证，步数与时限有界（见下方 **增强认证**）
 - 线级 MQTT 3.1.1/5 一致性测试套件（`TestConformance`）
 - 可插拔钩子：`AuthManager`、`AclManager`、`EventSink`（生命周期/消息）、
-  `MetricsManager`、`Interceptor`
+  `MetricsManager`、`Interceptor`——契约定义在 [`gmqx/hook`](hook/)，根包以类型别名重新导出
+  （见下方 **扩展点**）
 - 可插拔路由：`Dispatcher` 接收每个被接受 publish 的 `Publication` 并决定去向；
   未配置时保持内置的本地投递 + 集群传播行为（`DefaultDispatcher`）；broker 提供只读接缝
   （`LocalTargets`、`SendLocal`、`SpreadPublication`），dispatcher 无需自行重写 topic 匹配
@@ -100,6 +101,26 @@
   MQTT 3.1.1/5、双向 QoS 1/2 状态机（DUP/PUBREL 重传与 inflight 窗口）、
   带退避与订阅恢复的重连、keepalive、MQTT 5 属性，以及有界且有序的写队列与投递队列
   （见下面的 **MQTT 客户端**）
+
+## 扩展点
+
+钩子契约定义在 [`gmqx/hook`](hook/)：`ConnectInfo`、`AuthManager`、`AuthExchange`、
+`AclManager`、`SessionInfo`、`EventSink`、`PublishEvent`、`PublishResult`、
+`MetricsManager`、`Interceptor`、`ConnInfo` 与 MQTT 5 reason code。根包把每一个都以类型别名
+重新导出，因此两条 import 路径是**同一种类型**，已有代码一行不用改：
+
+```go
+var _ gmqx.EventSink = hook.SinkFuncs{ /* ... */ }  // 同一个类型
+```
+
+三个适配器消除了宽接口的样板代码：
+
+- `hook.SinkFuncs`——只实现你关心的事件，nil 字段直接跳过；没写 publish 钩子的 sink 表示接受；
+- `hook.InterceptFunc`——一个闭包就能当拦截器；
+- `hook.NoopMetrics`——嵌入后只覆写自己在意的计数器。
+
+路由接缝（`Dispatcher`、`Publication`、`LocalTarget`）有意留在根包：它把 broker 自己的路由
+原语交给 dispatcher，要移出去就得导出实现细节。
 
 ## 安装
 
