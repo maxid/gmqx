@@ -59,6 +59,14 @@
   `cluster.go`、`config.go`、`errors.go`、`doc.go`。行为零变化；根包公开 API 逐字节相同
   （`go doc -all`），`ByteRateMetrics` 是 conn 同名接口的别名。
 
+- **引擎变为 `internal/engine`，根包只剩一个 `facade.go`。** 装配包原本是 `gmqx/server`——一个公开
+  import 路径，文件名与根门面一一对应：同一个 broker 有两个公开包，其中一个还是逐文件复制的名字。
+  现在它是 `internal/engine`（包名 `engine`），外部不可 import；根目录的八个别名文件合成一个
+  `facade.go`（外加 `version.go`）。公开 API 不变：每个名字仍是别名（`gmqx.Broker` ==
+  `engine.Broker`），与上一提交用 `go doc -all` 对比（标识符集合差异 0），并用一个模块外的消费者验证过
+  （实现 `gmqx.Dispatcher`/`gmqx.EventSink`、嵌入 `gmqx.NoopMetrics`、创建 broker）。
+  `gmqx/server` 从未被文档列为公开路径、仓内除门面外无人 import，现已删除。
+
 ### 新增
 
 - `hook.SinkFuncs`：只实现关心的事件；nil 字段跳过，没写 publish 钩子的 sink 表示接受。

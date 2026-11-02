@@ -131,6 +131,18 @@
   package's exported API is byte-identical (`go doc -all`), and `ByteRateMetrics`
   is an alias of conn's identical interface.
 
+- **The engine is `internal/engine` and the root package is one `facade.go`.** The
+  assembly package was `gmqx/server`, a public import path with the same file names
+  as the root facade — two public packages for one broker, one of them duplicated
+  name for name. It is now `internal/engine` (package `engine`), which consumers
+  cannot import, and the eight alias files at the root are one `facade.go` (plus
+  `version.go`). The public API is unchanged: every name is still an alias
+  (`gmqx.Broker` == `engine.Broker`), verified against the previous commit with
+  `go doc -all` (identifier set diff: 0) and with an out-of-module consumer that
+  implements `gmqx.Dispatcher` and `gmqx.EventSink`, embeds `gmqx.NoopMetrics` and
+  builds a broker. `gmqx/server` — never documented as a public path, no in-repo
+  importer besides the facade — is gone.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
