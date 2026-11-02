@@ -579,6 +579,7 @@ func TestNewRedisClusterWithSessionStore(t *testing.T) {
 		t.Fatalf("the session is not under %q", want)
 	}
 	// The layout of the two kinds of key, under one prefix, shares no segment.
+	sessionPrefix := strings.TrimSuffix(want, "collide")
 	for _, other := range []string{
 		redisTestKey(cfg, "node", "collide"),
 		redisTestKey(cfg, "owner", "collide"),
@@ -586,7 +587,7 @@ func TestNewRedisClusterWithSessionStore(t *testing.T) {
 		redisTestKey(cfg, "subs", "collide"),
 		redisTestPresenceKey(cfg, "", "collide"),
 	} {
-		if other == want || strings.HasPrefix(other, store.sessionKeyPrefix()) {
+		if other == want || strings.HasPrefix(other, sessionPrefix) {
 			t.Fatalf("a session key collides with the cluster key %q", other)
 		}
 	}

@@ -1,4 +1,4 @@
-package gmqx
+package session
 
 // Redis-backed SessionStore
 //
@@ -55,6 +55,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/maxid/gmqx/cluster"
+	"github.com/maxid/gmqx/hook"
 )
 
 // redisSessionKeySegment is the key segment session state lives under, next to the
@@ -105,7 +106,7 @@ type RedisSessionStoreConfig struct {
 	// Metrics, when set, receives RecordDroppedMessage for what the store drops
 	// ("session_store_corrupt" for a value that does not decode,
 	// "session_store_error" for a failed command).
-	Metrics MetricsManager
+	Metrics hook.MetricsManager
 	// Logger receives decode and command failures (default slog.Default()).
 	Logger *slog.Logger
 }
@@ -184,7 +185,7 @@ func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, erro
 // The store inherits the backend's Metrics and Logger, so "session_store_corrupt"
 // and "session_store_error" land in the same place as the cluster's own drops.
 // Close the store when the broker stops; the backend has its own Stop.
-func NewRedisClusterWithSessionStore(cfg RedisClusterConfig) (Cluster, *RedisSessionStore, error) {
+func NewRedisClusterWithSessionStore(cfg cluster.RedisClusterConfig) (cluster.Cluster, *RedisSessionStore, error) {
 	store, err := NewRedisSessionStore(RedisSessionStoreConfig{
 		Addr:          cfg.Addr,
 		Password:      cfg.Password,
@@ -196,7 +197,7 @@ func NewRedisClusterWithSessionStore(cfg RedisClusterConfig) (Cluster, *RedisSes
 	if err != nil {
 		return nil, nil, err
 	}
-	return NewRedisCluster(cfg), store, nil
+	return cluster.NewRedisCluster(cfg), store, nil
 }
 
 // SharedAcrossNodes implements SharedSessionStore: the store is shared state, so a
