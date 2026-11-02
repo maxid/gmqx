@@ -521,6 +521,30 @@ with scheduling; the bounds did not.
 | Goroutines after the run | 2, baseline 2, bound 10 |
 | Live heap after the run (after two GCs) | 651,640 B, before 428,928 B, bound 67,966,720 B |
 
+A ten-minute run of the same harness (2026-11-02, same machine, `GMQX_SOAK_DURATION=10m`)
+is the leak evidence the ten-second run cannot be:
+
+```sh
+GMQX_SOAK_DURATION=10m ./scripts/soak.sh
+```
+
+```
+soak teardown: clients=0 stored_sessions=0 indexed_sessions=0 retained=0 pending_wills=0 offline_queued=0
+soak delivery ledger: acknowledged=23452162 delivered_qos12=23452162 duplicates=0
+soak resources: goroutines=2 (baseline 2, bound 10) heap_before=454672 heap_after=793440 heap_bound=68018208 total_alloc_delta=52945515416
+soak result: 34352 generations, 68712 connections, 2198640 batches, 35178240 messages (11726078 QoS 0, 11726081 QoS 1, 11726081 QoS 2), 23452162 acknowledged, 23452162 delivered
+```
+
+That is 35.2 M messages over 600 s (58.6 k/s; 39.1 k QoS 1/2 acknowledgements/s,
+115 connections/s) with `delivered_qos12` still exactly `acknowledged` and no
+duplicates. The single-connection writer queues stayed at their documented bound
+mid-run (the progress lines report 38 goroutines: four workers plus the broker's
+per-connection reader, writer and retransmission timer for eight live
+connections), and after `Stop` the count returned to the two-goroutine baseline
+while the live heap stayed under 1 MiB — 52.9 GB were allocated and collected in
+the ten minutes, and nothing was retained. This is the run to cite for "no leak
+across connection churn", and the ten-second one for "no regression per commit".
+
 The bounds are deliberately conservative, and this is the rationale:
 
 - **Goroutines: baseline + 8.** A leak of a broker connection goroutine, a

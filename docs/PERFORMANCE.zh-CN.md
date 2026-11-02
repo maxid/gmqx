@@ -288,6 +288,26 @@ soak result: 380 generations, 768 connections, 24492 batches, 391872 messages (1
 | 运行后 goroutine | 2，基线 2，上限 10 |
 | 运行后存活堆（两次 GC 之后） | 651,640 B，之前 428,928 B，上限 67,966,720 B |
 
+同一套 harness 的十分钟运行（2026-11-02，同机，`GMQX_SOAK_DURATION=10m`）给出十秒运行无法给出的
+泄漏证据：
+
+```sh
+GMQX_SOAK_DURATION=10m ./scripts/soak.sh
+```
+
+```
+soak teardown: clients=0 stored_sessions=0 indexed_sessions=0 retained=0 pending_wills=0 offline_queued=0
+soak delivery ledger: acknowledged=23452162 delivered_qos12=23452162 duplicates=0
+soak resources: goroutines=2 (baseline 2, bound 10) heap_before=454672 heap_after=793440 heap_bound=68018208 total_alloc_delta=52945515416
+soak result: 34352 generations, 68712 connections, 2198640 batches, 35178240 messages (11726078 QoS 0, 11726081 QoS 1, 11726081 QoS 2), 23452162 acknowledged, 23452162 delivered
+```
+
+600 秒内 3520 万条消息（58.6 k/s；QoS 1/2 确认 39.1 k/s，连接 115 条/s），
+`delivered_qos12` 仍与 `acknowledged` 完全相等且零重复。中途每个连接的写队列停在其文档上限内（进度行
+报告 38 个 goroutine：四个 worker，加上 broker 为八条活连接各开的读、写与重传协程），`Stop` 之后
+goroutine 回到两条的基线，存活堆始终低于 1 MiB——十分钟共分配并回收 52.9 GB，没有留下任何常驻。
+引用"连接churn 无泄漏"时用这一次，引用"每次提交无回归"时用十秒那次。
+
 边界刻意保守，理由如下：
 
 - **goroutine：基线 + 8。** 一处泄漏——broker 的连接协程、写协程、重传定时器或 drain 协程——至少增加每连接一个 goroutine，而该轮运行打开数百条连接；每 worker 一处泄漏则至少增加四个。`Broker.Stop` 会 join broker 启动的所有协程（专门的泄漏测试断言其为 `baseline+2`），因此 8 足以覆盖 runtime 与 testing 包的噪声，又不会掩盖真实泄漏。
