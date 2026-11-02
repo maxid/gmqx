@@ -1,5 +1,7 @@
 package gmqx
 
+import ns "github.com/maxid/gmqx/internal/namespace"
+
 import "strings"
 
 func validTopic(topic string) bool {
@@ -128,3 +130,9 @@ func nextLevel(s string) (level, rest string, more bool) {
 	}
 	return s, "", false
 }
+
+// The key-space rules live in ./internal/namespace; these wrappers keep the root package's
+// call sites and tests unchanged.
+func namespaceKey(namespace, name string) string { return ns.Key(namespace, name) }
+
+func keyInNamespace(namespace, key string) bool { return ns.InNamespace(namespace, key) }
