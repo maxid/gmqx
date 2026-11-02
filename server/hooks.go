@@ -6,6 +6,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 
 	"github.com/maxid/gmqx/hook"
+	"github.com/maxid/gmqx/routing"
 )
 
 // Publication is one accepted publication the broker routes. It is the payload
@@ -65,33 +66,6 @@ type DispatcherBinder interface {
 	Bind(b *Broker)
 }
 
-// LocalTarget is one local session a publication matches. Its fields are
-// read-only reporting; pass the value back to Broker.SendLocal to write the
-// PUBLISH. A LocalTarget is only valid for the broker that produced it.
-type LocalTarget struct {
-	ClientID     string
-	ConnectionID ConnectionID
-	// QoS is min(publication QoS, highest matching subscription QoS).
-	QoS byte
-	// Retain is the retain flag to send: it is set only for a retained
-	// publication delivered to a subscription with retain-as-published.
-	Retain bool
-
-	client     *client
-	sessionKey string
-	// subscriptionIDs are the Subscription Identifiers of the subscriptions the
-	// target was reached through, deduplicated. SendLocal attaches them to the
-	// PUBLISH it writes (or queues), which is what makes the identifier a property
-	// of the subscription rather than of the publication.
-	subscriptionIDs []uint32
-}
-
-// Offline reports whether the target is a persistent session with no live
-// connection. SendLocal queues the publication for such a target instead of
-// writing it, and the queue drains right after the session's next CONNACK;
-// ConnectionID is empty for it, because there is no connection to name.
-func (t LocalTarget) Offline() bool { return t.client == nil && t.sessionKey != "" }
-
 // AllowAll permits every connection/subscription/publish.
 type AllowAll struct{}
 
@@ -110,6 +84,14 @@ func (DenyAll) RequiresOffload() bool                           { return false }
 // paths. New code may import github.com/maxid/gmqx/hook directly — both spellings are the
 // same type, so they mix freely.
 type (
+	// LocalTarget is one local session a publication matches. Its fields are
+	// read-only reporting; pass the value back to Broker.SendLocal to write the
+	// PUBLISH. A LocalTarget is only valid for the broker that produced it.
+	//
+	// The type is defined in gmqx/routing (the routing table is what produces it)
+	// and re-exported here as an alias, so a Dispatcher keeps naming it the same way.
+	LocalTarget = routing.Target
+
 	ConnectInfo    = hook.ConnectInfo
 	AuthManager    = hook.AuthManager
 	AuthStatus     = hook.AuthStatus

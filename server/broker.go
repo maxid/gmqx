@@ -28,6 +28,7 @@ import (
 	ns "github.com/maxid/gmqx/internal/namespace"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
 	retainedstore "github.com/maxid/gmqx/retained"
+	"github.com/maxid/gmqx/routing"
 	sessionstate "github.com/maxid/gmqx/session"
 )
 
@@ -53,8 +54,8 @@ type Broker struct {
 	store      SessionStore
 	// index is the routing table: which local session (live or stored) is
 	// subscribed to which filter. It is the only structure a publication is
-	// matched against; see routing_index.go for its shape and invariants.
-	index *subscriptionIndex
+	// matched against; gmqx/routing owns its shape and invariants.
+	index *routing.Index
 	// presence is the optional cluster view of which node holds a client id. The
 	// backend that implements it is told about every connect and disconnect, so a
 	// directed publish can be routed instead of broadcast.
@@ -63,11 +64,10 @@ type Broker struct {
 	// a shared subscription group. It is what lets one node deliver a shared
 	// publication instead of every node delivering a copy (see shared.go).
 	sharedNodes sharedDirectory
-	// sharedMu guards sharedRotation, the per-group counter that rotates the node
-	// election of a shared group so successive publications of one group do not all
-	// land on the same node. The table is bounded by maxSharedRotationEntries.
-	sharedMu       sync.Mutex
-	sharedRotation map[string]uint64
+	// sharedElection rotates the node election of each shared group, so successive
+	// publications of one group do not all land on the same node (see shared.go).
+	// The zero value is an empty election.
+	sharedElection routing.Election
 
 	// readBytes and writeBytes are the broker-wide byte-rate buckets: every byte
 	// this process reads from a client connection or writes to one is charged to
@@ -272,7 +272,7 @@ func New(cfg Config) (*Broker, error) {
 		namespace: cfg.Namespace.Name,
 		clients:   make(map[string]*client),
 		store:     cfg.SessionStore,
-		index:     newSubscriptionIndex(),
+		index:     routing.NewIndex(),
 		retained:  retainedstore.NewStore(),
 		wills:     make(map[string]*pendingWill),
 		addrs:     make(map[string]string),
@@ -857,7 +857,7 @@ func (b *Broker) register(c *client) error {
 	// restored (or the empty set of a clean session) are routable before the
 	// CONNACK goes out, and the stored entries of a session that was taken over
 	// stop being targets here, under the same lock that moves the session.
-	b.index.setLive(key, c, c.subs)
+	b.index.SetLive(key, c, c.subs)
 	n := len(b.clients)
 	b.mu.Unlock()
 	if len(c.subs) > 0 {
@@ -997,7 +997,7 @@ func (b *Broker) unregister(c *client) {
 		// already installed the replacement's entries under this lock, so the entry
 		// is kept in that case.
 		if _, connected := b.clients[key]; !connected {
-			b.index.remove(key)
+			b.index.Remove(key)
 		}
 	}
 	b.mu.Unlock()
@@ -1070,7 +1070,7 @@ func (b *Broker) subscribe(c *client, filter string, sub sessionstate.Subscripti
 	c.mu.Unlock()
 	// The subscription is routable before the SUBACK is written: the connection
 	// goroutine updates the index here, and the SUBACK follows in handleSubscribe.
-	b.index.add(namespaceKey(b.namespace, c.id), c, filter, sub)
+	b.index.Add(namespaceKey(b.namespace, c.id), c, filter, sub)
 	b.metrics().IncrementSubscribeEvents()
 	if !exists {
 		b.subscriptionsChanged()
@@ -1095,7 +1095,7 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 	c.mu.Unlock()
 	if existed {
 		// The filter stops routing before the UNSUBACK is written.
-		b.index.removeFilter(namespaceKey(b.namespace, c.id), c, filter)
+		b.index.RemoveFilter(namespaceKey(b.namespace, c.id), c, filter)
 		b.metrics().DecrementSubscribeEvents()
 		b.subscriptionsChanged()
 	}
@@ -1110,7 +1110,7 @@ func (b *Broker) unsubscribe(c *client, filter string) {
 // nodes that have a matching subscriber; the advertised summary carries the
 // namespace, so peers of another namespace ignore it.
 func (b *Broker) subscriptionFilters() []string {
-	return b.index.liveFilters()
+	return b.index.LiveFilters()
 }
 
 // sharedSubscriptionGroups implements sharedSubscriptionProvider: the shared
@@ -1120,7 +1120,7 @@ func (b *Broker) subscriptionFilters() []string {
 // (see Broker.dispatchShared). Stored sessions are not advertised: an offline
 // member receives no shared delivery.
 func (b *Broker) sharedSubscriptionGroups() []string {
-	return b.index.liveSharedGroups()
+	return b.index.LiveSharedGroups()
 }
 
 // subscriptionsChanged tells a cluster backend that can push subscription
@@ -1443,7 +1443,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, pub Publication) error
 // flag already applied, and no-local subscriptions of the publishing connection
 // excluded. A publication of another namespace has no local target here.
 //
-// It answers from the routing index (see routing_index.go), not by scanning the
+// It answers from the routing index (see gmqx/routing), not by scanning the
 // client table and the store: a literal topic is one map lookup plus one lookup
 // per distinct wildcard filter, and the SessionStore is not consulted at all. The
 // broker's own lock is not taken, so a publish never waits for a connection that
@@ -1459,7 +1459,7 @@ func (b *Broker) LocalTargets(pub Publication) []LocalTarget {
 	if pub.Namespace != b.namespace {
 		return nil
 	}
-	return b.index.targets(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain)
+	return b.index.Targets(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain)
 }
 
 // eachLocalTarget is LocalTargets without the slice: it hands each matching
@@ -1470,7 +1470,7 @@ func (b *Broker) eachLocalTarget(pub Publication, fn func(LocalTarget)) {
 	if pub.Namespace != b.namespace {
 		return
 	}
-	b.index.eachTarget(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain, fn)
+	b.index.EachTarget(pub.Topic, ConnectionID(pub.FromConnectionID), pub.QoS, pub.Retain, fn)
 }
 
 // SendLocal is the write half of the routing seam: it writes pub to one target
@@ -1481,7 +1481,7 @@ func (b *Broker) eachLocalTarget(pub Publication, fn func(LocalTarget)) {
 // dispatcher can observe cancellation, not to abort a write that is already on
 // the wire.
 func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publication) error {
-	if target.client == nil && target.sessionKey == "" {
+	if target.Endpoint() == nil && target.SessionKey() == "" {
 		return errors.New("gmqx: local target was not produced by this broker")
 	}
 	props := pub.props
@@ -1496,15 +1496,15 @@ func (b *Broker) SendLocal(ctx context.Context, target LocalTarget, pub Publicat
 	// through, so they are attached here, once per delivery, and never travel in
 	// Publication.Props (see subscription_id.go).
 	var dropped bool
-	props, dropped = mqtt5.WithSubscriptionIDs(props, target.subscriptionIDs)
+	props, dropped = mqtt5.WithSubscriptionIDs(props, target.SubscriptionIDs())
 	if dropped {
 		b.metrics().RecordDroppedMessage("subscription_identifier_limit")
 	}
-	if target.client == nil {
+	if target.Endpoint() == nil {
 		b.enqueueOffline(target, pub, props)
 		return nil
 	}
-	return target.client.sendPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
+	return target.Endpoint().DeliverPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
 }
 
 // SpreadPublication is the cluster half of the routing seam: it hands pub to the
@@ -1628,23 +1628,9 @@ func (b *Broker) PublishToClient(ctx context.Context, clientID string, pub Publi
 // index is not local, which is what makes the caller hand the publication to the
 // cluster.
 func (b *Broker) deliverLocal(ctx context.Context, clientID string, pub Publication) (bool, error) {
-	s, ok := b.index.session(namespaceKey(b.namespace, clientID))
+	target, ok := b.index.Target(namespaceKey(b.namespace, clientID), pub.QoS, pub.Retain)
 	if !ok {
 		return false, nil
-	}
-	target := LocalTarget{
-		ClientID:     s.clientID,
-		ConnectionID: s.connID,
-		QoS:          pub.QoS,
-		Retain:       pub.Retain,
-		client:       s.client,
-	}
-	if s.client == nil {
-		// An offline session has no connection to name: SendLocal queues through
-		// the session key, and its re-check makes a session that reconnected in
-		// the meantime receive the publication live.
-		target.ConnectionID = ""
-		target.sessionKey = s.key
 	}
 	return true, b.SendLocal(ctx, target, pub)
 }

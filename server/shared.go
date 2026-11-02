@@ -5,7 +5,7 @@ package server
 // A shared subscription ("$share/{ShareName}/{filter}", MQTT 5 §4.8.2) is a
 // group: a publication that matches it is sent to exactly one of its sessions,
 // not to all of them. Outside a cluster the routing index answers that on its own
-// (subscriptionIndex.sharedTarget picks the member round robin). Across a cluster
+// (routing.Index.SharedTarget picks the member round robin). Across a cluster
 // it would be wrong for every node to do that: each node would deliver its own
 // copy, so a group whose members live on two nodes would receive the publication
 // twice. Routing a shared publication is therefore two decisions, and both are
@@ -15,21 +15,17 @@ package server
 //     a live member of the group: this node when the routing index has one, plus
 //     the peers the cluster backend advertises. The advertised subscription
 //     summary carries the group keys (sharedDirectory, implemented by the TCP and
-//     Redis backends), so no node has to ask another. The elected node is
-//
-//     candidates[(fnv64(groupKey) + Seat) % len(candidates)]
-//
-//     over the sorted candidate list. The group hash is the group's affinity:
-//     different groups spread over the nodes without any coordination, and two
-//     origins publishing to the same group do not have to agree. Seat is a
-//     per-group counter of this origin (sharedRotation), so successive publications
-//     of one group visit every candidate instead of pinning the group to one node
-//     while it lives. The election needs no shared state and no round trip — each
-//     node decides alone for the publications it produces, which is what makes it
-//     correct for both backends.
+//     Redis backends), so no node has to ask another. The election itself is
+//     routing.Election: candidates[(fnv64(groupKey) + Seat) % len(candidates)]
+//     over the sorted candidate list, with the group hash as the group's affinity
+//     and a per-group counter as the seat, so successive publications of one group
+//     visit every candidate instead of pinning the group to one node while it
+//     lives. It needs no shared state and no round trip — each node decides alone
+//     for the publications it produces, which is what makes it correct for both
+//     backends.
 //
 //  2. Which member of the elected node. That node picks round robin among its own
-//     live members (subscriptionIndex.sharedTarget), so two members of one group
+//     live members (routing.Index.SharedTarget), so two members of one group
 //     on the same node alternate. A peer learns which groups it must deliver from
 //     ClusterMessage.Shared: an entry names one node and the groups that node is
 //     responsible for, and a peer applies only the entries that name it (see
@@ -57,7 +53,6 @@ package server
 
 import (
 	"context"
-	"hash/fnv"
 	"sort"
 
 	topicmatch "github.com/maxid/gmqx/internal/topic"
@@ -89,7 +84,7 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 		// this broker's to route, and a shared group is a local session set.
 		return nil
 	}
-	local := b.index.sharedGroups(pub.Topic)
+	local := b.index.SharedGroups(pub.Topic)
 	var peers map[string][]string
 	if b.sharedNodes != nil {
 		peers = b.sharedNodes.SharedGroups()
@@ -121,20 +116,21 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 
 	var remote []SharedDelivery
 	for _, group := range groups {
-		candidates := append([]string(nil), peers[group]...)
+		candidates := peers[group]
 		if _, isLocal := localSet[group]; isLocal {
-			candidates = append(candidates, b.nodeID)
+			// A nil append would replace the peer slice; copy before adding this node
+			// so the backend's view is never written to.
+			candidates = append(append([]string(nil), candidates...), b.nodeID)
 		}
-		candidates = uniqueSorted(candidates)
-		if len(candidates) == 0 {
+		chosen, ok := b.sharedElection.Choose(group, candidates)
+		if !ok {
 			// No node holds a live member: the group exists nowhere by the time the
 			// publication is routed. Dropped, and counted, rather than guessed at.
 			b.metrics().RecordDroppedMessage("shared_no_member")
 			b.log.Debug("gmqx shared publication dropped", "group", group, "topic", pub.Topic, "reason", "no_member")
 			continue
 		}
-		seat := (groupHash(group) + b.nextSharedSeat(group)) % uint64(len(candidates))
-		if chosen := candidates[seat]; chosen != b.nodeID {
+		if chosen != b.nodeID {
 			remote = append(remote, SharedDelivery{Node: chosen, Groups: []string{group}})
 			continue
 		}
@@ -147,7 +143,7 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 // on this node, and counts the drop when the group has no live member left. It is
 // the only place a shared publication is written, locally or from a peer event.
 func (b *Broker) deliverSharedGroup(ctx context.Context, group string, pub Publication) bool {
-	target, ok := b.index.sharedTarget(group, pub.QoS, pub.Retain)
+	target, ok := b.index.SharedTarget(group, pub.QoS, pub.Retain)
 	if !ok {
 		b.metrics().RecordDroppedMessage("shared_no_member")
 		b.log.Debug("gmqx shared publication dropped", "group", group, "topic", pub.Topic, "reason", "no_live_member")
@@ -155,55 +151,6 @@ func (b *Broker) deliverSharedGroup(ctx context.Context, group string, pub Publi
 	}
 	_ = b.SendLocal(ctx, target, pub)
 	return true
-}
-
-// maxSharedRotationEntries bounds the per-group election counters. Past it the
-// table is reset: the group hash still spreads the groups, so the only cost is that
-// a group's rotation restarts from its affinity, never a correctness problem.
-const maxSharedRotationEntries = 1024
-
-// nextSharedSeat advances the rotation of one group and returns the value to elect
-// with. The table is per broker and per group, so the counter of a group is not
-// disturbed by the publications of another one (a single counter shared by all
-// groups would keep the parity of a group constant whenever two groups match the
-// same publication).
-func (b *Broker) nextSharedSeat(group string) uint64 {
-	b.sharedMu.Lock()
-	defer b.sharedMu.Unlock()
-	if b.sharedRotation == nil {
-		b.sharedRotation = make(map[string]uint64, 8)
-	}
-	if len(b.sharedRotation) >= maxSharedRotationEntries {
-		clear(b.sharedRotation)
-	}
-	seat := b.sharedRotation[group]
-	b.sharedRotation[group] = seat + 1
-	return seat
-}
-
-// groupHash is the affinity of a shared group: FNV-1a over its key. It is stable
-// across processes and restarts, so two nodes that elect for the same group start
-// from the same candidate.
-func groupHash(group string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(group))
-	return h.Sum64()
-}
-
-// uniqueSorted copies ids, sorts the copy and removes duplicates.
-func uniqueSorted(ids []string) []string {
-	if len(ids) == 0 {
-		return nil
-	}
-	out := append([]string(nil), ids...)
-	sort.Strings(out)
-	kept := out[:1]
-	for _, id := range out[1:] {
-		if id != kept[len(kept)-1] {
-			kept = append(kept, id)
-		}
-	}
-	return kept
 }
 
 // mergeSharedDeliveries folds the per-group entries into one per node, sorted by

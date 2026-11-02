@@ -182,15 +182,11 @@ func (s *State) Stored() SessionState {
 // with a packet id, and a queued message whose property block no longer decodes,
 // which costs the message and not the session.
 func StateFromStored(state SessionState) (*State, int) {
-	s := &State{ClientID: state.ClientID, ExpiresAt: state.ExpiresAt, Subs: make(map[string]Subscription, len(state.Subscriptions))}
-	for filter, sub := range state.Subscriptions {
-		s.Subs[filter] = Subscription{
-			QoS:               sub.QoS,
-			NoLocal:           sub.NoLocal,
-			RetainAsPublished: sub.RetainAsPublished,
-			RetainHandling:    sub.RetainHandling,
-			SubscriptionIDs:   sub.SubscriptionIdentifiers,
-		}
+	s := &State{ClientID: state.ClientID, ExpiresAt: state.ExpiresAt, Subs: SubscriptionsFromStored(state.Subscriptions)}
+	if s.Subs == nil {
+		// A session without subscriptions is still resumable: the broker installs an
+		// empty set so a SUBSCRIBE has a map to write into.
+		s.Subs = make(map[string]Subscription)
 	}
 	if len(state.InboundQoS2) > 0 {
 		s.InboundQoS2 = append([]uint16(nil), state.InboundQoS2...)
@@ -252,6 +248,27 @@ func knownStage(stage InflightStage) InflightStage {
 	default:
 		return InflightAwaitPuback
 	}
+}
+
+// SubscriptionsFromStored converts a stored subscription set into the live form,
+// and reports nothing else: the two shapes carry the same options under the names
+// of their side of the seam. A nil set converts to nil, so an empty session stays
+// distinguishable from one that was never stored.
+func SubscriptionsFromStored(subs map[string]SessionSubscription) map[string]Subscription {
+	if len(subs) == 0 {
+		return nil
+	}
+	out := make(map[string]Subscription, len(subs))
+	for filter, sub := range subs {
+		out[filter] = Subscription{
+			QoS:               sub.QoS,
+			NoLocal:           sub.NoLocal,
+			RetainAsPublished: sub.RetainAsPublished,
+			RetainHandling:    sub.RetainHandling,
+			SubscriptionIDs:   sub.SubscriptionIdentifiers,
+		}
+	}
+	return out
 }
 
 // CopySubscriptions returns a detached copy of a session's subscription set, so a

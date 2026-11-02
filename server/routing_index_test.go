@@ -1,11 +1,15 @@
 package server
 
-// Routing-index tests: the index must produce exactly the targets the old
-// per-publish scan produced (topic matching, the per-subscription QoS cap, retain
-// as published, no-local, the '$' topic exclusion, offline targets), it must drop
-// entries on every transition that ends a subscription, it must never consult the
-// SessionStore while a publish is routed, and its cost must not grow with the
-// number of subscriptions.
+// Routing tests as the broker exposes them: LocalTargets must produce exactly the
+// targets the old per-publish scan produced (topic matching, the per-subscription
+// QoS cap, retain as published, no-local, the '$' topic exclusion, offline
+// targets), the index must be emptied by every transition that ends a
+// subscription, a publish must never consult the SessionStore, and the cost must
+// not grow with the number of subscriptions.
+//
+// The table itself — buckets, live counters, the displacement rule, shared-group
+// membership, the round robin — is pinned by gmqx/routing's own tests; the cases
+// here are the broker paths that install and tear it down.
 
 import (
 	"fmt"
@@ -332,15 +336,7 @@ func targetIDs(targets []LocalTarget) []string {
 // indexEntries reports the (filter, session) entries the index holds and how many
 // sessions it knows about.
 func indexEntries(b *Broker) (entries, sessions int) {
-	b.index.mu.RLock()
-	defer b.index.mu.RUnlock()
-	for _, bucket := range b.index.exact {
-		entries += len(bucket)
-	}
-	for _, bucket := range b.index.wildcard {
-		entries += len(bucket)
-	}
-	return entries, len(b.index.sessions)
+	return b.index.EntryCount(), b.index.Len()
 }
 
 // TestRoutingIndexRemovals pins every transition that must take a subscription
@@ -589,14 +585,14 @@ func benchBroker(size, wildcards int) (*Broker, Publication) {
 	for i := 0; i < size; i++ {
 		id := fmt.Sprintf("bench-%06d", i)
 		c := &client{id: id, connID: ConnectionID("conn-" + id)}
-		b.index.setLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
+		b.index.SetLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
 			fmt.Sprintf("plant/%06d/temp", i): {QoS: 1},
 		})
 	}
 	for j := 0; j < wildcards; j++ {
 		id := fmt.Sprintf("wild-%04d", j)
 		c := &client{id: id, connID: ConnectionID("conn-" + id)}
-		b.index.setLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
+		b.index.SetLive(namespaceKey(b.namespace, id), c, map[string]sessionstate.Subscription{
 			fmt.Sprintf("other%04d/+/temp", j): {QoS: 1},
 		})
 	}

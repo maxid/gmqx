@@ -1270,6 +1270,22 @@ func (c *client) handlePublish(v mqtt.PublishView) {
 	}
 }
 
+// ClientID, ConnectionID and DeliverPublish implement routing.Endpoint: the three
+// things the routing table needs from a live connection, and nothing else. They are
+// exported on an unexported type on purpose — the interface is what gmqx/routing
+// names, while the connection state machine stays in the engine.
+func (c *client) ClientID() string { return c.id }
+
+// ConnectionID implements routing.Endpoint.
+func (c *client) ConnectionID() ConnectionID { return c.connID }
+
+// DeliverPublish implements routing.Endpoint by writing (or, when its hand-off
+// window has begun, queueing) one PUBLISH with the delivery rules of this
+// connection.
+func (c *client) DeliverPublish(topic string, payload []byte, qos byte, retain bool, props mqtt.Properties) error {
+	return c.sendPublish(topic, payload, qos, retain, props)
+}
+
 func (c *client) handleSubscribe(m *mqtt.Subscribe) {
 	// Subscription Identifiers are accepted: the CONNACK this connection was
 	// admitted with advertises Subscription Identifier Available 1 (props.go). A

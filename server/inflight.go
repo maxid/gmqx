@@ -60,6 +60,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
+	"github.com/maxid/gmqx/routing"
 	sessionstate "github.com/maxid/gmqx/session"
 )
 
@@ -686,7 +687,7 @@ func (c *client) sendPublish(topic string, payload []byte, qos byte, retain bool
 		clientID := c.id
 		c.mu.Unlock()
 		c.broker.enqueueOffline(
-			LocalTarget{ClientID: clientID, sessionKey: key, QoS: qos, Retain: retain},
+			routing.OfflineTarget(clientID, key, qos, retain),
 			deliveryPublication(topic, payload, qos, retain, props), props)
 		return nil
 	}

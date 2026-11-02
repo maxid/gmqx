@@ -148,7 +148,7 @@ func (b *Broker) deleteStoredSession(key string) {
 		b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
 	}
 	b.store.Delete(key)
-	b.index.remove(key)
+	b.index.Remove(key)
 }
 
 // saveStoredSession writes the state the connection c leaves behind: its
@@ -180,7 +180,9 @@ func (b *Broker) saveStoredSession(key string, c *client) {
 	b.store.Save(key, state)
 	b.offlineQueued += len(c.queue)
 	c.queue = nil
-	b.index.setStored(key, c.id, c.subs, expiresAt)
+	// The index is fed the same subscription set the store just got, so a publish
+	// that matches the session is routed exactly like a restored one.
+	b.index.SetStored(key, state.ClientID, state.Subscriptions, expiresAt)
 }
 
 // loadStoredSessions indexes the sessions a store already held when the broker
@@ -203,7 +205,7 @@ func (b *Broker) loadStoredSessions() {
 		if !state.ExpiresAt.IsZero() && !now.Before(state.ExpiresAt) {
 			continue
 		}
-		b.index.setStored(key, state.ClientID, indexedSubscriptions(state.Subscriptions), state.ExpiresAt)
+		b.index.SetStored(key, state.ClientID, state.Subscriptions, state.ExpiresAt)
 	}
 }
 
@@ -357,7 +359,7 @@ func (b *Broker) dropPendingLocked(c *client, reason string) {
 // for. The global cap rejects the newest message, the per-session cap drops the
 // oldest one, and both are counted through the metrics drop hook.
 func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.Properties) {
-	key := target.sessionKey
+	key := target.SessionKey()
 	b.mu.Lock()
 	if live, ok := b.clients[key]; ok {
 		b.mu.Unlock()

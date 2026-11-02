@@ -486,7 +486,7 @@ func TestRedisClusterPresenceFollowsTakeover(t *testing.T) {
 		return presenceNode(t, mr, key) == "b"
 	})
 	waitFor(t, "the old node to drop the routing entry", func() bool {
-		_, ok := a.index.session("roamer")
+		ok := a.index.Has("roamer")
 		return !ok
 	})
 	// Several refresh periods pass; the old node must not take the record back.

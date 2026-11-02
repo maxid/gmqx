@@ -402,6 +402,7 @@ func TestSharedSessionTakeIsAtomic(t *testing.T) {
 	})
 	type attempt struct {
 		present bool
+		conn    net.Conn
 		err     error
 	}
 	attempts := make(chan attempt, 2)
@@ -410,17 +411,19 @@ func TestSharedSessionTakeIsAtomic(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			got, err := connectSessionPresent(node.Addr(), "racing")
-			attempts <- attempt{present: got, err: err}
+			present, conn, err := connectSessionPresent(node.Addr(), "racing")
+			attempts <- attempt{present: present, conn: conn, err: err}
 		}()
 	}
 	wg.Wait()
 	close(attempts)
 	resumed := 0
+	var conns []net.Conn
 	for got := range attempts {
 		if got.err != nil {
 			t.Fatalf("concurrent persistent CONNECT: %v", got.err)
 		}
+		conns = append(conns, got.conn)
 		if got.present {
 			resumed++
 		}
@@ -428,8 +431,15 @@ func TestSharedSessionTakeIsAtomic(t *testing.T) {
 	if resumed != 1 {
 		t.Fatalf("%d nodes resumed the same session, want exactly 1", resumed)
 	}
+	// Both connections are still open, so no disconnect has stored a session again
+	// yet (a persistent session is written back when its connection ends, and both
+	// nodes would write their own copy): what the store holds here is what the take
+	// left, and the take must have removed the session.
 	if mr.Exists(sessionStoreKey("racing")) {
 		t.Fatal("the taken session is still stored")
+	}
+	for _, conn := range conns {
+		conn.Close()
 	}
 }
 
@@ -494,7 +504,7 @@ func TestSharedSessionKeptWhenPeerTookOver(t *testing.T) {
 			}
 			// The session is no longer a routing target here: nothing on this node may
 			// queue for a session the peer owns.
-			if _, indexed := b.index.session("handover"); indexed {
+			if indexed := b.index.Has("handover"); indexed {
 				t.Fatal("the session that moved away is still a local routing target")
 			}
 		})
@@ -618,15 +628,16 @@ func TestMemorySessionStoreIsTheDefault(t *testing.T) {
 	}
 }
 
-// connectSessionPresent sends a persistent MQTT 3.1.1 CONNECT and reports the Session
-// Present flag of the CONNACK. It touches no *testing.T, so a case can run it from a
-// goroutine.
-func connectSessionPresent(addr, clientID string) (bool, error) {
+// connectSessionPresent sends a persistent MQTT 3.1.1 CONNECT, reports the Session
+// Present flag of the CONNACK and returns the still open connection. The caller
+// decides when the session ends, which is what lets a case observe the store before
+// the disconnect writes the session back. It touches no *testing.T, so a case can
+// run it from a goroutine.
+func connectSessionPresent(addr, clientID string) (bool, net.Conn, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	defer conn.Close()
 
 	var body []byte
 	body = appendString(body, "MQTT")
@@ -636,25 +647,30 @@ func connectSessionPresent(addr, clientID string) (bool, error) {
 	frame = append(frame, body...)
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	if _, err := conn.Write(frame); err != nil {
-		return false, err
+		conn.Close()
+		return false, nil, err
 	}
 	r := bufio.NewReader(conn)
 	header, err := r.ReadByte()
 	if err != nil {
-		return false, err
+		conn.Close()
+		return false, nil, err
 	}
 	n, err := readRemainingLength(r)
 	if err != nil {
-		return false, err
+		conn.Close()
+		return false, nil, err
 	}
 	payload := make([]byte, n)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return false, err
+		conn.Close()
+		return false, nil, err
 	}
 	if header>>4 != 2 || len(payload) < 2 {
-		return false, fmt.Errorf("unexpected CONNACK: %#x %v", header, payload)
+		conn.Close()
+		return false, nil, fmt.Errorf("unexpected CONNACK: %#x %v", header, payload)
 	}
-	return payload[0]&0x01 != 0, nil
+	return payload[0]&0x01 != 0, conn, nil
 }
 
 // recordingSharedStore wraps the Redis store and records the writes one broker makes,

@@ -27,9 +27,7 @@ func subscribeShared(t *testing.T, c *confClient, pid uint16, filter string, qos
 // sharedGroupCount is the number of shared groups the routing index holds. It is
 // read under the index lock, because the broker's own goroutines update it.
 func sharedGroupCount(b *Broker) int {
-	b.index.mu.RLock()
-	defer b.index.mu.RUnlock()
-	return len(b.index.shared)
+	return b.index.SharedGroupCount()
 }
 
 // TestSharedSubscriptionRoundRobin is the core of the feature: two members of one
@@ -59,7 +57,7 @@ func TestSharedSubscriptionRoundRobin(t *testing.T) {
 	expectNoMessage(t, second, 100*time.Millisecond)
 
 	// The group survives the churn of the two members and holds both.
-	if groups := b.index.liveSharedGroups(); len(groups) != 1 || groups[0] != "$share/workers/jobs/+" {
+	if groups := b.index.LiveSharedGroups(); len(groups) != 1 || groups[0] != "$share/workers/jobs/+" {
 		t.Fatalf("live shared groups = %v, want the one group", groups)
 	}
 }
@@ -117,7 +115,7 @@ func TestSharedSubscriptionUnsubscribe(t *testing.T) {
 	}
 
 	leaving.unsubscribe(2, "$share/g/u/x")
-	if groups := b.index.liveSharedGroups(); len(groups) != 1 {
+	if groups := b.index.LiveSharedGroups(); len(groups) != 1 {
 		t.Fatalf("live shared groups after one unsubscribe = %v, want the group to survive", groups)
 	}
 
@@ -144,7 +142,7 @@ func TestSharedSubscriptionUnsubscribe(t *testing.T) {
 	second.unsubscribe(2, "$share/g/u/x")
 	third.unsubscribe(2, "$share/g/u/x")
 	waitFor(t, "the shared group to disappear", func() bool { return sharedGroupCount(b) == 0 })
-	if groups := b.index.liveSharedGroups(); len(groups) != 0 {
+	if groups := b.index.LiveSharedGroups(); len(groups) != 0 {
 		t.Fatalf("live shared groups after every member left = %v, want none", groups)
 	}
 	// A publication to the group's filter now reaches nobody.
@@ -260,7 +258,7 @@ func TestSharedSubscriptionOfflineMemberReceivesNothing(t *testing.T) {
 		t.Fatal("the stored session lost its shared subscription")
 	}
 	// The offline session is not a member of the group.
-	if groups := b.index.liveSharedGroups(); len(groups) != 0 {
+	if groups := b.index.LiveSharedGroups(); len(groups) != 0 {
 		t.Fatalf("live shared groups with only an offline member = %v, want none", groups)
 	}
 
@@ -348,17 +346,17 @@ func BenchmarkSharedTargetSelection(b *testing.B) {
 			for i := 0; i < members; i++ {
 				id := fmt.Sprintf("bench-%06d", i)
 				c := &client{id: id, connID: ConnectionID("conn-" + id)}
-				broker.index.setLive(namespaceKey(broker.namespace, id), c, map[string]sessionstate.Subscription{
+				broker.index.SetLive(namespaceKey(broker.namespace, id), c, map[string]sessionstate.Subscription{
 					group: {QoS: 1},
 				})
 			}
-			if len(broker.index.liveSharedGroups()) != 1 {
+			if len(broker.index.LiveSharedGroups()) != 1 {
 				b.Fatalf("the benchmark group is not indexed")
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				benchSharedTarget, benchSharedOK = broker.index.sharedTarget(group, 1, false)
+				benchSharedTarget, benchSharedOK = broker.index.SharedTarget(group, 1, false)
 			}
 		})
 	}
