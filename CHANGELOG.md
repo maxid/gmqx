@@ -36,6 +36,14 @@
   before. `plugin_codec_test.go` is the acceptance case (JSON→binary, CSV→JSON, and the
   byte-for-byte passthrough after unloading the plugin).
 
+- **The cluster backends live in `gmqx/cluster`.** The gossip, TCP and Redis backends,
+  the configuration types, `ErrNodeIDInUse` and the handler collision interfaces moved
+  there; the root package re-exports every type and constant as an alias, and keeps the
+  constructor forwards (`NewGossipCluster`, `NewTCPCluster`, `NewRedisCluster`,
+  `NewRedisClusterWithSessionStore`), so both import paths name the same types and no
+  consumer changes. The root package is down to 21 implementation files from 26, and
+  the backends carry their own tests (including -race) beside them.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
