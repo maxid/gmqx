@@ -1,4 +1,4 @@
-package server
+package conn
 
 // Byte-rate shaping
 //
@@ -41,21 +41,14 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/maxid/gmqx/hook"
 )
 
-// Defaults of the byte-rate limits. They are high enough to leave normal traffic
-// untouched: a device publishing a few kilobytes per second is three orders of
-// magnitude below them, and the burst absorbs any single maximum-size packet.
-const (
-	defaultMaxReadByteRate       = 8 << 20   // 8 MiB/s per connection
-	defaultMaxWriteByteRate      = 16 << 20  // 16 MiB/s per connection
-	defaultMaxTotalReadByteRate  = 256 << 20 // 256 MiB/s for the whole broker
-	defaultMaxTotalWriteByteRate = 256 << 20
-	// minByteRateBurst is the floor of a bucket's burst: one second of traffic can
-	// be smaller than the largest packet a broker accepts, and a bucket without
-	// room for one packet would delay even the first message of a connection.
-	minByteRateBurst = 16 << 10
-)
+// minByteRateBurst is the floor of a bucket's burst: one second of traffic can be
+// smaller than the largest packet a broker accepts, and a bucket without room for
+// one packet would delay even the first message of a connection.
+const minByteRateBurst = 16 << 10
 
 // ByteRateMetrics is the optional extension of MetricsManager a metrics
 // implementation can add to observe byte-rate shaping. direction is "read" or
@@ -124,23 +117,70 @@ func (l *byteLimiter) reserve(n int) time.Duration {
 	return wait
 }
 
-// shapeConn wraps conn in the broker's byte-rate buckets. A broker whose limits
-// are all disabled gets the connection back unchanged, so the wrapper costs
-// nothing unless it was asked for.
-func (b *Broker) shapeConn(conn net.Conn) net.Conn {
-	read := newByteLimiter(b.cfg.MaxReadByteRate)
-	write := newByteLimiter(b.cfg.MaxWriteByteRate)
-	if read == nil && write == nil && b.readBytes == nil && b.writeBytes == nil {
-		return conn
+// Shaping is what one connection is shaped with: its own per-direction limits, the
+// broker-wide buckets it also charges, and the metrics the waits are reported to.
+// A zero Shaping shapes nothing and Shape returns the connection unchanged.
+type Shaping struct {
+	// ReadRate and WriteRate bound this connection, in bytes per second. A
+	// non-positive value disables that direction.
+	ReadRate  int
+	WriteRate int
+	// ReadTotal and WriteTotal are the broker-wide buckets this connection shares
+	// with every other one. Either may be nil.
+	ReadTotal  *Buckets
+	WriteTotal *Buckets
+	// Metrics receives the throttled-byte counts; nil is accepted.
+	Metrics hook.MetricsManager
+}
+
+// Shape wraps netConn in the byte-rate buckets of s. A connection whose limits are
+// all disabled gets netConn back unchanged, so the wrapper costs nothing unless it
+// was asked for.
+func Shape(netConn net.Conn, s Shaping) net.Conn {
+	read := newByteLimiter(s.ReadRate)
+	write := newByteLimiter(s.WriteRate)
+	if read == nil && write == nil && s.ReadTotal == nil && s.WriteTotal == nil {
+		return netConn
 	}
 	return &shapedConn{
-		Conn:       conn,
-		broker:     b,
+		Conn:       netConn,
+		metrics:    s.Metrics,
 		read:       read,
 		write:      write,
-		readTotal:  b.readBytes,
-		writeTotal: b.writeBytes,
+		readTotal:  s.ReadTotal.readBucket(),
+		writeTotal: s.WriteTotal.writeBucket(),
 	}
+}
+
+// Buckets is one broker's shared byte-rate bucket for each direction: the total a
+// group of connections may move together. A disabled limit is a nil bucket.
+type Buckets struct {
+	read  *byteLimiter
+	write *byteLimiter
+}
+
+// NewBuckets builds the broker-wide buckets of readRate and writeRate bytes per
+// second. A non-positive limit leaves that direction disabled.
+func NewBuckets(readRate, writeRate int) *Buckets {
+	b := &Buckets{read: newByteLimiter(readRate), write: newByteLimiter(writeRate)}
+	if b.read == nil && b.write == nil {
+		return nil
+	}
+	return b
+}
+
+func (b *Buckets) readBucket() *byteLimiter {
+	if b == nil {
+		return nil
+	}
+	return b.read
+}
+
+func (b *Buckets) writeBucket() *byteLimiter {
+	if b == nil {
+		return nil
+	}
+	return b.write
 }
 
 // shapedConn applies the per-connection and broker-wide byte-rate limits to one
@@ -150,7 +190,7 @@ func (b *Broker) shapeConn(conn net.Conn) net.Conn {
 // of sleeping past it.
 type shapedConn struct {
 	net.Conn
-	broker *Broker
+	metrics hook.MetricsManager
 	// read/write are the per-connection buckets, readTotal/writeTotal the
 	// broker-wide ones. Any of them may be nil (that limit is disabled).
 	read, write           *byteLimiter
@@ -213,8 +253,10 @@ func (s *shapedConn) wait(d time.Duration, deadline time.Time) error {
 
 // countThrottled reports bytes whose transfer had to wait.
 func (s *shapedConn) countThrottled(direction string, n int) {
-	s.broker.metrics().RecordOverflow("byte_rate_" + direction)
-	if m, ok := s.broker.metrics().(ByteRateMetrics); ok {
+	if s.metrics != nil {
+		s.metrics.RecordOverflow("byte_rate_" + direction)
+	}
+	if m, ok := s.metrics.(ByteRateMetrics); ok {
 		m.RecordThrottledBytes(direction, n)
 	}
 }

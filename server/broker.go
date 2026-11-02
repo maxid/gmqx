@@ -1,7 +1,3 @@
-// Package gmqx implements a small, embeddable MQTT 3.1.1 broker.
-//
-// The broker is protocol-focused: authentication, ACL, message handling and
-// metrics are pluggable.
 package server
 
 import (
@@ -17,10 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/maxid/gnety"
-	"github.com/maxid/gnety/codec/mqtt"
-	"github.com/maxid/gplugin"
-
 	"github.com/maxid/gmqx/conn"
 	"github.com/maxid/gmqx/hook"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
@@ -28,7 +20,12 @@ import (
 	topicmatch "github.com/maxid/gmqx/internal/topic"
 	retainedstore "github.com/maxid/gmqx/retained"
 	"github.com/maxid/gmqx/routing"
+	"github.com/maxid/gmqx/session"
 	sessionstate "github.com/maxid/gmqx/session"
+	sessionstore "github.com/maxid/gmqx/session"
+	"github.com/maxid/gnety"
+	"github.com/maxid/gnety/codec/mqtt"
+	"github.com/maxid/gplugin"
 )
 
 // Broker is a single-node MQTT 3.1.1 broker.
@@ -71,10 +68,10 @@ type Broker struct {
 	// readBytes and writeBytes are the broker-wide byte-rate buckets: every byte
 	// this process reads from a client connection or writes to one is charged to
 	// them, which is what makes MaxTotalReadByteRate/MaxTotalWriteByteRate a limit
-	// on the whole broker instead of on one connection. A disabled limit is a nil
-	// bucket (see byte_rate.go).
-	readBytes  *byteLimiter
-	writeBytes *byteLimiter
+	// on the whole broker instead of on one connection. A disabled limit is nil
+	// (the shaper itself lives in gmqx/conn).
+	readBytes  *conn.Buckets
+	writeBytes *conn.Buckets
 
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
@@ -119,6 +116,14 @@ const (
 	defaultMaxWillDelayInterval    = 5 * time.Minute
 	defaultNotKickSeconds          = 30
 	defaultReceiveMaximum          = 64
+	// Defaults of the byte-rate limits. They are high enough to leave normal
+	// traffic untouched: a device publishing a few kilobytes per second is three
+	// orders of magnitude below them, and the burst absorbs any single
+	// maximum-size packet (the shaping itself lives in gmqx/conn).
+	defaultMaxReadByteRate       = 8 << 20   // 8 MiB/s per connection
+	defaultMaxWriteByteRate      = 16 << 20  // 16 MiB/s per connection
+	defaultMaxTotalReadByteRate  = 256 << 20 // 256 MiB/s for the whole broker
+	defaultMaxTotalWriteByteRate = 256 << 20
 	// defaultPortFallback is how many ports above the configured one a listener
 	// may try before Start fails.
 	defaultPortFallback = 16
@@ -293,8 +298,8 @@ func New(cfg Config) (*Broker, error) {
 	// The broker-wide half of the byte-rate shaping: one bucket each for every
 	// byte read from and written to every connection of this process. A disabled
 	// limit (negative) is a nil bucket, which the shaper skips.
-	b.readBytes = newByteLimiter(cfg.MaxTotalReadByteRate)
-	b.writeBytes = newByteLimiter(cfg.MaxTotalWriteByteRate)
+	b.readBytes = conn.NewBuckets(cfg.MaxTotalReadByteRate, 0)
+	b.writeBytes = conn.NewBuckets(0, cfg.MaxTotalWriteByteRate)
 	b.presence, _ = cfg.ClusterBackend.(clientPresence)
 	b.sharedNodes, _ = cfg.ClusterBackend.(sharedDirectory)
 	b.dispatcher = newDispatcher(cfg.Dispatcher, b)
@@ -752,6 +757,28 @@ func (b *Broker) serve(netConn net.Conn) {
 	defer b.unregister(c)
 	c.Loop()
 }
+
+// shapeConn applies the broker's byte-rate limits to one accepted connection. The
+// shaper itself lives in gmqx/conn, which is where the connection I/O is: this is
+// the broker's half — the per-listener settings and the broker-wide buckets.
+func (b *Broker) shapeConn(netConn net.Conn) net.Conn {
+	if b.cfg.MaxReadByteRate <= 0 && b.cfg.MaxWriteByteRate <= 0 && b.readBytes == nil && b.writeBytes == nil {
+		// The common case: no shaping at all, and no wrapper around the socket.
+		return netConn
+	}
+	return conn.Shape(netConn, conn.Shaping{
+		ReadRate:   b.cfg.MaxReadByteRate,
+		WriteRate:  b.cfg.MaxWriteByteRate,
+		ReadTotal:  b.readBytes,
+		WriteTotal: b.writeBytes,
+		Metrics:    b.metrics(),
+	})
+}
+
+// ByteRateMetrics is the optional extension of hook.MetricsManager that observes
+// byte-rate shaping. It is defined with the shaper in gmqx/conn and re-exported
+// here, so a metrics implementation names the same type through either import.
+type ByteRateMetrics = conn.ByteRateMetrics
 
 // register enforces connect mode and connection limits, then records the
 // session and calls the dispatcher. A persistent session (clean session / clean
@@ -2008,3 +2035,970 @@ func (r *rateLimiter) allow() bool {
 func namespaceKey(namespace, name string) string { return ns.Key(namespace, name) }
 
 func keyInNamespace(namespace, key string) bool { return ns.InNamespace(namespace, key) }
+
+// The host side of the connection seam
+//
+// gmqx/conn owns the protocol state machine; everything it cannot know — the
+// namespace, the resolved per-connection limits, the swappable extension
+// snapshots, the publish/subscribe/retained path, the session handoff and the
+// delayed-will scheduler — is this file. Most methods are one-line adapters over
+// the broker's own helpers, so the engine keeps a single implementation of each
+// behavior and the connection only sees the interface.
+//
+// Naming: the interface method is the exported spelling (Metrics, Sink, Register),
+// the broker's internal helper keeps its lower-case name (metrics, sink, register).
+// A method pair that differs only in case is deliberate here: the exported one is
+// the seam, the unexported one is what the rest of the engine calls.
+
+// MaxAuthSteps is the number of AUTH challenges one exchange may run; the limit is
+// enforced by the connection's exchange loop, and the constant lives with it.
+const MaxAuthSteps = conn.MaxAuthSteps
+
+// Second implements conn.Host: the protocol second a connection measures
+// keep-alive, session expiry and will delay in.
+func (b *Broker) Second() time.Duration { return b.second() }
+
+// Limits implements conn.Host: the per-connection settings, with the broker's
+// defaults already applied by the helpers that own them.
+func (b *Broker) Limits() conn.Limits {
+	return conn.Limits{
+		MaxPacketSize:           b.cfg.MaxPacketSize,
+		ReceiveMaximum:          b.receiveMaximum(),
+		MaxInflightQoS1:         b.cfg.MaxInflightQoS1,
+		MaxInflightQoS2:         b.cfg.MaxInflightQoS2,
+		MaxInflightQueueSize:    b.cfg.MaxInflightQueueSize,
+		MaxOfflineQueueSize:     b.cfg.MaxOfflineQueueSize,
+		MaxTotalOfflineMessages: b.cfg.MaxTotalOfflineMessages,
+		MaxOutboundQueueSize:    b.cfg.MaxOutboundQueueSize,
+		WriteTimeout:            b.cfg.WriteTimeout,
+		// The two resolved settings: a negative will delay disables delayed wills
+		// and a zero connect timeout means the documented default, so the broker
+		// decides them once (see connectTimeout, maxWillDelayInterval).
+		ConnectTimeout:       b.connectTimeout(),
+		MaxWillDelayInterval: b.maxWillDelayInterval(),
+		AuthTimeout:          b.cfg.AuthTimeout,
+		QoSRetryInterval:     b.cfg.QoSRetryInterval,
+		QoSMaxRetries:        b.cfg.QoSMaxRetries,
+		ConnContext:          b.cfg.ConnContext,
+	}
+}
+
+// Metrics implements conn.Host.
+func (b *Broker) Metrics() hook.MetricsManager { return b.metrics() }
+
+// Sink implements conn.Host.
+func (b *Broker) Sink() hook.EventSink { return b.sink() }
+
+// Logger implements conn.Host.
+func (b *Broker) Logger() *slog.Logger { return b.log }
+
+// LifecycleContext implements conn.Host.
+func (b *Broker) LifecycleContext() context.Context { return b.lifecycleContext() }
+
+// AuthExchange implements conn.Host.
+func (b *Broker) AuthExchange(method string) hook.AuthExchange { return b.authExchange(method) }
+
+// Authenticate implements conn.Host.
+func (b *Broker) Authenticate(ctx context.Context, info hook.ConnectInfo) error {
+	return b.authenticate(ctx, info)
+}
+
+// Register implements conn.Host.
+func (b *Broker) Register(c *conn.Client) error { return b.register(c) }
+
+// Unregister implements conn.Host.
+func (b *Broker) Unregister(c *conn.Client) { b.unregister(c) }
+
+// Publish implements conn.Host.
+func (b *Broker) Publish(from conn.Origin, ev hook.PublishEvent, props mqtt.Properties) hook.PublishResult {
+	return b.publish(from, ev, props)
+}
+
+// Subscribe implements conn.Host.
+func (b *Broker) Subscribe(c *conn.Client, filter string, sub session.Subscription) (byte, bool) {
+	return b.subscribe(c, filter, sub)
+}
+
+// Unsubscribe implements conn.Host.
+func (b *Broker) Unsubscribe(c *conn.Client, filter string) { b.unsubscribe(c, filter) }
+
+// SendRetained implements conn.Host.
+func (b *Broker) SendRetained(c *conn.Client, filter string, qos byte, retainAsPublished bool, ids []uint32) {
+	b.sendRetained(c, filter, qos, retainAsPublished, ids)
+}
+
+// ReceiveMaxFull implements conn.Host.
+func (b *Broker) ReceiveMaxFull(topic string) { b.receiveMaxFull(topic) }
+
+// EnqueueOffline implements conn.Host.
+func (b *Broker) EnqueueOffline(target routing.Target, msg conn.Message) {
+	b.enqueueOffline(target, Publication{
+		Topic:    msg.Topic,
+		Payload:  msg.Payload,
+		QoS:      msg.QoS,
+		Retain:   msg.Retain,
+		props:    msg.Props,
+		propsSet: true,
+	}, msg.Props)
+}
+
+// ScheduleWill implements conn.Host.
+func (b *Broker) ScheduleWill(c *conn.Client, delay time.Duration, ev hook.PublishEvent, props mqtt.Properties) {
+	b.scheduleWill(c, namespaceKey(b.namespace, c.ID()), delay, ev, props)
+}
+
+// Persistent-session bookkeeping
+//
+// The state itself — the subscriptions to restore, the messages queued while the
+// session was offline, the QoS 2 state of both directions and the expiry deadline —
+// lives in gmqx/session (State, with Stored/StateFromStored as the projection to
+// the SessionStore form). This file is the broker side of it: when the state is
+// taken from a store, written back, swept, and how the offline queue and its caps
+// follow it.
+//
+// The broker stores a session only when it has no live connection. While a
+// connection owns the session its subscriptions live on the connection and the
+// connection has taken the queued messages over (they drain right after the
+// CONNACK), so the store and Broker.clients never hold the same key at the same
+// time. That invariant is what makes a publication reach an offline session
+// exactly once: LocalTargets reads the offline half, SendLocal re-checks it, and a
+// session that reconnected in between receives the message on its live connection
+// instead of a stale queue.
+//
+// The reference broker of this family also queues for clean sessions; gmqx does
+// not, because a clean session is deleted with its connection and recreated empty
+// by the next CONNECT — a queued message would be delivered to a session that
+// declared it wanted none.
+
+// takeStoredSession removes the stored session of key and hands it to a
+// connection. The caller holds b.mu. The global offline-queue counter follows the
+// messages that leave the store, because those messages are now owned by the
+// connection.
+//
+// An expired session is never handed over, even when the sweeper has not reached
+// it yet: the Session Expiry Interval is a deadline, not a hint.
+//
+// The removal is atomic when the store provides Take (a shared store must: see
+// sessionTaker), so two nodes that reconnect the same client id cannot both be
+// handed the session. A node-local store is taken with Load followed by Delete,
+// which its own broker lock already serialises.
+func (b *Broker) takeStoredSession(key string) (*sessionstate.State, bool) {
+	state, ok := b.takeSessionState(key)
+	if !ok {
+		return nil, false
+	}
+	b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
+	if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
+		b.metrics().RecordDroppedMessage("session_expired")
+		return nil, false
+	}
+	s, dropped := sessionstate.StateFromStored(state)
+	if dropped > 0 {
+		b.log.Warn("gmqx dropped queued messages with an undecodable property block",
+			"client", s.ClientID, "count", dropped)
+		b.metrics().RecordDroppedMessage("offline_queue_corrupt")
+	}
+	return s, true
+}
+
+// takeSessionState removes the state stored under key and returns it: one atomic
+// operation for a store that implements Take, Load and Delete otherwise.
+func (b *Broker) takeSessionState(key string) (SessionState, bool) {
+	if taker, ok := b.store.(sessionTaker); ok {
+		return taker.Take(key)
+	}
+	state, ok := b.store.Load(key)
+	if !ok {
+		return SessionState{}, false
+	}
+	b.store.Delete(key)
+	return state, true
+}
+
+// sharedStore reports whether Config.SessionStore is read and written by several
+// broker nodes, which is what decides whether a connection displaced by a peer's
+// kick may still write to it (see unregister).
+func (b *Broker) sharedStore() bool {
+	shared, ok := b.store.(SharedSessionStore)
+	return ok && shared.SharedAcrossNodes()
+}
+
+// deleteStoredSession removes key and forgets its queued messages. The caller
+// holds b.mu. The session leaves the routing index with it: an expired or
+// discarded session must not be a target any more.
+func (b *Broker) deleteStoredSession(key string) {
+	if state, ok := b.store.Load(key); ok {
+		b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
+	}
+	b.store.Delete(key)
+	b.index.Remove(key)
+}
+
+// saveStoredSession writes the state the connection c handed over: its
+// subscriptions, the queue it did not manage to drain plus the deliveries it
+// still owed, and its expiry deadline. The caller holds b.mu, and the connection
+// runs it from inside conn.Client.HandOff, so no delivery can observe the handoff
+// before the state is stored.
+//
+// The session's filters move from live to stored in the routing index here: from
+// this point a matching publication is queued for it instead of written to a
+// connection, and no store call is needed to find out that it is a target.
+func (b *Broker) saveStoredSession(key string, h *conn.Handoff) {
+	if stale, ok := b.store.Load(key); ok {
+		// Defensive: a stored session of a live connection should not exist, but
+		// the counter must follow what the store actually holds.
+		b.offlineQueued = max(0, b.offlineQueued-len(stale.Queue))
+	}
+	// One deadline for both halves: the store the sweeper enforces and the index
+	// that decides whether a publication still finds a target.
+	queue := b.adoptQueue(h)
+	state := (&sessionstate.State{
+		ClientID:    h.ClientID,
+		Subs:        h.Subs,
+		Queue:       queue,
+		ExpiresAt:   h.ExpiresAt,
+		InboundQoS2: h.InboundQoS2,
+		Inflight:    h.Inflight,
+	}).Stored()
+	b.store.Save(key, state)
+	b.offlineQueued += len(queue)
+	// The index is fed the same subscription set the store just got, so a publish
+	// that matches the session is routed exactly like a restored one.
+	b.index.SetStored(key, state.ClientID, state.Subscriptions, h.ExpiresAt)
+}
+
+// adoptQueue merges the deliveries a connection still owed its inflight window
+// into the queue it hands over, in the order they were queued. They were
+// acknowledged to their publisher and never written, so a persistent session must
+// not lose them with the connection: they take their place behind whatever the
+// offline queue still holds, which is where the next CONNECT drains them from.
+//
+// This queue is what a persistent session gets instead of a drop when its inflight
+// queue overflows (see conn's sendPublish), and it is also what a connection that
+// simply went away leaves behind. The queue's own bounds apply exactly as they do
+// to a message published while the session is offline — Config.MaxOfflineQueueSize
+// drops the oldest messages of the combined queue, Config.MaxTotalOfflineMessages
+// rejects the newest — and they are counted with the same reasons
+// ("offline_queue_full", "offline_queue_total"), so the offline queue's capacity
+// stays the single, documented loss point of a persistent session.
+//
+// The caller holds b.mu.
+func (b *Broker) adoptQueue(h *conn.Handoff) []sessionstate.Pending {
+	queue := h.Queue
+	rejected := 0
+	for _, m := range h.Pending {
+		if limit := b.cfg.MaxTotalOfflineMessages; limit > 0 && b.offlineQueued+len(queue) >= limit {
+			rejected++
+			continue
+		}
+		queue = append(queue, m)
+	}
+	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(queue) > maxQueue {
+		queue = queue[len(queue)-maxQueue:]
+		b.metrics().RecordDroppedMessage("offline_queue_full")
+	}
+	for i := 0; i < rejected; i++ {
+		b.metrics().RecordDroppedMessage("offline_queue_total")
+	}
+	return queue
+}
+
+// loadStoredSessions indexes the sessions a store already held when the broker
+// was created: a deployment restores session state before New, and those sessions
+// have to be local targets from the first publication on. A session whose deadline
+// already passed is skipped — nothing is queued for it, and the sweeper deletes
+// it. A store that is written behind the broker's back while it runs is not
+// re-read: the broker indexes what it saves, hands over and expires.
+func (b *Broker) loadStoredSessions() {
+	now := time.Now()
+	for _, key := range b.store.Keys() {
+		if !keyInNamespace(b.namespace, key) {
+			// A store may be shared with a broker of another namespace.
+			continue
+		}
+		state, ok := b.store.Load(key)
+		if !ok {
+			continue
+		}
+		if !state.ExpiresAt.IsZero() && !now.Before(state.ExpiresAt) {
+			continue
+		}
+		b.index.SetStored(key, state.ClientID, state.Subscriptions, state.ExpiresAt)
+	}
+}
+
+// maxSessionSweepPerTick bounds how many stored sessions one sweep tick examines,
+// so the sweeper's cost per tick stays bounded no matter how many sessions a
+// broker holds. Map iteration order is randomized, so a session that is not
+// reached in one tick is reached by a later one.
+const maxSessionSweepPerTick = 512
+
+// sessionSweeper deletes the sessions whose Session Expiry Interval elapsed. One
+// goroutine per broker, started by Start and ended by Stop; no timer per session.
+func (b *Broker) sessionSweeper() {
+	interval := b.cfg.SessionSweepInterval
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.done:
+			return
+		case <-ticker.C:
+			b.sweepExpiredSessions()
+		}
+	}
+}
+
+// sweepExpiredSessions removes the stored sessions whose deadline has passed.
+// Subscriptions and queued messages go with them: the session is gone.
+func (b *Broker) sweepExpiredSessions() {
+	now := time.Now()
+	checked := 0
+	for _, key := range b.store.Keys() {
+		if checked >= maxSessionSweepPerTick {
+			return
+		}
+		if !keyInNamespace(b.namespace, key) {
+			// A store may be shared with a broker of another namespace; its
+			// sessions are that broker's to expire.
+			continue
+		}
+		checked++
+		stored, ok := b.store.Load(key)
+		if !ok || stored.ExpiresAt.IsZero() || now.Before(stored.ExpiresAt) {
+			continue
+		}
+		b.mu.Lock()
+		if _, connected := b.clients[key]; connected {
+			// The session has an owner; its next disconnect stamps a new deadline.
+			b.mu.Unlock()
+			continue
+		}
+		// Re-read under the lock: a reconnect or a new publish may have changed
+		// the entry since the check above.
+		current, ok := b.store.Load(key)
+		if ok && !current.ExpiresAt.IsZero() && !now.Before(current.ExpiresAt) {
+			b.deleteStoredSession(key)
+			// The session is gone, so no directed publish can be queued for it
+			// here any more: a presence-tracking cluster backend stops routing it to
+			// this node.
+			b.forgetClientPresence(current.ClientID)
+			b.metrics().RecordDroppedMessage("session_expired")
+			b.metrics().RecordQueueDepth("offline", b.offlineQueued)
+		}
+		b.mu.Unlock()
+	}
+}
+
+// enqueueOffline appends one publication to the queue of the persistent session
+// target names. It is the write half of an offline LocalTarget.
+//
+// Routing is a snapshot, so the session may have reconnected since LocalTargets
+// ran: then the message goes to the live connection instead of a queue nobody
+// would drain. A session that is gone (cleaned or expired) has nothing to queue
+// for. The global cap rejects the newest message, the per-session cap drops the
+// oldest one, and both are counted through the metrics drop hook.
+func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.Properties) {
+	key := target.SessionKey()
+	b.mu.Lock()
+	if live, ok := b.clients[key]; ok {
+		b.mu.Unlock()
+		// A live connection owns the session now, so delivery is live again.
+		_ = live.DeliverPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
+		return
+	}
+	state, ok := b.store.Load(key)
+	if !ok {
+		b.mu.Unlock()
+		b.metrics().RecordDroppedMessage("offline_session_missing")
+		return
+	}
+	if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
+		// The session is past its deadline and only waits for the sweeper.
+		b.mu.Unlock()
+		b.metrics().RecordDroppedMessage("offline_session_missing")
+		return
+	}
+	if limit := b.cfg.MaxTotalOfflineMessages; limit > 0 && b.offlineQueued >= limit {
+		b.mu.Unlock()
+		b.metrics().RecordDroppedMessage("offline_queue_total")
+		return
+	}
+	queue := make([]QueuedMessage, 0, len(state.Queue)+1)
+	queue = append(queue, state.Queue...)
+	// The queued message keeps the MQTT 5 property block of the delivery, which
+	// carries the target's subscription identifiers when it has any: they are part
+	// of the subscription state and have to be there when the session drains its
+	// queue after the next CONNACK. Without them the block the publisher sent is
+	// stored unchanged, so an ordinary message is not re-encoded.
+	wireProps := pub.Props
+	if len(props.SubscriptionIdentifiers) > 0 {
+		if encoded, err := mqtt5.EncodePropertyBlock(props); err == nil {
+			wireProps = encoded
+		}
+	}
+	queue = append(queue, QueuedMessage{
+		Topic:   pub.Topic,
+		Payload: append([]byte(nil), pub.Payload...),
+		QoS:     target.QoS,
+		Retain:  target.Retain,
+		Props:   append([]byte(nil), wireProps...),
+	})
+	queued := 1
+	evicted := false
+	if maxQueue := b.cfg.MaxOfflineQueueSize; maxQueue > 0 && len(queue) > maxQueue {
+		dropped := len(queue) - maxQueue
+		queue = queue[dropped:]
+		queued -= dropped
+		evicted = true
+	}
+	b.offlineQueued += queued
+	state.Queue = queue
+	b.store.Save(key, state)
+	depth := b.offlineQueued
+	b.mu.Unlock()
+
+	if evicted {
+		b.metrics().RecordDroppedMessage("offline_queue_full")
+	}
+	b.metrics().RecordQueueDepth("offline", depth)
+}
+
+// Delayed wills (MQTT 5 Will Delay Interval)
+//
+// A will is the last message a client asks the server to publish for it. MQTT
+// 3.1.1 publishes it as soon as the connection is gone; MQTT 5 lets the client
+// ask for a delay, so a device that reconnects after a network blip does not
+// announce its own death to the world.
+//
+// The rule is the one MQTT 5 states in §3.1.3.2.2: the will is published when the
+// earlier of two things happens — the Will Delay Interval elapses, or the session
+// ends. Everything else follows from that:
+//
+//   - A session that ends with its connection (Clean Start set, or a zero Session
+//     Expiry Interval) publishes its will immediately, because the delay cannot
+//     outlive the session it belongs to.
+//   - A session with a Session Expiry Interval publishes its will at the expiry
+//     when that comes first, so a delayed will is never left waiting for a session
+//     that no longer exists.
+//   - A CONNECT that resumes the session (same client id) cancels the pending
+//     will [MQTT-3.1.2-28]: a session that comes back must not announce that it
+//     died. That CONNECT is either local (register cancels directly) or on another
+//     node, where the cluster kick it spreads cancels it here (OnRemoteKick).
+//   - A CONNECT with Clean Start set discards the session instead of resuming it,
+//     so the session ends there and the will is published at that moment.
+//   - A broker that stops drops what is pending: it is shutting down, so there is
+//     nowhere to publish the will and no timer may outlive Stop.
+//
+// Scheduling is one timer per pending will, not a broker-wide ticker: a delayed
+// will is rare, and a timer that exists only while the will waits costs nothing
+// when nobody asks for one. The timer fires on its own goroutine, publishes under
+// the broker's lifetime context (the connection's own context is cancelled by
+// then) and removes itself from the map before publishing, so a will is published
+// at most once even when a cancellation and the timer race.
+//
+// What the connection decides (the delay, the identity the will is published
+// under) lives in gmqx/conn; what outlives the connection — the map and its
+// timers — stays here.
+
+// pendingWill is a will waiting for its Will Delay Interval to elapse. It is
+// stored under the namespace-scoped client id it belongs to, which is what a
+// CONNECT of the same session cancels.
+type pendingWill struct {
+	// origin is the identity the will is published under once it fires: the
+	// connection is closed by then, so it carries the broker's lifetime context
+	// with the connection's hook.ConnInfo instead of the cancelled connection context.
+	origin conn.Origin
+	ev     hook.PublishEvent
+	props  mqtt.Properties
+	timer  *time.Timer
+	// delay is the wait that was scheduled, for the log line.
+	delay time.Duration
+}
+
+// scheduleWill records a delayed will and arms its timer. A will already pending
+// for the same client id is replaced: a session has one will, and the newest
+// connection ended with it.
+func (b *Broker) scheduleWill(c *conn.Client, key string, delay time.Duration, ev hook.PublishEvent, props mqtt.Properties) {
+	pw := &pendingWill{origin: c.WillOrigin(), ev: ev, props: props, delay: delay}
+	// A broker that is stopping has nowhere left to publish the will and must not
+	// arm a timer behind Stop's back; the wills Stop was already holding are
+	// dropped the same way.
+	b.mu.RLock()
+	stopped := b.closed
+	b.mu.RUnlock()
+	if stopped {
+		if b.log != nil {
+			b.log.Debug("gmqx delayed will dropped: broker is stopping", "client", pw.origin.ClientID,
+				"topic", ev.Topic)
+		}
+		return
+	}
+	b.willMu.Lock()
+	if old, ok := b.wills[key]; ok {
+		old.timer.Stop()
+	}
+	// The timer is created under the lock and its callback takes the same lock
+	// first, so the callback cannot observe the map before pw is in it.
+	pw.timer = time.AfterFunc(delay, func() { b.firePendingWill(key, pw) })
+	b.wills[key] = pw
+	b.willMu.Unlock()
+	if b.log != nil {
+		b.log.Debug("gmqx will delayed", "client", pw.origin.ClientID,
+			"connection", string(pw.origin.ConnID), "topic", ev.Topic, "delay", delay)
+	}
+}
+
+// firePendingWill publishes a delayed will whose interval elapsed. It removes the
+// entry first, so a will is published at most once even when a cancellation and
+// the timer race.
+func (b *Broker) firePendingWill(key string, want *pendingWill) {
+	b.willMu.Lock()
+	pw, ok := b.wills[key]
+	if !ok || pw != want {
+		b.willMu.Unlock()
+		return
+	}
+	delete(b.wills, key)
+	b.willMu.Unlock()
+	_ = b.publish(pw.origin, pw.ev, pw.props)
+}
+
+// flushPendingWill publishes a delayed will right away, because the session it
+// belongs to is ending before the delay elapsed: a CONNECT with Clean Start set
+// discards the session [MQTT-3.1.2-29], and the will is published when the
+// session ends.
+func (b *Broker) flushPendingWill(key string) {
+	b.willMu.Lock()
+	pw, ok := b.wills[key]
+	if ok {
+		delete(b.wills, key)
+	}
+	b.willMu.Unlock()
+	if !ok {
+		return
+	}
+	pw.timer.Stop()
+	_ = b.publish(pw.origin, pw.ev, pw.props)
+}
+
+// cancelPendingWill drops the will a closed connection left waiting for its
+// delay. A CONNECT that resumes the session calls it, because a session that
+// comes back must not announce that it died.
+func (b *Broker) cancelPendingWill(key string) {
+	b.willMu.Lock()
+	pw, ok := b.wills[key]
+	if ok {
+		delete(b.wills, key)
+	}
+	b.willMu.Unlock()
+	if ok {
+		pw.timer.Stop()
+		if b.log != nil {
+			b.log.Debug("gmqx delayed will cancelled by a reconnect", "client", pw.origin.ClientID,
+				"connection", string(pw.origin.ConnID), "delay", pw.delay)
+		}
+	}
+}
+
+// dropPendingWills forgets every delayed will. Stop calls it: the broker is
+// shutting down, so there is no subscriber left to publish to, and no timer may
+// outlive the broker.
+func (b *Broker) dropPendingWills() {
+	b.willMu.Lock()
+	pending := b.wills
+	b.wills = make(map[string]*pendingWill)
+	b.willMu.Unlock()
+	for _, pw := range pending {
+		pw.timer.Stop()
+	}
+}
+
+// extensions is the mutable half of a broker's configuration: the hooks an
+// application can swap while the broker runs. It is immutable once stored, so a
+// publish reads one consistent snapshot instead of a field that another goroutine
+// is rewriting; a setter clones the snapshot, changes it and swaps it.
+//
+// Everything that is not here stays configuration: a listener address, a limit or a
+// cluster backend cannot be swapped after Start, and pretending otherwise would
+// make the broker's behaviour depend on call order.
+type extensions struct {
+	auth         hook.AuthManager
+	acl          hook.AclManager
+	sink         hook.EventSink
+	metrics      hook.MetricsManager
+	interceptors []*interceptorSlot
+	transcoders  []*transcoderSlot
+}
+
+// interceptorSlot and transcoderSlot wrap a hook so Add* can hand back a remove
+// function: slots are compared by pointer, because a hook's dynamic type may be a
+// function type and interfaces holding functions are not comparable.
+type interceptorSlot struct{ fn hook.Interceptor }
+
+type transcoderSlot struct{ fn hook.Transcoder }
+
+// interceptorSlots wraps the configured interceptors into slots, so a
+// configuration-time interceptor and one a plugin adds later behave the same.
+func interceptorSlots(interceptors []Interceptor) []*interceptorSlot {
+	if len(interceptors) == 0 {
+		return nil
+	}
+	slots := make([]*interceptorSlot, 0, len(interceptors))
+	for _, interceptor := range interceptors {
+		slots = append(slots, &interceptorSlot{fn: interceptor})
+	}
+	return slots
+}
+
+// exts returns the current extension snapshot.
+func (b *Broker) exts() *extensions { return b.ext.Load() }
+
+// metrics returns the metrics hook of the current snapshot.
+func (b *Broker) metrics() hook.MetricsManager { return b.exts().metrics }
+
+// sink returns the event sink of the current snapshot.
+func (b *Broker) sink() hook.EventSink { return b.exts().sink }
+
+// acl returns the authorization hook of the current snapshot.
+func (b *Broker) acl() hook.AclManager { return b.exts().acl }
+
+// auth returns the authentication hook of the current snapshot.
+func (b *Broker) auth() hook.AuthManager { return b.exts().auth }
+
+// mutateExtensions applies change to a clone of the current snapshot and publishes
+// it. Setters go through here so a half-written snapshot is never visible.
+func (b *Broker) mutateExtensions(change func(*extensions)) {
+	b.extMu.Lock()
+	defer b.extMu.Unlock()
+	current := b.ext.Load()
+	next := *current
+	next.interceptors = append([]*interceptorSlot(nil), current.interceptors...)
+	next.transcoders = append([]*transcoderSlot(nil), current.transcoders...)
+	change(&next)
+	b.ext.Store(&next)
+}
+
+// SetMetricsManager replaces the metrics hook of a running broker. It implements
+// hook.Host, so a plugin can install one; an application that swaps metrics while
+// connections are live is expected to keep both generations working.
+func (b *Broker) SetMetricsManager(metrics hook.MetricsManager) {
+	b.mutateExtensions(func(e *extensions) { e.metrics = metrics })
+}
+
+// SetEventSink replaces the lifecycle/publication sink of a running broker.
+func (b *Broker) SetEventSink(sink hook.EventSink) {
+	b.mutateExtensions(func(e *extensions) { e.sink = sink })
+}
+
+// SetAclManager replaces the authorization hook of a running broker.
+func (b *Broker) SetAclManager(acl hook.AclManager) {
+	b.mutateExtensions(func(e *extensions) { e.acl = acl })
+}
+
+// SetAuthManager replaces the CONNECT authentication hook of a running broker.
+func (b *Broker) SetAuthManager(auth hook.AuthManager) {
+	b.mutateExtensions(func(e *extensions) { e.auth = auth })
+}
+
+// AddInterceptor appends an interceptor and returns the function that removes it.
+// Interceptors run in registration order; the returned function is safe to call
+// twice.
+func (b *Broker) AddInterceptor(interceptor hook.Interceptor) (remove func()) {
+	slot := &interceptorSlot{fn: interceptor}
+	b.mutateExtensions(func(e *extensions) { e.interceptors = append(e.interceptors, slot) })
+	removed := false
+	return func() {
+		if removed {
+			return
+		}
+		removed = true
+		b.mutateExtensions(func(e *extensions) {
+			kept := e.interceptors[:0]
+			for _, existing := range e.interceptors {
+				if existing != slot {
+					kept = append(kept, existing)
+				}
+			}
+			e.interceptors = kept
+		})
+	}
+}
+
+// AddTranscoder appends a payload transcoder and returns the function that removes
+// it. Transcoders run in registration order, after the sink accepted a publication
+// and before it is retained or routed.
+func (b *Broker) AddTranscoder(transcoder hook.Transcoder) (remove func()) {
+	slot := &transcoderSlot{fn: transcoder}
+	b.mutateExtensions(func(e *extensions) { e.transcoders = append(e.transcoders, slot) })
+	removed := false
+	return func() {
+		if removed {
+			return
+		}
+		removed = true
+		b.mutateExtensions(func(e *extensions) {
+			kept := e.transcoders[:0]
+			for _, existing := range e.transcoders {
+				if existing != slot {
+					kept = append(kept, existing)
+				}
+			}
+			e.transcoders = kept
+		})
+	}
+}
+
+// Codecs returns the payload encodings this broker offers to its plugins. The
+// broker never picks a codec itself: an application-side plugin registers the
+// encodings it understands and wires them into a transcoder or a dispatcher.
+func (b *Broker) Codecs() *hook.CodecSet { return b.codecs }
+
+// Plugins returns the registry of application plugins attached to this broker.
+//
+// It is created with the broker, so a plugin can be added before or after Start:
+//
+//	broker.Plugins().Add(jsonCodecPlugin)
+//	if err := broker.Plugins().Start("json-codec"); err != nil { ... }
+//	for _, status := range broker.Plugins().Snapshot() { ... }   // what runs, and why not
+//
+// The host a plugin receives is the broker itself (hook.Host), which is what makes
+// the slots above reachable without importing the broker's internals.
+func (b *Broker) Plugins() *gplugin.Registry[hook.Host] { return b.plugins }
+
+// Publication is one accepted publication the broker routes. It is the payload
+// of the routing SPI: QoS and Retain are the values the client published, Dup
+// reports a retransmission, and FromClientID/FromConnectionID name the session
+// that produced it (both are empty for an event that came from a peer node).
+// Props is the MQTT 5 PUBLISH property block without its length prefix, nil for
+// MQTT 3.1.1 traffic.
+type Publication struct {
+	Namespace        string
+	Topic            string
+	Payload          []byte
+	QoS              byte
+	Retain           bool
+	Dup              bool
+	FromClientID     string
+	FromConnectionID string
+	Props            []byte
+
+	// props is the typed mirror of Props for publications the broker built
+	// itself. SendLocal uses it directly instead of decoding Props once per
+	// local target; a Publication built by a dispatcher only carries Props.
+	props    mqtt.Properties
+	propsSet bool
+}
+
+// Dispatcher is the single decision point for where an accepted publication
+// goes. The broker authorizes, runs every Interceptor and calls the EventSink
+// first; only a publication the sink accepted reaches Dispatch. Suppressing it
+// here therefore suppresses delivery, not the acknowledgement the sink already
+// granted.
+//
+// A Dispatcher must not re-implement topic matching. It routes through the
+// broker's read-only seam instead:
+//
+//	targets := broker.LocalTargets(pub)        // sessions whose subscriptions match
+//	for _, t := range targets {
+//	    _ = broker.SendLocal(ctx, t, pub)      // one PUBLISH to one of them
+//	}
+//	return broker.SpreadPublication(ctx, pub)  // forward to the cluster backend
+//
+// A dispatcher that needs the seam implements DispatcherBinder; the broker binds
+// itself before the first publication is routed. Retained state is not part of
+// routing: the broker stores an accepted retained publication before Dispatch, so
+// a dispatcher decides where live publications go, not what is retained.
+//
+// Config.Dispatcher == nil selects DefaultDispatcher, which is the behavior of a
+// broker without the SPI: local delivery plus a cluster spread.
+type Dispatcher interface {
+	Dispatch(ctx context.Context, pub Publication) error
+}
+
+// DispatcherBinder is implemented by a Dispatcher that needs the broker's
+// routing seam (LocalTargets, SendLocal, SpreadPublication). The broker calls
+// Bind once, from New, before any connection can publish.
+type DispatcherBinder interface {
+	Bind(b *Broker)
+}
+
+// AllowAll permits every connection/subscription/publish.
+type AllowAll struct{}
+
+func (AllowAll) Authenticate(context.Context, ConnectInfo) error            { return nil }
+func (AllowAll) RequiresOffload() bool                                      { return false }
+func (AllowAll) Check(context.Context, SessionInfo, string, AclAction) bool { return true }
+
+// DenyAll rejects every connection.
+type DenyAll struct{}
+
+func (DenyAll) Authenticate(context.Context, ConnectInfo) error { return ErrUnauthorized }
+func (DenyAll) RequiresOffload() bool                           { return false }
+
+// The enhanced-authentication seam: the broker owns the factory and the method it
+// advertises, the connection (gmqx/conn) owns the packet flow of one exchange.
+
+// authExchange returns the exchange of method, or nil when this broker does not
+// support the method. Nil is the answer for every method when
+// Config.Authenticator is unset, for a method outside a non-empty
+// Config.AuthMethods, and for a factory that declines the method or returns an
+// exchange that reports a different one.
+func (b *Broker) authExchange(method string) hook.AuthExchange {
+	if method == "" || b.cfg.Authenticator == nil {
+		return nil
+	}
+	if len(b.cfg.AuthMethods) > 0 {
+		supported := false
+		for _, advertised := range b.cfg.AuthMethods {
+			if advertised == method {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return nil
+		}
+	}
+	exchange := b.cfg.Authenticator(method)
+	if exchange == nil {
+		return nil
+	}
+	if got := exchange.Method(); got != method {
+		// A factory that answers one method with an exchange for another is a
+		// configuration error: the broker would name the wrong method in the AUTH
+		// packets, and the client's CONNACK would not match its CONNECT.
+		if b.log != nil {
+			b.log.Warn("gmqx authenticator returned an exchange for another method",
+				"method", method, "exchange_method", got)
+		}
+		return nil
+	}
+	return exchange
+}
+
+// The extension contracts live in ./hook. Every name below is an alias, so a consumer
+// keeps importing this package and still gets the hook type: one definition, two import
+// paths. New code may import github.com/maxid/gmqx/hook directly — both spellings are the
+// same type, so they mix freely.
+type (
+	// LocalTarget is one local session a publication matches. Its fields are
+	// read-only reporting; pass the value back to Broker.SendLocal to write the
+	// PUBLISH. A LocalTarget is only valid for the broker that produced it.
+	//
+	// The type is defined in gmqx/routing (the routing table is what produces it)
+	// and re-exported here as an alias, so a Dispatcher keeps naming it the same way.
+	LocalTarget = routing.Target
+
+	ConnectInfo    = hook.ConnectInfo
+	AuthManager    = hook.AuthManager
+	AuthStatus     = hook.AuthStatus
+	AuthStep       = hook.AuthStep
+	AuthExchange   = hook.AuthExchange
+	AclAction      = hook.AclAction
+	SessionInfo    = hook.SessionInfo
+	AclManager     = hook.AclManager
+	ConnectionID   = hook.ConnectionID
+	ConnInfo       = hook.ConnInfo
+	Disposition    = hook.Disposition
+	PublishResult  = hook.PublishResult
+	PublishEvent   = hook.PublishEvent
+	EventSink      = hook.EventSink
+	MetricsManager = hook.MetricsManager
+	NoopMetrics    = hook.NoopMetrics
+	Interceptor    = hook.Interceptor
+)
+
+const (
+	AuthContinue  = hook.AuthContinue
+	AuthSucceeded = hook.AuthSucceeded
+	AuthFailed    = hook.AuthFailed
+
+	AclSubscribe = hook.AclSubscribe
+	AclPublish   = hook.AclPublish
+
+	PublishAccepted  = hook.PublishAccepted
+	PublishRetryable = hook.PublishRetryable
+	PublishRejected  = hook.PublishRejected
+
+	ReasonUnspecified            = hook.ReasonUnspecified
+	ReasonProtocolError          = hook.ReasonProtocolError
+	ReasonNotAuthorized          = hook.ReasonNotAuthorized
+	ReasonBadAuthMethod          = hook.ReasonBadAuthMethod
+	ReasonSessionTakenOver       = hook.ReasonSessionTakenOver
+	ReasonQuotaExceeded          = hook.ReasonQuotaExceeded
+	ReasonConnectionRateExceeded = hook.ReasonConnectionRateExceeded
+)
+
+// ContextWithConn forwards to hook.ContextWithConn, so a consumer needs one import.
+func ContextWithConn(ctx context.Context, info ConnInfo) context.Context {
+	return hook.ContextWithConn(ctx, info)
+}
+
+// ConnFromContext forwards to hook.ConnFromContext.
+func ConnFromContext(ctx context.Context) (ConnInfo, bool) { return hook.ConnFromContext(ctx) }
+
+// The session store lives in gmqx/session (docs/design/source-layout.md §2, rule L3):
+// the root package re-exports its types as aliases and forwards the constructors, so
+// Config.SessionStore, an implementation outside this module (contrib/sessionstore-
+// gcache) and the stores this package ships all name the same types as before.
+
+type (
+	// SessionStore is the persistence seam of persistent-session state.
+	SessionStore = sessionstore.SessionStore
+	// SharedSessionStore is a SessionStore that several broker nodes share.
+	SharedSessionStore = sessionstore.SharedSessionStore
+	// SessionState is the state of one persistent session with no live connection.
+	SessionState = sessionstore.SessionState
+	// InflightStage is where a stored outbound exchange stood when its connection
+	// ended.
+	InflightStage = sessionstore.InflightStage
+	// SessionInflight is one outbound QoS 1/2 exchange a session owes its client.
+	SessionInflight = sessionstore.SessionInflight
+	// SessionSubscription is one subscription of a stored sessionstore.
+	SessionSubscription = sessionstore.SessionSubscription
+	// QueuedMessage is one message queued for an offline persistent sessionstore.
+	QueuedMessage = sessionstore.QueuedMessage
+	// MemorySessionStore is the default node-local store.
+	MemorySessionStore = sessionstore.MemorySessionStore
+	// RedisSessionStore is the store shared by the nodes of a Redis cluster.
+	RedisSessionStore = sessionstore.RedisSessionStore
+	// RedisSessionStoreConfig configures the Redis-backed store.
+	RedisSessionStoreConfig = sessionstore.RedisSessionStoreConfig
+)
+
+const (
+	InflightAwaitPuback  = sessionstore.InflightAwaitPuback
+	InflightAwaitPubrec  = sessionstore.InflightAwaitPubrec
+	InflightAwaitPubcomp = sessionstore.InflightAwaitPubcomp
+)
+
+// NewMemorySessionStore builds the default node-local store.
+func NewMemorySessionStore() *MemorySessionStore { return sessionstore.NewMemorySessionStore() }
+
+// NewRedisSessionStore builds the Redis-backed store and validates its
+// configuration.
+func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, error) {
+	return sessionstore.NewRedisSessionStore(cfg)
+}
+
+// NewRedisClusterWithSessionStore builds the Redis cluster backend and the Redis
+// session store of one cluster from one RedisClusterConfig: both use the same
+// address, database and key prefix, so the sessions a node stores are the ones its
+// peers take over.
+func NewRedisClusterWithSessionStore(cfg RedisClusterConfig) (Cluster, *RedisSessionStore, error) {
+	return sessionstore.NewRedisClusterWithSessionStore(cfg)
+}
+
+// sessionTaker is implemented by a SessionStore that can remove a stored session
+// atomically and hand it to one caller. A shared store needs it: Load followed by
+// Delete is two round trips, so two nodes reconnecting the same client id at the
+// same time could both see the session and both serve it. The method is exported
+// so an implementation outside this module can provide it; the interface is
+// unexported because only the broker decides when to take a sessionstore.
+type sessionTaker interface {
+	Take(key string) (SessionState, bool)
+}
