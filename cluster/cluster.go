@@ -1,0 +1,278 @@
+package cluster
+
+import (
+	"context"
+	"time"
+)
+
+// ClusterEventType identifies a cross-node cluster event.
+type ClusterEventType string
+
+const (
+	ClusterPublish ClusterEventType = "publish"
+	ClusterKick    ClusterEventType = "kick"
+	// ClusterTarget is a directed publish: deliver one publication to one client
+	// id, on whichever node holds it (see Broker.PublishToClient). It carries
+	// ClientID plus the publication fields of ClusterPublish. A receiving node
+	// applies it only when the client id is a session of its own
+	// ClusterMessage.Namespace; a node that does not hold the id drops it and
+	// counts it (Metrics.RecordDroppedMessage("target_unknown")).
+	//
+	// Routing a target event is the backend's choice: a backend with a client-id
+	// presence view (the Redis backend) sends it to the one node that holds the
+	// client, and the built-in TCP mesh, which has no presence, broadcasts it to
+	// every peer and lets each node apply it only if it holds that client id (see
+	// the TCP backend's Spread doc comment). Namespace scoping and (Origin, Seq)
+	// deduplication are the ones every cluster event uses. A peer running an older
+	// build that does not know the type drops the frame in its receive path instead
+	// of misapplying it, so a rolling upgrade degrades a directed publish to a lost
+	// one — which is the transport's at-most-once behaviour anyway.
+	ClusterTarget ClusterEventType = "target"
+)
+
+// ClusterMessage is a cross-node cluster event.
+//
+// Every event carries the identity of the node that produced it: NodeID is the
+// node that handed the event to the cluster, Origin is the node that first
+// produced it and Seq is that origin's event sequence. A cluster backend stamps
+// Origin and Seq on locally produced events and drops an event whose Origin is
+// the receiving node, so a re-broadcast topology cannot loop. Received events
+// are never forwarded: they die at the node that receives them.
+type ClusterMessage struct {
+	Type     ClusterEventType
+	NodeID   string
+	ClientID string
+	Topic    string
+	Payload  []byte
+	QoS      byte
+	Retain   bool
+	Props    []byte
+	// Namespace is the isolation scope the event belongs to: the broker stamps
+	// Config.Namespace on every event it produces and a backend drops an event
+	// whose namespace is not its own, so two namespaces sharing one cluster never
+	// apply each other's publishes, retained state or kicks. The empty string is
+	// the default namespace, which keeps the pre-namespace wire behaviour.
+	Namespace string
+
+	// Shared names the shared subscription groups this event must deliver, one
+	// entry per node: the entry whose Node is the receiving node names the groups
+	// that node has to deliver one member of (see shared.go). The producing node
+	// elects them, so a group is delivered on exactly one node even when its
+	// members live on several. An event that matches no shared group carries none,
+	// and a peer that does not know the field (an older build) ignores it and
+	// delivers no shared copy, which degrades a shared subscription to "no message
+	// across nodes" rather than to a duplicate.
+	Shared []SharedDelivery
+
+	// Origin is the node id of the node that first produced the event. An empty
+	// Origin means "produced locally": the built-in TCP cluster fills it in
+	// before the event leaves the node and never rewrites a received one.
+	Origin string
+	// Seq is the origin's monotonically increasing event sequence number,
+	// starting at 1. Receivers use (Origin, Seq) to drop duplicates. Seq 0 means
+	// "not stamped" and is delivered without deduplication.
+	Seq uint64
+
+	// ConnectTime is the epoch of a kick: when the connection that produced the
+	// event was registered on its own node, in Unix nanoseconds from that node's
+	// wall clock. It is set on ClusterKick only, and it is what lets a receiving
+	// node tell a delayed or reordered kick from a current one instead of closing
+	// a connection that is newer than the one the kick was meant to replace (see
+	// Broker.OnRemoteKick).
+	//
+	// Clock assumption: the value is a wall-clock reading, because a monotonic
+	// reading means nothing on another process. Cross-node ordering therefore
+	// assumes the clocks of a cluster are NTP-synchronised to within the
+	// Config.NotKickSeconds anti-flap window, which is what the receive-side
+	// window bounds: skew larger than that window cannot revive an already
+	// displaced connection, it can only make the peer refuse (or accept) a kick it
+	// would have decided differently, and a refused kick never closes a younger
+	// connection. Within one node nothing is compared across clocks: the local
+	// anti-flap window uses the monotonic reading of the connection's start time.
+	//
+	// Zero means "not stamped": a peer running a build from before kick epochs
+	// sends none, and its kick is applied with the pre-epoch behaviour (see
+	// Broker.OnRemoteKick).
+	ConnectTime int64
+}
+
+// ClusterHandler receives the remote events every backend delivers: a publish and
+// a client-id kick. A directed publish arrives through the optional targetHandler
+// (Broker implements it); a backend that receives a ClusterTarget hands it to that
+// interface when the handler provides it.
+type ClusterHandler interface {
+	OnRemotePublish(msg ClusterMessage)
+	OnRemoteKick(msg ClusterMessage)
+}
+
+// Cluster is a pluggable cluster backend (e.g. Redis pub/sub, gossip).
+//
+// Spread must only be called with locally produced events: a backend may drop
+// an event whose Origin belongs to another node instead of forwarding it.
+//
+// Start may refuse a nodeID that another live process already owns by returning
+// an error that wraps ErrNodeIDInUse: two processes sharing an id would apply
+// every event twice. A backend without shared state (the built-in TCP mesh and
+// the gossip backend) cannot arbitrate that before a peer is seen: the gossip
+// backend refuses the link of a peer that announces this node's own id and keeps
+// the id for itself, while the TCP mesh collapses duplicate links into one
+// member.
+type Cluster interface {
+	Start(ctx context.Context, nodeID string, handler ClusterHandler) error
+	Stop(ctx context.Context) error
+	Spread(ctx context.Context, msg ClusterMessage) error
+}
+
+// SharedDelivery is the shared-subscription half of one cluster publish: the
+// shared subscription groups one node must deliver one member of (see shared.go).
+// The groups are full shared filters ("$share/{ShareName}/{filter}"), because that
+// is what identifies a group; the node picks the member and attaches the member's
+// own subscription identifiers.
+type SharedDelivery struct {
+	// Node is the node id that must deliver the groups.
+	Node string `json:"node"`
+	// Groups are the shared subscription group keys it must deliver.
+	Groups []string `json:"groups"`
+}
+
+// MemberState is the liveness of one node in a cluster backend's member view.
+type MemberState string
+
+const (
+	// MemberAlive is a node that answers and is routable.
+	MemberAlive MemberState = "alive"
+	// MemberSuspect is a node that missed a ping and is being probed again,
+	// directly and through other members, before it is declared dead.
+	MemberSuspect MemberState = "suspect"
+	// MemberDead is a node that stopped answering its probe window. It is still
+	// in the view until DeadTimeout elapses, because a dead record has to outlive
+	// the suspicion that produced it, and a node that refutes its incarnation can
+	// come back.
+	MemberDead MemberState = "dead"
+)
+
+// Member is one node in a cluster backend's member view.
+type Member struct {
+	// NodeID is the node id the peer announced in its handshake.
+	NodeID string
+	// Addr is the peer's advertised cluster listen address.
+	Addr string
+	// Incarnation identifies the peer process; a restart produces a new one.
+	Incarnation string
+	// Since is when this incarnation became a member.
+	Since time.Time
+	// State is the liveness the backend tracks for the node. A backend that
+	// only exposes a peer list leaves it empty, which means alive; the gossip
+	// backend reports MemberAlive, MemberSuspect or MemberDead (see MemberState).
+	State MemberState
+	// Filters and Shared are the two halves of the subscription summary the node
+	// advertises: the topic filters, oldest first, and the shared subscription
+	// group keys it holds a live member of. SummaryKnown is false until its first
+	// summary arrived. A peer with an unknown summary receives every publish,
+	// because a stale view must not cost a delivery; a backend without a summary
+	// provider never sets SummaryKnown.
+	Filters      []string
+	Shared       []string
+	SummaryKnown bool
+}
+
+// MemberView is implemented by cluster backends that expose their member view.
+// It is an optional interface: Cluster stays small so third-party backends do
+// not have to implement membership.
+type MemberView interface {
+	Members() []Member
+}
+
+// ClusterStats is a snapshot of one backend's counters. A backend that does not
+// track a counter leaves it zero, so the struct grows additively when a backend
+// learns a new one instead of every backend having to answer every question.
+type ClusterStats struct {
+	// Drops counts the events the backend refused to deliver or forward,
+	// whatever the reason (duplicate, foreign namespace, unreachable peer,
+	// unknown target).
+	Drops uint64
+	// Dedup is how many event identities the duplicate table remembers now.
+	Dedup int
+	// Forwards counts received events this node passed on to another node.
+	Forwards uint64
+	// EventWrites counts the peer targets a locally produced event was written
+	// to: the fan-out of the origin.
+	EventWrites uint64
+	// TargetRouted counts directed publishes (ClusterTarget) routed to the node
+	// the presence view names.
+	TargetRouted uint64
+	// TargetFlooded counts directed publishes that fell back to the epidemic
+	// because no live presence claim was known.
+	TargetFlooded uint64
+	// TargetForwards counts received directed publishes this node passed on.
+	TargetForwards uint64
+	// TargetFanouts counts the peer frame writes a locally produced directed
+	// publish caused. A mesh without presence pays one write per peer and makes
+	// that trade-off observable here.
+	TargetFanouts uint64
+}
+
+// StatsView is implemented by cluster backends that expose their counters.
+// It is an optional interface, like MemberView.
+type StatsView interface {
+	Stats() ClusterStats
+}
+
+// Link is one transport connection of a cluster node. A mesh backend reports one
+// entry per physical connection, so two nodes that dial each other appear twice
+// until the reconciliation drops the loser.
+//
+//   - ID is the connection identity: it is assigned when the connection is
+//     registered and never reused, so a replaced link keeps its peer and
+//     direction but never its ID. It is what makes "the link set stopped
+//     changing" observable from outside the backend.
+//   - Peer is the node id the peer announced. It is empty until the handshake
+//     identifies the link.
+//   - Addr is the peer's advertised cluster address, and DialAddr the address
+//     this node dialed (outbound links only). An inbound link has no DialAddr.
+type Link struct {
+	ID       uint64
+	Peer     string
+	Addr     string
+	DialAddr string
+	Outbound bool
+}
+
+// LinkView is implemented by cluster backends that expose their transport links.
+// A backend without a mesh (the Redis fan-out) does not implement it.
+type LinkView interface {
+	Links() []Link
+}
+
+// PresenceView is implemented by cluster backends that track which node holds a
+// client id. Presence is a TTL'd hint, not a source of truth: a claim can be
+// missing or stale, and a directed publish then falls back to the epidemic (see
+// ClusterTarget).
+type PresenceView interface {
+	// Presence reports the node a client id's live claim names. ok is false when
+	// the backend holds no claim for it (never seen, or expired).
+	Presence(clientID string) (nodeID string, ok bool)
+}
+
+// Routed is one peer as a backend's routing view holds it: the node a locally
+// produced event would be sent to now, with the subscription summary that decision
+// is based on.
+type Routed struct {
+	NodeID string
+	// Filters and Shared are the two halves of the summary the routing view holds
+	// for the node, and SummaryKnown is false until it has seen a summary (which
+	// makes the node receive every publish rather than none).
+	Filters      []string
+	Shared       []string
+	SummaryKnown bool
+}
+
+// RoutingView is implemented by cluster backends that route through a cached copy
+// of the shared cluster state instead of their live view. The Redis fan-out is the
+// case: Members() reads the shared state, and RoutingView reports what this node
+// would actually do with an event right now, which lags membership by up to one
+// RedisClusterConfig.SummaryInterval. A test that asserts a delivery waits for the
+// routing view, not for membership.
+type RoutingView interface {
+	Routed() []Routed
+}
