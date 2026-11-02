@@ -25,7 +25,7 @@ func TestRedisClusterNodeIDOwnershipRejectsSecondProcess(t *testing.T) {
 	cfg.NodeTTL = 5 * time.Second
 	cfg.SummaryTTL = 5 * time.Second
 
-	owner := startRedisCluster(t, mr, "n1", &recClusterHandler{}, cfg)
+	owner := startRedisTestCluster(t, mr, "n1", &recClusterHandler{}, cfg)
 	if !mr.Exists(owner.ownerKey("n1")) {
 		t.Fatalf("ownership key %s was not written", owner.ownerKey("n1"))
 	}
@@ -75,7 +75,7 @@ func TestRedisClusterNodeIDOwnershipReleasedOnStop(t *testing.T) {
 	cfg.NodeTTL = 5 * time.Second
 	cfg.SummaryTTL = 5 * time.Second
 
-	first := startRedisCluster(t, mr, "n1", &recClusterHandler{}, cfg)
+	first := startRedisTestCluster(t, mr, "n1", &recClusterHandler{}, cfg)
 	if err := stopWithin(t, first, 5*time.Second); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestRedisClusterNodeIDOwnershipReleasedOnStop(t *testing.T) {
 	}
 
 	// The same id is free immediately: the restart does not wait for the TTL.
-	second := startRedisCluster(t, mr, "n1", &recClusterHandler{}, cfg)
+	second := startRedisTestCluster(t, mr, "n1", &recClusterHandler{}, cfg)
 	rec, err := second.readOwner(context.Background())
 	if err != nil {
 		t.Fatalf("read owner record: %v", err)
@@ -103,7 +103,7 @@ func TestRedisClusterNodeIDOwnershipStaleOwner(t *testing.T) {
 	cfg.NodeTTL = 3 * time.Second
 	cfg.SummaryTTL = 3 * time.Second
 
-	crashed := startRedisCluster(t, mr, "n1", &recClusterHandler{}, cfg)
+	crashed := startRedisTestCluster(t, mr, "n1", &recClusterHandler{}, cfg)
 
 	// Simulate a crash: stop the loops without deregistering (Stop would release
 	// the lease at once) and without waiting for the TTL. Closing the
@@ -143,7 +143,7 @@ func TestRedisClusterNodeIDOwnershipStaleOwner(t *testing.T) {
 	if mr.Exists(crashed.ownerKey("n1")) {
 		t.Fatalf("ownership key %s outlived NodeTTL", crashed.ownerKey("n1"))
 	}
-	restarted := startRedisCluster(t, mr, "n1", &recClusterHandler{}, cfg)
+	restarted := startRedisTestCluster(t, mr, "n1", &recClusterHandler{}, cfg)
 	if restarted.incarnation == crashed.incarnation {
 		t.Fatalf("restarted process reused incarnation %q", restarted.incarnation)
 	}

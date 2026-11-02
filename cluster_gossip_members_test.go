@@ -22,10 +22,7 @@ package gmqx
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"sort"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,153 +34,13 @@ import (
 // still fails instead of hanging.
 const gossipWaitCeiling = 10 * time.Second
 
-// gossipTestConfig is the fast variant of the gossip defaults: every timer is in
-// the millisecond range so a membership transition is observed in a few polls
-// instead of a few seconds.
-func gossipTestConfig(addr string, seeds ...string) GossipClusterConfig {
-	return GossipClusterConfig{
-		Addr:  addr,
-		Seeds: seeds,
-		// The probe timeout has to absorb a scheduling stall of the test process, not
-		// a network round trip: a direct probe that times out in a two-node cluster
-		// marks the peer suspect at once, and a suspect member is declared dead (and
-		// its link closed) one suspicion window later. 100 ms was small enough that a
-		// loaded -race run declared a live peer dead, dropped the link and lost the
-		// one-shot event a test was waiting for. The suspicion window is still short
-		// enough for the membership test, which drives the clock itself.
-		PingInterval:        25 * time.Millisecond,
-		PingTimeout:         500 * time.Millisecond,
-		SuspicionMultiplier: 4,
-		DeadTimeout:         300 * time.Millisecond,
-		ReconnectInterval:   10 * time.Millisecond,
-		DialTimeout:         500 * time.Millisecond,
-		SummaryInterval:     25 * time.Millisecond,
-		PresenceTTL:         time.Second,
-		Logger:              discardLogger(),
-	}
-}
-
-func startGossipCluster(t *testing.T, nodeID string, cfg GossipClusterConfig, handler ClusterHandler) *gossipCluster {
+// startGossipTestCluster starts a gossip node and keeps the concrete type, which
+// the membership tests below drive directly (a controlled clock, forced suspicion).
+// This file moves into gmqx/cluster with the implementation; the backend-agnostic
+// helpers the rest of the package uses live in cluster_backend_helpers_test.go.
+func startGossipTestCluster(t *testing.T, nodeID string, cfg GossipClusterConfig, handler ClusterHandler) *gossipCluster {
 	t.Helper()
-	c, ok := NewGossipCluster(cfg).(*gossipCluster)
-	if !ok {
-		t.Fatal("NewGossipCluster did not return a gossipCluster")
-	}
-	if err := c.Start(context.Background(), nodeID, handler); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Stop(context.Background()) })
-	return c
-}
-
-// gossipMemberIDs returns the sorted peer ids of a node.
-func gossipMemberIDs(c *gossipCluster) []string {
-	out := []string{}
-	for _, m := range c.Members() {
-		out = append(out, m.NodeID)
-	}
-	return out
-}
-
-// waitGossipMembers waits until the node sees exactly the given peers (itself
-// excluded by Members).
-func waitGossipMembers(t *testing.T, c *gossipCluster, want ...string) {
-	t.Helper()
-	sort.Strings(want)
-	deadline := time.Now().Add(gossipWaitCeiling)
-	var got []string
-	for time.Now().Before(deadline) {
-		got = gossipMemberIDs(c)
-		if equalStrings(got, want) {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("members of %s = %v, want %v", c.nodeID, got, want)
-}
-
-// waitGossipLink waits until a link backs the peer, which is what a send needs; the
-// member view alone can be one gossip frame ahead of the link.
-func waitGossipLink(t *testing.T, c *gossipCluster, nodeID string) {
-	t.Helper()
-	deadline := time.Now().Add(gossipWaitCeiling)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		link := c.linksByNode[nodeID]
-		c.mu.Unlock()
-		if link != nil {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("%s has no link to %s", c.nodeID, nodeID)
-}
-
-// gossipLinkQuiet is how long the link set of a node must be unchanged before a
-// test treats it as settled.
-const gossipLinkQuiet = 250 * time.Millisecond
-
-// gossipLinkSignature is the identity of a node's link set: one token per link
-// with its pointer, its peer and its direction. A replaced link produces a new
-// token even when the replacement has the same peer and direction, which is what
-// lets waitGossipSettled see the replacement.
-func gossipLinkSignature(c *gossipCluster) string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	parts := make([]string, 0, len(c.links))
-	for l := range c.links {
-		dir := "in"
-		if l.outbound {
-			dir = "out"
-		}
-		parts = append(parts, fmt.Sprintf("%p/%s/%s/%s", l, l.nodeID, l.dialAddr, dir))
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, ",")
-}
-
-// waitGossipSettled waits until the link sets of all given nodes have been unchanged
-// for gossipLinkQuiet, so a broadcast made right after it is not sent into a link
-// that is being superseded.
-//
-// Two nodes that dial each other reconcile to one physical connection just after
-// startup: the superseded link is closed and the survivor is the other dial, so for
-// a few milliseconds a peer has no link at all. A send in that window is dropped
-// ("cluster_unreachable") and a gossip event is never retried, so a test that asserts
-// a delivery waits for the reconciliation to finish rather than for a link to exist.
-// The wait is an observation of the cluster, not a fixed sleep: it is bounded by
-// gossipWaitCeiling and returns as soon as the sets are proven stable.
-func waitGossipSettled(t *testing.T, cs ...*gossipCluster) {
-	t.Helper()
-	deadline := time.Now().Add(gossipWaitCeiling)
-	sigs := make([]string, len(cs))
-	since := make([]time.Time, len(cs))
-	start := time.Now()
-	for i, c := range cs {
-		sigs[i], since[i] = gossipLinkSignature(c), start
-	}
-	var last string
-	for time.Now().Before(deadline) {
-		settled := true
-		now := time.Now()
-		for i, c := range cs {
-			sig := gossipLinkSignature(c)
-			if sig != sigs[i] {
-				sigs[i], since[i] = sig, now
-				settled = false
-				continue
-			}
-			if now.Sub(since[i]) < gossipLinkQuiet {
-				settled = false
-			}
-			last = c.nodeID + ": " + sig
-		}
-		if settled {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("gossip link sets did not settle within %v (last: %s)", gossipWaitCeiling, last)
+	return startGossipCluster(t, nodeID, cfg, handler).(*gossipCluster)
 }
 
 // waitGossipState waits until the node's view of the member holds exactly want.
@@ -224,11 +81,11 @@ func waitGossipGone(t *testing.T, c *gossipCluster, nodeID string) {
 // have to be symmetric.
 func TestGossipMembershipOneSidedSeed(t *testing.T) {
 	aAddr, bAddr := freeAddr(t), freeAddr(t)
-	b := startGossipCluster(t, "b", gossipTestConfig(bAddr), &recClusterHandler{})
-	a := startGossipCluster(t, "a", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
+	b := startGossipTestCluster(t, "b", gossipTestConfig(bAddr), &recClusterHandler{})
+	a := startGossipTestCluster(t, "a", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
 
-	waitGossipMembers(t, a, "b")
-	waitGossipMembers(t, b, "a")
+	waitClusterMembers(t, a, "b")
+	waitClusterMembers(t, b, "a")
 
 	view, ok := Cluster(a).(MemberView)
 	if !ok {
@@ -251,12 +108,12 @@ func TestGossipMembershipOneSidedSeed(t *testing.T) {
 // ack, then dials b itself. a also learns c and gossips it to b.
 func TestGossipMembershipJoinThroughGossip(t *testing.T) {
 	aAddr, bAddr, cAddr := freeAddr(t), freeAddr(t), freeAddr(t)
-	a := startGossipCluster(t, "a", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
-	b := startGossipCluster(t, "b", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
-	waitGossipMembers(t, a, "b")
-	waitGossipMembers(t, b, "a")
+	a := startGossipTestCluster(t, "a", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
+	b := startGossipTestCluster(t, "b", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
+	waitClusterMembers(t, a, "b")
+	waitClusterMembers(t, b, "a")
 
-	c := startGossipCluster(t, "c", gossipTestConfig(cAddr, aAddr), &recClusterHandler{})
+	c := startGossipTestCluster(t, "c", gossipTestConfig(cAddr, aAddr), &recClusterHandler{})
 	for _, node := range []*gossipCluster{a, b, c} {
 		want := []string{}
 		for _, id := range []string{"a", "b", "c"} {
@@ -264,7 +121,7 @@ func TestGossipMembershipJoinThroughGossip(t *testing.T) {
 				want = append(want, id)
 			}
 		}
-		waitGossipMembers(t, node, want...)
+		waitClusterMembers(t, node, want...)
 	}
 
 	// The member view is sorted by node id and carries incarnation and state.
@@ -303,14 +160,14 @@ func TestGossipMembershipSuspectDeadRemoved(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ca.Stop(context.Background()) })
 	a := ca
-	b := startGossipCluster(t, "b", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
-	waitGossipMembers(t, a, "b")
-	waitGossipMembers(t, b, "a")
+	b := startGossipTestCluster(t, "b", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
+	waitClusterMembers(t, a, "b")
+	waitClusterMembers(t, b, "a")
 	// The transition is driven by the link closing, so the link has to exist before b
 	// stops. A node that never linked to b only re-dials a stopped address and would
 	// keep the member alive, which is a different scenario from the one under test.
-	waitGossipLink(t, a, "b")
-	waitGossipSettled(t, a)
+	waitClusterLink(t, a, "b")
+	waitClusterSettled(t, a)
 
 	if err := b.Stop(context.Background()); err != nil {
 		t.Fatal(err)
@@ -338,10 +195,10 @@ func TestGossipMembershipSuspectDeadRemoved(t *testing.T) {
 // turning into a death.
 func TestGossipMembershipRefutesFalseSuspicion(t *testing.T) {
 	aAddr, bAddr := freeAddr(t), freeAddr(t)
-	a := startGossipCluster(t, "a", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
-	b := startGossipCluster(t, "b", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
-	waitGossipMembers(t, a, "b")
-	waitGossipMembers(t, b, "a")
+	a := startGossipTestCluster(t, "a", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
+	b := startGossipTestCluster(t, "b", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
+	waitClusterMembers(t, a, "b")
+	waitClusterMembers(t, b, "a")
 
 	incA, ok := a.memberIncNumber("b")
 	if !ok {
@@ -389,15 +246,15 @@ func TestGossipMembershipRefutesFalseSuspicion(t *testing.T) {
 // stay empty.
 func TestGossipMembershipDuplicateNodeIDRefused(t *testing.T) {
 	aAddr, bAddr := freeAddr(t), freeAddr(t)
-	a := startGossipCluster(t, "dup", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
-	b := startGossipCluster(t, "dup", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
+	a := startGossipTestCluster(t, "dup", gossipTestConfig(aAddr, bAddr), &recClusterHandler{})
+	b := startGossipTestCluster(t, "dup", gossipTestConfig(bAddr, aAddr), &recClusterHandler{})
 
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if got := gossipMemberIDs(a); len(got) != 0 {
+		if got := clusterMemberIDs(t, a); len(got) != 0 {
 			t.Fatalf("duplicate node id admitted on a: %v", got)
 		}
-		if got := gossipMemberIDs(b); len(got) != 0 {
+		if got := clusterMemberIDs(t, b); len(got) != 0 {
 			t.Fatalf("duplicate node id admitted on b: %v", got)
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -411,7 +268,7 @@ func TestGossipSingleNodeNoSeeds(t *testing.T) {
 	logs := &captureHandler{}
 	cfg := gossipTestConfig(freeAddr(t))
 	cfg.Logger = slog.New(logs)
-	c := startGossipCluster(t, "solo", cfg, &recClusterHandler{})
+	c := startGossipTestCluster(t, "solo", cfg, &recClusterHandler{})
 
 	waitFor(t, "the alone notice", func() bool {
 		return logs.count("gmqx gossip cluster is alone: no seeds and no peers") == 1

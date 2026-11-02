@@ -14,10 +14,6 @@ import (
 	"github.com/maxid/gnety"
 )
 
-// discardLogger keeps test output readable: membership decisions are logged at
-// Info/Debug and the tests below do not assert on them.
-func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
-
 // captureHandler records log records so tests can assert that a membership
 // decision was logged.
 type captureHandler struct {
@@ -47,20 +43,12 @@ func (h *captureHandler) count(msg string) int {
 	return n
 }
 
-func startTestCluster(t *testing.T, nodeID string, cfg TCPClusterConfig, handler ClusterHandler) *tcpCluster {
+// startTCPTestCluster starts a TCP node and keeps the concrete type, which the
+// membership tests below drive directly. This file moves into gmqx/cluster with the
+// implementation.
+func startTCPTestCluster(t *testing.T, nodeID string, cfg TCPClusterConfig, handler ClusterHandler) *tcpCluster {
 	t.Helper()
-	if cfg.Logger == nil {
-		cfg.Logger = discardLogger()
-	}
-	c, ok := NewTCPCluster(cfg).(*tcpCluster)
-	if !ok {
-		t.Fatalf("NewTCPCluster returned %T", c)
-	}
-	if err := c.Start(context.Background(), nodeID, handler); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Stop(context.Background()) })
-	return c
+	return startTestCluster(t, nodeID, cfg, handler).(*tcpCluster)
 }
 
 // memberIDs returns the sorted member node ids.
@@ -103,12 +91,12 @@ func waitLinks(t *testing.T, c *tcpCluster, want int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if c.peerCount() == want {
+		if len(clusterLinks(t, c)) == want {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("links = %d, want %d", c.peerCount(), want)
+	t.Fatalf("links = %d, want %d", len(clusterLinks(t, c)), want)
 }
 
 func waitMemberSummary(t *testing.T, c *tcpCluster, nodeID string, want ...string) {
@@ -116,7 +104,7 @@ func waitMemberSummary(t *testing.T, c *tcpCluster, nodeID string, want ...strin
 	deadline := time.Now().Add(5 * time.Second)
 	var got []string
 	for time.Now().Before(deadline) {
-		if filters, ok := c.memberSummary(nodeID); ok {
+		if filters, ok := clusterMemberSummary(t, c, nodeID); ok {
 			got = filters
 			if equalStrings(got, want) {
 				return
@@ -125,18 +113,6 @@ func waitMemberSummary(t *testing.T, c *tcpCluster, nodeID string, want ...strin
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("summary of %q = %v, want %v", nodeID, got, want)
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func portOf(t *testing.T, addr string) int {
@@ -323,9 +299,9 @@ func TestTCPClusterMembershipConverges(t *testing.T) {
 		}
 		return out
 	}
-	ca := startTestCluster(t, "a", testClusterConfig(aAddr, others(aAddr, aAddr, bAddr, cAddr)), &recClusterHandler{})
-	cb := startTestCluster(t, "b", testClusterConfig(bAddr, others(bAddr, aAddr, bAddr, cAddr)), &recClusterHandler{})
-	cc := startTestCluster(t, "c", testClusterConfig(cAddr, others(cAddr, aAddr, bAddr, cAddr)), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", testClusterConfig(aAddr, others(aAddr, aAddr, bAddr, cAddr)), &recClusterHandler{})
+	cb := startTCPTestCluster(t, "b", testClusterConfig(bAddr, others(bAddr, aAddr, bAddr, cAddr)), &recClusterHandler{})
+	cc := startTCPTestCluster(t, "c", testClusterConfig(cAddr, others(cAddr, aAddr, bAddr, cAddr)), &recClusterHandler{})
 
 	for _, c := range []*tcpCluster{ca, cb, cc} {
 		waitMembersOf(t, c, "a", "b", "c")
@@ -365,8 +341,8 @@ func TestTCPClusterDuplicateLinkCollapse(t *testing.T) {
 	logs := &captureHandler{}
 	cfgA := testClusterConfig(aAddr, []string{bAddr, alias})
 	cfgA.Logger = slog.New(logs)
-	ca := startTestCluster(t, "a", cfgA, &recClusterHandler{})
-	cb := startTestCluster(t, "b", testClusterConfig(bAddr, []string{aAddr}), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", cfgA, &recClusterHandler{})
+	cb := startTCPTestCluster(t, "b", testClusterConfig(bAddr, []string{aAddr}), &recClusterHandler{})
 
 	waitMembers(t, ca, "b")
 	waitMembers(t, cb, "a")
@@ -376,7 +352,7 @@ func TestTCPClusterDuplicateLinkCollapse(t *testing.T) {
 	stable := time.Time{}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(ca.Members()) == 1 && ca.peerCount() == 1 && len(cb.Members()) == 1 && cb.peerCount() == 1 {
+		if len(ca.Members()) == 1 && len(clusterLinks(t, ca)) == 1 && len(cb.Members()) == 1 && len(clusterLinks(t, cb)) == 1 {
 			if stable.IsZero() {
 				stable = time.Now()
 			}
@@ -390,7 +366,7 @@ func TestTCPClusterDuplicateLinkCollapse(t *testing.T) {
 	}
 	if stable.IsZero() {
 		t.Fatalf("duplicate link did not collapse: a members=%v links=%d, b members=%v links=%d",
-			memberIDs(ca), ca.peerCount(), memberIDs(cb), cb.peerCount())
+			memberIDs(ca), len(clusterLinks(t, ca)), memberIDs(cb), len(clusterLinks(t, cb)))
 	}
 	if n := logs.count("gmqx cluster link rejected"); n == 0 {
 		t.Fatal("duplicate link collapse was not logged")
@@ -404,7 +380,7 @@ func TestTCPClusterMemberEviction(t *testing.T) {
 	cfg := testClusterConfig(aAddr, nil)
 	cfg.HeartbeatInterval = 20 * time.Millisecond
 	cfg.HeartbeatMissBudget = 2
-	ca := startTestCluster(t, "a", cfg, &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", cfg, &recClusterHandler{})
 
 	// A silent peer: it sends the handshake and never answers a ping.
 	newFakePeerWithOptions(t, aAddr, "quiet", "127.0.0.1:9001", "inc-quiet", false)
@@ -412,7 +388,7 @@ func TestTCPClusterMemberEviction(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(ca.Members()) == 0 && ca.peerCount() == 0 {
+		if len(ca.Members()) == 0 && len(clusterLinks(t, ca)) == 0 {
 			time.Sleep(100 * time.Millisecond)
 			if len(ca.Members()) != 0 {
 				t.Fatal("evicted member came back without a handshake")
@@ -421,7 +397,7 @@ func TestTCPClusterMemberEviction(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("member not evicted: members=%v links=%d", memberIDs(ca), ca.peerCount())
+	t.Fatalf("member not evicted: members=%v links=%d", memberIDs(ca), len(clusterLinks(t, ca)))
 }
 
 // TestTCPClusterRestartRejoin checks that a stopped node leaves the view, that
@@ -438,8 +414,8 @@ func TestTCPClusterRestartRejoin(t *testing.T) {
 		}
 		return testClusterConfig(self, seeds)
 	}
-	ca := startTestCluster(t, "a", cfgFor(aAddr), &recClusterHandler{})
-	cb := startTestCluster(t, "b", cfgFor(bAddr), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", cfgFor(aAddr), &recClusterHandler{})
+	cb := startTCPTestCluster(t, "b", cfgFor(bAddr), &recClusterHandler{})
 	cc, _ := NewTCPCluster(cfgFor(cAddr)).(*tcpCluster)
 	if err := cc.Start(context.Background(), "c", &recClusterHandler{}); err != nil {
 		t.Fatal(err)
@@ -487,7 +463,7 @@ func TestTCPClusterRestartRejoin(t *testing.T) {
 // and the refusal to forward a received event.
 func TestTCPClusterDedup(t *testing.T) {
 	aAddr := freeAddr(t)
-	ca := startTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
 	h := ca.handler.(*recClusterHandler)
 	peer := newFakePeer(t, aAddr, "peer", "127.0.0.1:9001")
 	waitMembers(t, ca, "peer")
@@ -510,23 +486,23 @@ func TestTCPClusterDedup(t *testing.T) {
 	}
 
 	// An event stamped with this node as its origin must not be applied.
-	beforeLoop := ca.dropCount()
+	beforeLoop := clusterStats(t, ca).Drops
 	peer.sendEvent("a", 99, "t/x", "loop")
 	time.Sleep(100 * time.Millisecond)
 	if n, _ := h.counts(); n != 1 {
 		t.Fatalf("loop event was delivered: %d", n)
 	}
-	if ca.dropCount() <= beforeLoop {
+	if clusterStats(t, ca).Drops <= beforeLoop {
 		t.Fatal("loop event was not counted as a drop")
 	}
 
 	// A received event must never be forwarded.
-	beforeForward := ca.dropCount()
+	beforeForward := clusterStats(t, ca).Drops
 	received := ClusterMessage{Type: ClusterPublish, Origin: "peer", NodeID: "peer", Seq: 8, Topic: "t/x"}
 	if err := ca.Spread(context.Background(), received); err != nil {
 		t.Fatal(err)
 	}
-	if ca.dropCount() <= beforeForward {
+	if clusterStats(t, ca).Drops <= beforeForward {
 		t.Fatal("forwarded event was not dropped")
 	}
 }
@@ -538,7 +514,7 @@ func TestTCPClusterDedupBounds(t *testing.T) {
 	cfg := testClusterConfig(aAddr, nil)
 	cfg.DedupSize = 4
 	cfg.DedupTTL = time.Minute
-	ca := startTestCluster(t, "a", cfg, &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", cfg, &recClusterHandler{})
 	h := ca.handler.(*recClusterHandler)
 
 	publish := func(seq uint64) {
@@ -570,7 +546,7 @@ func TestTCPClusterDedupTTL(t *testing.T) {
 	aAddr := freeAddr(t)
 	cfg := testClusterConfig(aAddr, nil)
 	cfg.DedupTTL = 30 * time.Millisecond
-	ca := startTestCluster(t, "a", cfg, &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", cfg, &recClusterHandler{})
 	h := ca.handler.(*recClusterHandler)
 
 	ev := ClusterMessage{Type: ClusterPublish, NodeID: "peer", Origin: "peer", Seq: 3, Topic: "t/x"}
@@ -591,7 +567,7 @@ func TestTCPClusterDedupTTL(t *testing.T) {
 // peer only, and that kicks and retained publishes go everywhere.
 func TestTCPClusterDirectedRouting(t *testing.T) {
 	aAddr := freeAddr(t)
-	ca := startTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
 
 	subscribed := newFakePeer(t, aAddr, "sub", "127.0.0.1:9001")
 	quiet := newFakePeer(t, aAddr, "quiet", "127.0.0.1:9002")
@@ -673,7 +649,7 @@ func TestTCPClusterSummaryCap(t *testing.T) {
 	cfg.MaxSummaryFilters = 3
 	h := &filterHandler{}
 	h.setFilters("a/1", "a/2", "a/3", "a/4", "a/5")
-	ca := startTestCluster(t, "a", cfg, h)
+	ca := startTCPTestCluster(t, "a", cfg, h)
 
 	peer := newFakePeer(t, aAddr, "peer", "127.0.0.1:9001")
 	waitMembers(t, ca, "peer")
@@ -683,7 +659,7 @@ func TestTCPClusterSummaryCap(t *testing.T) {
 	ca.subscriptionsChanged()
 	peer.waitSubs(t, "a/4", "a/5", "a/6")
 
-	if filters, ok := ca.memberSummary("peer"); ok {
+	if filters, ok := clusterMemberSummary(t, ca, "peer"); ok {
 		t.Fatalf("summary of a peer that advertised nothing = %v", filters)
 	}
 }
@@ -743,7 +719,7 @@ func TestTCPClusterBrokerDirectedRouting(t *testing.T) {
 // peer that never handshaked are still handled, but cannot create a member.
 func TestTCPClusterEventFromUnknownPeer(t *testing.T) {
 	aAddr := freeAddr(t)
-	ca := startTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
 	h := ca.handler.(*recClusterHandler)
 
 	client, err := gnety.Dial(context.Background(), gnety.ClientConfig{
@@ -780,7 +756,7 @@ func TestTCPClusterEventFromUnknownPeer(t *testing.T) {
 // must not become a member (and cannot produce a duplicate logical member).
 func TestTCPClusterWireVersionRejected(t *testing.T) {
 	aAddr := freeAddr(t)
-	ca := startTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
+	ca := startTCPTestCluster(t, "a", testClusterConfig(aAddr, nil), &recClusterHandler{})
 
 	client, err := gnety.Dial(context.Background(), gnety.ClientConfig{
 		Network: "tcp", Addr: aAddr, Codec: gnety.LengthFieldCodec{}, Timeout: 2 * time.Second,
@@ -802,15 +778,15 @@ func TestTCPClusterWireVersionRejected(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(ca.Members()) == 0 && ca.peerCount() == 0 {
+		if len(ca.Members()) == 0 && len(clusterLinks(t, ca)) == 0 {
 			// Stayed out: the refusal is not a transient state.
 			time.Sleep(100 * time.Millisecond)
-			if len(ca.Members()) != 0 || ca.peerCount() != 0 {
-				t.Fatalf("refused peer was admitted: members=%v links=%d", memberIDs(ca), ca.peerCount())
+			if len(ca.Members()) != 0 || len(clusterLinks(t, ca)) != 0 {
+				t.Fatalf("refused peer was admitted: members=%v links=%d", memberIDs(ca), len(clusterLinks(t, ca)))
 			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("peer with a foreign wire version was not refused: members=%v links=%d", memberIDs(ca), ca.peerCount())
+	t.Fatalf("peer with a foreign wire version was not refused: members=%v links=%d", memberIDs(ca), len(clusterLinks(t, ca)))
 }

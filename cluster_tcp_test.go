@@ -15,10 +15,7 @@ package gmqx
 
 import (
 	"context"
-	"fmt"
 	"net"
-	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,9 +24,6 @@ import (
 // tcpWaitCeiling bounds a cluster wait. It exists so a genuinely broken build fails
 // instead of hanging; a correct one returns as soon as its condition holds.
 const tcpWaitCeiling = 10 * time.Second
-
-// tcpLinkQuiet is how long the link set must be unchanged to count as settled.
-const tcpLinkQuiet = 250 * time.Millisecond
 
 type recClusterHandler struct {
 	mu      sync.Mutex
@@ -70,36 +64,14 @@ func freeAddr(t *testing.T) string {
 // number of members: a link alone is not yet routable.
 func waitPeers(t *testing.T, c Cluster, want int) {
 	t.Helper()
-	tc, ok := c.(*tcpCluster)
-	if !ok {
-		t.Fatalf("not a tcp cluster: %T", c)
-	}
 	deadline := time.Now().Add(tcpWaitCeiling)
 	for time.Now().Before(deadline) {
-		if tc.peerCount() >= want && len(tc.Members()) >= want {
+		if links, members := len(clusterLinks(t, c)), len(clusterMembers(t, c)); links >= want && members >= want {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("cluster peers = %d (%d members), want %d", tc.peerCount(), len(tc.Members()), want)
-}
-
-// tcpLinkSignature is the identity of a node's link set: one token per link with its
-// pointer, its peer and its direction, so a replaced link produces a new token even
-// when the replacement has the same peer and direction.
-func tcpLinkSignature(c *tcpCluster) string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	parts := make([]string, 0, len(c.links))
-	for l := range c.links {
-		dir := "in"
-		if l.outbound {
-			dir = "out"
-		}
-		parts = append(parts, fmt.Sprintf("%p/%s/%s", l, l.nodeID, dir))
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, ",")
+	t.Fatalf("cluster peers = %d (%d members), want %d", len(clusterLinks(t, c)), len(clusterMembers(t, c)), want)
 }
 
 // waitTCPSummary waits until this node's view of a peer advertises the filter. A
@@ -109,14 +81,10 @@ func tcpLinkSignature(c *tcpCluster) string {
 // waits for it instead of assuming the cluster already knows.
 func waitTCPSummary(t *testing.T, c Cluster, nodeID, want string) {
 	t.Helper()
-	tc, ok := c.(*tcpCluster)
-	if !ok {
-		t.Fatalf("not a tcp cluster: %T", c)
-	}
 	deadline := time.Now().Add(tcpWaitCeiling)
 	var got []string
 	for time.Now().Before(deadline) {
-		filters, known := tc.memberSummary(nodeID)
+		filters, known := clusterMemberSummary(t, c, nodeID)
 		if known {
 			got = filters
 			for _, f := range filters {
@@ -127,52 +95,7 @@ func waitTCPSummary(t *testing.T, c Cluster, nodeID, want string) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("tcp summary of %s on %s = %v, want %q", nodeID, tc.nodeID, got, want)
-}
-
-// waitLinksSettled waits until the link set of every given cluster has been unchanged
-// for tcpLinkQuiet. Two nodes that dial each other collapse to one link just after
-// startup and the loser is dropped, so a one-shot publish made before that
-// reconciliation can be written into a link that is already going away.
-func waitLinksSettled(t *testing.T, cs ...Cluster) {
-	t.Helper()
-	tcs := make([]*tcpCluster, len(cs))
-	for i, c := range cs {
-		tc, ok := c.(*tcpCluster)
-		if !ok {
-			t.Fatalf("not a tcp cluster: %T", c)
-		}
-		tcs[i] = tc
-	}
-	deadline := time.Now().Add(tcpWaitCeiling)
-	sigs := make([]string, len(tcs))
-	since := make([]time.Time, len(tcs))
-	start := time.Now()
-	for i, tc := range tcs {
-		sigs[i], since[i] = tcpLinkSignature(tc), start
-	}
-	var last string
-	for time.Now().Before(deadline) {
-		settled := true
-		now := time.Now()
-		for i, tc := range tcs {
-			sig := tcpLinkSignature(tc)
-			if sig != sigs[i] {
-				sigs[i], since[i] = sig, now
-				settled = false
-				continue
-			}
-			if now.Sub(since[i]) < tcpLinkQuiet {
-				settled = false
-			}
-			last = tc.nodeID + ": " + sig
-		}
-		if settled {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("tcp link sets did not settle within %v (last: %s)", tcpWaitCeiling, last)
+	t.Fatalf("tcp summary of %s = %v, want %q", nodeID, got, want)
 }
 
 func newTCPClusterPair(t *testing.T) (Cluster, Cluster, *recClusterHandler, *recClusterHandler) {
@@ -256,7 +179,7 @@ func TestTCPClusterBrokerCrossNodePublish(t *testing.T) {
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
 	waitPeers(t, ca, 1)
 	waitPeers(t, cb, 1)
-	waitLinksSettled(t, ca, cb)
+	waitClusterSettled(t, ca, cb)
 
 	sub := dialTestClient(t, b.Addr(), "sub-b")
 	body := []byte{0, 1}
@@ -309,13 +232,12 @@ func TestTCPClusterReconnect(t *testing.T) {
 	t.Cleanup(func() { _ = ca.Stop(context.Background()) })
 
 	// Wait for the dead peer to be noticed before restarting b.
-	caTCP := ca.(*tcpCluster)
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && caTCP.peerCount() != 0 {
+	for time.Now().Before(deadline) && len(clusterLinks(t, ca)) != 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if caTCP.peerCount() != 0 {
-		t.Fatal("dead peer was not removed")
+	if links := clusterLinks(t, ca); len(links) != 0 {
+		t.Fatalf("dead peer was not removed: %v", links)
 	}
 
 	// Restart b on the same address; a's dial loop must reconnect.

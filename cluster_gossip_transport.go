@@ -35,6 +35,10 @@ type gossipLink struct {
 	closeOnce sync.Once
 	rejected  atomic.Bool
 
+	// id is the connection identity the cluster assigns when the link is
+	// registered (see cluster.LinkView); a replaced link never reuses it.
+	id uint64
+
 	// Identity of the peer, written under gossipCluster.mu when the link is
 	// identified and read under the same lock.
 	nodeID      string
@@ -107,6 +111,7 @@ func (c *gossipCluster) addLink(l *gossipLink) bool {
 		c.mu.Unlock()
 		return false
 	}
+	l.id = c.linkSeq.Add(1)
 	c.links[l] = struct{}{}
 	c.mu.Unlock()
 	c.wg.Add(1)

@@ -258,14 +258,14 @@ func TestClusterEnabledGossipEndToEnd(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = b.Stop(context.Background()) })
 	gcsA, gcsB := a.cfg.ClusterBackend.(*gossipCluster), b.cfg.ClusterBackend.(*gossipCluster)
-	waitGossipMembers(t, gcsA, "b")
-	waitGossipMembers(t, gcsB, "a")
-	waitGossipLink(t, gcsA, "b")
-	waitGossipLink(t, gcsB, "a")
+	waitClusterMembers(t, gcsA, "b")
+	waitClusterMembers(t, gcsB, "a")
+	waitClusterLink(t, gcsA, "b")
+	waitClusterLink(t, gcsB, "a")
 	// The publish below is a one-shot gossip event: wait for the startup link
 	// reconciliation to finish, otherwise it can be written into a link that is
 	// being superseded and dropped.
-	waitGossipSettled(t, gcsA, gcsB)
+	waitClusterSettled(t, gcsA, gcsB)
 
 	sub := dialTestClient(t, b.Addr(), "default-sub")
 	body := []byte{0, 1}
@@ -279,7 +279,7 @@ func TestClusterEnabledGossipEndToEnd(t *testing.T) {
 	// summary does: the summary update travels as gossip, and a directed routing
 	// decision made before it arrives sees a fresh, empty summary and skips b. Wait
 	// for the advertisement the publish will be routed by.
-	waitGossipSummary(t, gcsA, "b", "default/x")
+	waitClusterSummary(t, gcsA, "b", "default/x")
 
 	pub := dialTestClient(t, a.Addr(), "default-pub")
 	pubBody := appendString(nil, "default/x")

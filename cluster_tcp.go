@@ -184,6 +184,10 @@ type clusterLink struct {
 	incarnation string
 
 	closeOnce sync.Once
+
+	// id is the connection identity the cluster assigns when the link is
+	// registered (see LinkView); a replaced link never reuses it.
+	id uint64
 }
 
 func (l *clusterLink) touch()          { l.lastSeen.Store(time.Now().UnixNano()) }
@@ -231,9 +235,12 @@ type tcpCluster struct {
 	// end up with an older snapshot than the one already sent.
 	summaryMu sync.Mutex
 
-	seq   atomic.Uint64
-	dedup *clusterkit.Table
-	drops atomic.Uint64
+	seq atomic.Uint64
+	// linkSeq numbers the links as they are registered, so a replaced link is
+	// distinguishable from the one it supersedes (see Links).
+	linkSeq atomic.Uint64
+	dedup   *clusterkit.Table
+	drops   atomic.Uint64
 	// targetFanouts counts the peer writes the backend performed for directed
 	// publishes (ClusterTarget). The TCP mesh has no client-id presence, so one
 	// targeted publish costs as many frame writes as there are peers, to nodes that
@@ -341,14 +348,57 @@ func (c *tcpCluster) Stop(ctx context.Context) error {
 
 // Members implements MemberView. The view contains one entry per node id the
 // handshake admitted, sorted by node id.
+// Members implements MemberView. The view contains one entry per node id the
+// handshake admitted, sorted by node id and without this node itself. Each entry
+// carries the peer's advertised subscription summary (Filters and SummaryKnown),
+// copied out of the member record so a view never shares state with the handshake
+// or summary paths.
 func (c *tcpCluster) Members() []Member {
 	c.mu.Lock()
 	out := make([]Member, 0, len(c.members))
 	for _, m := range c.members {
-		out = append(out, m.Member)
+		member := m.Member
+		if m.filtersKnown {
+			member.Filters = append([]string(nil), m.filters...)
+			member.Shared = append([]string(nil), m.shared...)
+			member.SummaryKnown = true
+		}
+		out = append(out, member)
 	}
 	c.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// Stats implements StatsView. The TCP mesh keeps the drops, the duplicate table
+// and the peer writes directed publishes caused.
+func (c *tcpCluster) Stats() ClusterStats {
+	stats := ClusterStats{
+		Drops:         c.drops.Load(),
+		TargetFanouts: c.targetFanouts.Load(),
+	}
+	if c.dedup != nil {
+		stats.Dedup = c.dedup.Len()
+	}
+	return stats
+}
+
+// Links implements LinkView, sorted by connection id. A link reports its peer once
+// the handshake identified it, and the seed it was dialed at when it is outbound.
+func (c *tcpCluster) Links() []Link {
+	c.mu.Lock()
+	out := make([]Link, 0, len(c.links))
+	for l := range c.links {
+		out = append(out, Link{
+			ID:       l.id,
+			Peer:     l.nodeID,
+			Addr:     l.addr,
+			DialAddr: l.seed,
+			Outbound: l.outbound,
+		})
+	}
+	c.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -866,6 +916,7 @@ func (c *tcpCluster) addLink(l *clusterLink) bool {
 	if !c.running {
 		return false
 	}
+	l.id = c.linkSeq.Add(1)
 	c.links[l] = struct{}{}
 	return true
 }
@@ -1014,32 +1065,6 @@ func (c *tcpCluster) isRunning() bool {
 	defer c.mu.Unlock()
 	return c.running
 }
-
-// peerCount reports the number of open links (used by tests).
-func (c *tcpCluster) peerCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.links)
-}
-
-// memberSummary reports a member's advertised filters and whether they are
-// known (used by tests).
-func (c *tcpCluster) memberSummary(nodeID string) ([]string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	m, ok := c.members[nodeID]
-	if !ok || !m.filtersKnown {
-		return nil, false
-	}
-	return append([]string(nil), m.filters...), true
-}
-
-// dropCount reports dropped events (used by tests).
-func (c *tcpCluster) dropCount() uint64 { return c.drops.Load() }
-
-// targetFanoutCount reports how many peer writes directed publishes caused (used
-// by tests).
-func (c *tcpCluster) targetFanoutCount() uint64 { return c.targetFanouts.Load() }
 
 func (c *tcpCluster) reconnectInterval() time.Duration {
 	if c.cfg.ReconnectInterval > 0 {

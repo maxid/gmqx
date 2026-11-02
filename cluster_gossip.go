@@ -308,8 +308,11 @@ type gossipCluster struct {
 	dialing  map[string]bool
 	dialNext map[string]time.Time
 
-	seq      atomic.Uint64
-	nonce    atomic.Uint64
+	seq   atomic.Uint64
+	nonce atomic.Uint64
+	// linkSeq numbers the links as they are registered, so a replaced link is
+	// distinguishable from the one it supersedes (see Stats/Links).
+	linkSeq  atomic.Uint64
 	dedup    *clusterkit.Table
 	drops    atomic.Uint64
 	forwards atomic.Uint64
@@ -505,15 +508,71 @@ func (c *gossipCluster) Stop(ctx context.Context) error {
 //
 // A member is reported without a live link too: a member this node has heard of
 // but not yet dialed is still a member, and dialing is what the probe loop is for.
+//
+// Each entry carries the peer's advertised subscription summary (Filters and
+// SummaryKnown), copied out of the record: a view never shares an array with the
+// membership the probe loop is mutating.
 func (c *gossipCluster) Members() []Member {
 	c.mu.Lock()
 	out := make([]Member, 0, len(c.members))
 	for _, m := range c.members {
-		out = append(out, m.Member)
+		member := m.Member
+		if m.summaryKnown {
+			member.Filters = append([]string(nil), m.summary.Filters...)
+			member.Shared = append([]string(nil), m.summary.Shared...)
+			member.SummaryKnown = true
+		}
+		out = append(out, member)
 	}
 	c.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
+}
+
+// Stats implements StatsView. Every counter is monotonic apart from Dedup, which
+// is the size of the duplicate table right now.
+func (c *gossipCluster) Stats() ClusterStats {
+	stats := ClusterStats{
+		Drops:          c.drops.Load(),
+		Forwards:       c.forwards.Load(),
+		EventWrites:    c.eventWrites.Load(),
+		TargetRouted:   c.targetRouted.Load(),
+		TargetFlooded:  c.targetFlooded.Load(),
+		TargetForwards: c.targetForwards.Load(),
+	}
+	if c.dedup != nil {
+		stats.Dedup = c.dedup.Len()
+	}
+	return stats
+}
+
+// Links implements LinkView. It lists every physical connection, identified or
+// not, sorted by connection id. A link whose peer has not identified itself yet
+// reports an empty Peer.
+func (c *gossipCluster) Links() []Link {
+	c.mu.Lock()
+	out := make([]Link, 0, len(c.links))
+	for l := range c.links {
+		out = append(out, Link{
+			ID:       l.id,
+			Peer:     l.nodeID,
+			Addr:     l.addr,
+			DialAddr: l.dialAddr,
+			Outbound: l.outbound,
+		})
+	}
+	c.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Presence implements PresenceView. It reads the same view a directed publish is
+// routed by, so a test or an operator sees the decision the spread would take.
+func (c *gossipCluster) Presence(clientID string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nodeID := c.presenceOwnerLocked(clientID, time.Now())
+	return nodeID, nodeID != ""
 }
 
 // Spread implements Cluster.
@@ -1059,14 +1118,6 @@ func (c *gossipCluster) presenceOwnerLocked(clientID string, now time.Time) stri
 	return p.nodeID
 }
 
-// presenceOwner is the locking form of presenceOwnerLocked (used by tests and by
-// the receive path).
-func (c *gossipCluster) presenceOwner(clientID string) string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.presenceOwnerLocked(clientID, c.now())
-}
-
 // mergePresence folds the presence claims one frame carried into the local view.
 // A claim with a higher Lamport version wins; at the same version a live claim
 // beats a tombstone and the lexicographically greater node id wins, so two nodes
@@ -1567,53 +1618,6 @@ func rotateStrings(ids []string, offset int) []string {
 	out = append(out, ids[offset:]...)
 	out = append(out, ids[:offset]...)
 	return out
-}
-
-// Test-visible accessors. They exist for the package's own tests, like the TCP
-// backend's peerCount and dropCount.
-
-// linkCount reports the number of physical links.
-func (c *gossipCluster) linkCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.links)
-}
-
-// dropCount reports dropped events.
-func (c *gossipCluster) dropCount() uint64 { return c.drops.Load() }
-
-// forwardCount reports how many received events were forwarded.
-func (c *gossipCluster) forwardCount() uint64 { return c.forwards.Load() }
-
-// targetForwardCount reports how many directed publishes were passed on.
-func (c *gossipCluster) targetForwardCount() uint64 { return c.targetForwards.Load() }
-
-// eventWriteCount reports how many peer targets locally produced events addressed.
-func (c *gossipCluster) eventWriteCount() uint64 { return c.eventWrites.Load() }
-
-// targetRoutedCount reports directed publishes routed to a presence owner.
-func (c *gossipCluster) targetRoutedCount() uint64 { return c.targetRouted.Load() }
-
-// targetFloodedCount reports directed publishes that fell back to the epidemic.
-func (c *gossipCluster) targetFloodedCount() uint64 { return c.targetFlooded.Load() }
-
-// dedupLen reports how many event identities the dedup table remembers.
-func (c *gossipCluster) dedupLen() int {
-	if c.dedup == nil {
-		return 0
-	}
-	return c.dedup.Len()
-}
-
-// memberSummary reports a peer's advertised filters and whether they are known.
-func (c *gossipCluster) memberSummary(nodeID string) ([]string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	m := c.members[nodeID]
-	if m == nil || !m.summaryKnown {
-		return nil, false
-	}
-	return append([]string(nil), m.summary.Filters...), true
 }
 
 // memberState reports a peer's membership state.

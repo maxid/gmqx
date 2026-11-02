@@ -1006,6 +1006,36 @@ logged and reported by `Addrs()`, and an ephemeral bind (`:0`) never falls back.
 
 ## Cluster backend
 
+### Observing a backend
+
+`Cluster` stays small — three methods — and a backend that can say more about
+itself implements one of the optional views below. They are what a health
+endpoint, a dashboard or a test observes; nothing in the broker depends on them.
+
+| view | method | what it answers |
+|---|---|---|
+| `MemberView` | `Members() []Member` | who is in the cluster, with the summary each peer advertised |
+| `StatsView` | `Stats() ClusterStats` | the backend's counters: drops, duplicate-table size, forwards, directed-publish routing decisions and fan-out |
+| `LinkView` | `Links() []Link` | every physical connection, with a connection id that is never reused |
+| `PresenceView` | `Presence(clientID) (nodeID, bool)` | which node holds a client id (a TTL'd hint, see directed publish) |
+| `RoutingView` | `Routed() []Routed` | what this node would do with an event right now, for backends that route through a cached view (Redis) |
+
+```go
+if stats, ok := cluster.(gmqx.StatsView); ok {
+    s := stats.Stats()
+    log.Printf("cluster: %d drops, %d dedup entries, %d forward(s)", s.Drops, s.Dedup, s.Forwards)
+}
+```
+
+`Links()` is a link view, not a member view: two nodes that dial each other appear
+twice until the reconciliation drops the loser, which is why a `Link` carries an
+`ID` that a replacement never reuses. `Member.Filters` and `Member.Shared` are the
+two halves of a peer's advertised subscription summary, and `Member.SummaryKnown`
+says whether one has arrived at all: a peer whose summary is unknown receives
+every publish. `Members()` returns the live cluster state; `RoutingView` reports
+the cached view a spread routes by, which lags `Members()` by up to one
+`SummaryInterval`.
+
 ### Gossip backend (default)
 
 `Config.Cluster.Enabled` with no explicit `ClusterBackend` selects the built-in
@@ -1076,8 +1106,9 @@ available (`gmqx.NewGossipCluster` builds the default backend directly).
   goroutine per link, never one per message.
 
 `Members()` (through `MemberView`) reports `Member{NodeID, Addr, Incarnation,
-Since, State}` sorted by node id. `State` is `alive`, `suspect` or `dead`; the TCP
-and Redis backends leave it empty, which means alive. A node with no seeds starts
+Since, State, Filters, Shared, SummaryKnown}` sorted by node id. `State` is
+`alive`, `suspect` or `dead`; the TCP and Redis backends leave it empty, which
+means alive. A node with no seeds starts
 alone, serves local traffic and logs that it is alone.
 
 Member links are plain gnety TCP, exactly like the TCP backend: neither backend
@@ -1127,7 +1158,8 @@ advertised `(NodeID, Addr, Incarnation)` triple:
   broker (availability over strictness), but only a handshake can make that node
   a member again.
 - `Members()` (optional `MemberView` interface) exposes `Member{NodeID, Addr,
-  Incarnation, Since}`; the `Cluster` interface itself is unchanged:
+  Incarnation, Since, Filters, Shared, SummaryKnown}`; the `Cluster` interface
+  itself is unchanged:
 
   ```go
   if view, ok := cluster.(gmqx.MemberView); ok {

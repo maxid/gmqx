@@ -545,7 +545,13 @@ func (c *redisCluster) Members() []Member {
 	}
 	out := make([]Member, 0, len(view))
 	for _, p := range view {
-		out = append(out, p.Member)
+		member := p.Member
+		if p.filtersKnown {
+			member.Filters = append([]string(nil), p.filters...)
+			member.Shared = append([]string(nil), p.shared...)
+			member.SummaryKnown = true
+		}
+		out = append(out, member)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
@@ -1694,29 +1700,34 @@ func (c *redisCluster) maxSummaryFilters() int {
 	return defaultMaxSummaryFilters
 }
 
-// viewSummary reports a peer's cached routing summary and whether it is known
-// (used by tests).
-func (c *redisCluster) viewSummary(nodeID string) ([]string, bool) {
+// Routed implements RoutingView: the cached view the spread path routes by, sorted
+// by node id. It is what this node would do with a locally produced event right
+// now, which lags the shared state Members reads by up to one SummaryInterval.
+func (c *redisCluster) Routed() []Routed {
 	c.viewMu.Lock()
 	defer c.viewMu.Unlock()
-	p, ok := c.view[nodeID]
-	if !ok || !p.filtersKnown {
-		return nil, false
+	out := make([]Routed, 0, len(c.view))
+	for id, p := range c.view {
+		routed := Routed{NodeID: id}
+		if p.filtersKnown {
+			routed.Filters = append([]string(nil), p.filters...)
+			routed.Shared = append([]string(nil), p.shared...)
+			routed.SummaryKnown = true
+		}
+		out = append(out, routed)
 	}
-	return append([]string(nil), p.filters...), true
-}
-
-// viewMembers reports the cached routing view node ids, sorted (used by tests).
-func (c *redisCluster) viewMembers() []string {
-	c.viewMu.Lock()
-	defer c.viewMu.Unlock()
-	out := make([]string, 0, len(c.view))
-	for id := range c.view {
-		out = append(out, id)
-	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
 }
 
-// dropCount reports dropped events (used by tests).
-func (c *redisCluster) dropCount() uint64 { return c.drops.Load() }
+// Stats implements StatsView. The Redis backend keeps the drops and the duplicate
+// table; it has no link view (a fan-out over pub/sub has no per-peer connection)
+// and no presence view to read locally (a presence record is a Redis round trip,
+// and the routing path reads it as part of that trip).
+func (c *redisCluster) Stats() ClusterStats {
+	stats := ClusterStats{Drops: c.drops.Load()}
+	if c.dedup != nil {
+		stats.Dedup = c.dedup.Len()
+	}
+	return stats
+}

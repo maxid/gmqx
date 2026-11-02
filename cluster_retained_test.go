@@ -124,12 +124,11 @@ func newTCPRetainedPair(t *testing.T) clusterPair {
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb, MaxRetainMessages: 1})
 	waitPeers(t, ca, 1)
 	waitPeers(t, cb, 1)
-	tc := ca.(*tcpCluster)
 	return clusterPair{
 		a: a, b: b,
 		waitSummary: func(t *testing.T, filter string) {
 			t.Helper()
-			waitSummaryContains(t, "node a (tcp)", func() ([]string, bool) { return tc.memberSummary("b") }, filter)
+			waitSummaryContains(t, "node a (tcp)", func() ([]string, bool) { return clusterMemberSummary(t, ca, "b") }, filter)
 		},
 	}
 }
@@ -139,8 +138,8 @@ func newRedisRetainedPair(t *testing.T) clusterPair {
 	t.Helper()
 	mr := runMiniRedis(t)
 	cfg := redisTestConfig(mr)
-	ca := NewRedisCluster(cfg).(*redisCluster)
-	cb := NewRedisCluster(cfg).(*redisCluster)
+	ca := NewRedisCluster(cfg)
+	cb := NewRedisCluster(cfg)
 	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb, MaxRetainMessages: 1})
 	waitRedisView(t, ca, "b")
@@ -148,7 +147,7 @@ func newRedisRetainedPair(t *testing.T) clusterPair {
 		a: a, b: b,
 		waitSummary: func(t *testing.T, filter string) {
 			t.Helper()
-			waitSummaryContains(t, "node a (redis)", func() ([]string, bool) { return ca.viewSummary("b") }, filter)
+			waitSummaryContains(t, "node a (redis)", func() ([]string, bool) { return clusterRoutedSummary(t, ca, "b") }, filter)
 		},
 	}
 }

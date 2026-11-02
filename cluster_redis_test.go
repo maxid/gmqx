@@ -19,127 +19,39 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
 )
 
-// redisWaitCeiling bounds a Redis cluster wait. It exists so a genuinely broken build
-// fails instead of hanging; a correct one returns as soon as its condition holds.
-const redisWaitCeiling = 10 * time.Second
-
-// runMiniRedis starts miniredis with clock-driven TTLs. Without ClockTTL a
-// miniredis key only expires on an explicit FastForward, and a test that asserts
-// "the member key expired" would assert against the fake clock instead of the
-// real one.
-func runMiniRedis(t *testing.T) *miniredis.Miniredis {
+// startRedisTestCluster starts a Redis node and keeps the concrete type, which the
+// backend tests below drive directly. This file moves into gmqx/cluster with the
+// implementation; the backend-agnostic helpers live in
+// cluster_backend_helpers_test.go.
+func startRedisTestCluster(t *testing.T, mr *miniredis.Miniredis, nodeID string, handler ClusterHandler, cfg RedisClusterConfig) *redisCluster {
 	t.Helper()
-	mr := miniredis.RunT(t)
-	mr.ClockTTL(true)
-	return mr
+	return startRedisCluster(t, mr, nodeID, handler, cfg).(*redisCluster)
 }
 
-// redisTestConfig is a RedisClusterConfig tuned for tests: short intervals and
-// TTLs so a test does not have to wait a second for a refresh or an expiry.
-func redisTestConfig(mr *miniredis.Miniredis) RedisClusterConfig {
-	return RedisClusterConfig{
-		Addr:              mr.Addr(),
-		SummaryInterval:   20 * time.Millisecond,
-		SummaryTTL:        400 * time.Millisecond,
-		NodeTTL:           400 * time.Millisecond,
-		HeartbeatInterval: 50 * time.Millisecond,
-		Logger:            discardLogger(),
-	}
-}
-
-// startRedisCluster starts one node against the shared miniredis and stops it at
-// the end of the test.
-func startRedisCluster(t *testing.T, mr *miniredis.Miniredis, nodeID string, handler ClusterHandler, cfg RedisClusterConfig) *redisCluster {
-	t.Helper()
-	c, ok := NewRedisCluster(cfg).(*redisCluster)
-	if !ok {
-		t.Fatalf("NewRedisCluster returned %T", c)
-	}
-	if err := c.Start(context.Background(), nodeID, handler); err != nil {
-		t.Fatalf("start node %q: %v", nodeID, err)
-	}
-	t.Cleanup(func() { _ = c.Stop(context.Background()) })
-	return c
-}
-
-// redisTestClient is a plain client for the same miniredis: it lets a test
-// publish a raw frame or inspect a key without going through the backend.
-func redisTestClient(t *testing.T, mr *miniredis.Miniredis) *redis.Client {
-	t.Helper()
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = rdb.Close() })
-	return rdb
-}
-
-func redisMemberIDs(c *redisCluster) []string {
-	out := make([]string, 0, 4)
-	for _, m := range c.Members() {
-		out = append(out, m.NodeID)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// waitRedisMembers waits until the view read from Redis contains exactly want.
-func waitRedisMembers(t *testing.T, c *redisCluster, want ...string) {
-	t.Helper()
-	sort.Strings(want)
-	deadline := time.Now().Add(redisWaitCeiling)
-	var got []string
-	for time.Now().Before(deadline) {
-		got = redisMemberIDs(c)
-		if equalStrings(got, want) {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("%s members = %v, want %v", c.nodeID, got, want)
-}
-
-// waitRedisSummary waits until the node's cached routing view holds the summary
-// a peer advertised. Routing is only directed once the publisher saw it, so a
-// test that asserts on directed delivery waits for this and not for a sleep.
+// waitRedisSummary waits until the node's cached routing view holds the summary a
+// peer advertised. Routing is only directed once the publisher saw it, so a test
+// that asserts on directed delivery waits for this and not for a sleep.
 func waitRedisSummary(t *testing.T, c *redisCluster, nodeID string, want ...string) {
 	t.Helper()
 	deadline := time.Now().Add(redisWaitCeiling)
 	var got []string
 	for time.Now().Before(deadline) {
-		if filters, ok := c.viewSummary(nodeID); ok {
+		if filters, known := routedSummary(c.Routed(), nodeID); known {
 			got = filters
-			if equalStrings(got, want) {
+			if equalStringsUnordered(got, want) {
 				return
 			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("%s view of %q = %v, want %v", c.nodeID, nodeID, got, want)
-}
-
-// waitRedisView waits until the node's cached routing view holds exactly want:
-// the view is a node's own copy of the shared Redis state, refreshed at most once
-// per SummaryInterval.
-func waitRedisView(t *testing.T, c *redisCluster, want ...string) {
-	t.Helper()
-	sort.Strings(want)
-	deadline := time.Now().Add(redisWaitCeiling)
-	var got []string
-	for time.Now().Before(deadline) {
-		got = c.viewMembers()
-		if equalStrings(got, want) {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("%s routing view = %v, want %v", c.nodeID, got, want)
+	t.Fatalf("routing view of %q = %v, want %v", nodeID, got, want)
 }
 
 // redisCounter is anything that reports applied publish/kick counts, which both
@@ -191,9 +103,9 @@ func TestRedisClusterDirectedPublish(t *testing.T) {
 	hc := &filterHandler{}
 	hc.setFilters("other/#")
 
-	a := startRedisCluster(t, mr, "a", &recClusterHandler{}, cfg)
-	startRedisCluster(t, mr, "b", hb, cfg)
-	startRedisCluster(t, mr, "c", hc, cfg)
+	a := startRedisTestCluster(t, mr, "a", &recClusterHandler{}, cfg)
+	startRedisTestCluster(t, mr, "b", hb, cfg)
+	startRedisTestCluster(t, mr, "c", hc, cfg)
 	waitRedisMembers(t, a, "b", "c")
 	waitRedisView(t, a, "b", "c")
 
@@ -244,9 +156,9 @@ func TestRedisClusterKickAndRetainedBroadcast(t *testing.T) {
 	hc := &filterHandler{}
 	hc.setFilters("other/#")
 
-	a := startRedisCluster(t, mr, "a", &recClusterHandler{}, cfg)
-	startRedisCluster(t, mr, "b", hb, cfg)
-	startRedisCluster(t, mr, "c", hc, cfg)
+	a := startRedisTestCluster(t, mr, "a", &recClusterHandler{}, cfg)
+	startRedisTestCluster(t, mr, "b", hb, cfg)
+	startRedisTestCluster(t, mr, "c", hc, cfg)
 	waitRedisMembers(t, a, "b", "c")
 	// Members() is read from Redis; the kick is routed through a's cached routing
 	// view, which is only refreshed once per SummaryInterval. Without this wait the
@@ -295,14 +207,14 @@ func TestRedisClusterUnknownSummaryReceivesPublish(t *testing.T) {
 
 	ha := &recClusterHandler{}
 	hb := &recClusterHandler{} // no subscriptionProvider: never advertises
-	a := startRedisCluster(t, mr, "a", ha, cfg)
-	startRedisCluster(t, mr, "b", hb, cfg)
+	a := startRedisTestCluster(t, mr, "a", ha, cfg)
+	startRedisTestCluster(t, mr, "b", hb, cfg)
 	waitRedisMembers(t, a, "b")
 
-	if mr.Exists(a.summaryKey("b")) {
-		t.Fatalf("a node without a subscription provider advertised %s", a.summaryKey("b"))
+	if key := redisTestKey(cfg, "subs", "b"); mr.Exists(key) {
+		t.Fatalf("a node without a subscription provider advertised %s", key)
 	}
-	if _, ok := a.viewSummary("b"); ok {
+	if _, ok := clusterRoutedSummary(t, a, "b"); ok {
 		t.Fatal("view reports a summary for a node that advertised none")
 	}
 	if err := a.Spread(context.Background(), ClusterMessage{
@@ -328,7 +240,7 @@ func TestRedisClusterDedupAndLoopGuard(t *testing.T) {
 	cfg.DedupSize = 4
 
 	hb := &recClusterHandler{}
-	b := startRedisCluster(t, mr, "b", hb, cfg)
+	b := startRedisTestCluster(t, mr, "b", hb, cfg)
 	rdb := redisTestClient(t, mr)
 
 	frame := func(origin string, seq uint64, payload string) string {
@@ -373,7 +285,7 @@ func TestRedisClusterDedupAndLoopGuard(t *testing.T) {
 	}
 	// One duplicate drop for the first redelivery, five loop drops, one duplicate
 	// drop for the redelivery that survived the own-origin traffic.
-	if got := b.dropCount(); got != 7 {
+	if got := clusterStats(t, b).Drops; got != 7 {
 		t.Fatalf("dropped %d events, want 7 (1 duplicate + 5 own-origin + 1 duplicate)", got)
 	}
 	hb.mu.Lock()
@@ -394,8 +306,8 @@ func TestRedisClusterDoesNotForwardReceivedEvents(t *testing.T) {
 	cfg := redisTestConfig(mr)
 
 	ha := &recClusterHandler{}
-	a := startRedisCluster(t, mr, "a", ha, cfg)
-	b := startRedisCluster(t, mr, "b", &recClusterHandler{}, cfg)
+	a := startRedisTestCluster(t, mr, "a", ha, cfg)
+	b := startRedisTestCluster(t, mr, "b", &recClusterHandler{}, cfg)
 	waitRedisMembers(t, a, "b")
 
 	// A received event carries the origin of the node that produced it.
@@ -405,7 +317,7 @@ func TestRedisClusterDoesNotForwardReceivedEvents(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Spread returned %v, want a silent drop", err)
 	}
-	if got := b.dropCount(); got != 1 {
+	if got := clusterStats(t, b).Drops; got != 1 {
 		t.Fatalf("drops = %d, want 1 (cluster_forward)", got)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -423,8 +335,8 @@ func TestRedisClusterNodeTTLAndRestart(t *testing.T) {
 	cfg.NodeTTL = 250 * time.Millisecond
 	cfg.SummaryTTL = 250 * time.Millisecond
 
-	a := startRedisCluster(t, mr, "a", &recClusterHandler{}, cfg)
-	b := startRedisCluster(t, mr, "b", &recClusterHandler{}, cfg)
+	a := startRedisTestCluster(t, mr, "a", &recClusterHandler{}, cfg)
+	b := startRedisTestCluster(t, mr, "b", &recClusterHandler{}, cfg)
 	waitRedisMembers(t, a, "b")
 
 	b.mu.Lock()
@@ -439,7 +351,7 @@ func TestRedisClusterNodeTTLAndRestart(t *testing.T) {
 	for time.Now().Before(deadline) && len(a.Members()) != 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := redisMemberIDs(a); len(got) != 0 {
+	if got := clusterMemberIDs(t, a); len(got) != 0 {
 		t.Fatalf("crashed node is still a member after NodeTTL: %v", got)
 	}
 	if mr.Exists(a.memberKey("b")) {
@@ -447,7 +359,7 @@ func TestRedisClusterNodeTTLAndRestart(t *testing.T) {
 	}
 
 	// The same node id restarting is a new incarnation, not the old member.
-	startRedisCluster(t, mr, "b", &recClusterHandler{}, cfg)
+	startRedisTestCluster(t, mr, "b", &recClusterHandler{}, cfg)
 	waitRedisMembers(t, a, "b")
 	members := a.Members()
 	if members[0].Incarnation == "" || members[0].Incarnation == incarnation {
@@ -467,9 +379,9 @@ func TestRedisClusterRedisOutage(t *testing.T) {
 	cfg := redisTestConfig(mr)
 
 	ha, hb := &recClusterHandler{}, &recClusterHandler{}
-	a := startRedisCluster(t, mr, "a", ha, cfg)
-	b := startRedisCluster(t, mr, "b", hb, cfg)
-	victim := startRedisCluster(t, mr, "victim", &recClusterHandler{}, cfg)
+	a := startRedisTestCluster(t, mr, "a", ha, cfg)
+	b := startRedisTestCluster(t, mr, "b", hb, cfg)
+	victim := startRedisTestCluster(t, mr, "victim", &recClusterHandler{}, cfg)
 	waitRedisMembers(t, a, "b", "victim")
 
 	spread := func(payload string) error {
@@ -687,7 +599,7 @@ func TestRedisClusterSummaryCap(t *testing.T) {
 
 	h := &filterHandler{}
 	h.setFilters("a/1", "a/2", "a/3", "a/4", "a/5")
-	c := startRedisCluster(t, mr, "n1", h, cfg)
+	c := startRedisTestCluster(t, mr, "n1", h, cfg)
 	rdb := redisTestClient(t, mr)
 
 	summary := func() redisSummaryRecord {

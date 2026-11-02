@@ -271,14 +271,14 @@ func TestTCPClusterAdvertisesSharedGroups(t *testing.T) {
 	waitPeers(t, cb, 1)
 	_ = cb
 	waitFor(t, "node a to see the shared group of node b", func() bool {
-		groups := ca.sharedGroups()
-		return len(groups["$share/g/tcp/x"]) == 1 && groups["$share/g/tcp/x"][0] == "b"
+		groups, ok := clusterMemberShared(t, ca, "b")
+		return ok && len(groups) == 1 && groups[0] == "$share/g/tcp/x"
 	})
 	// The shared group travels beside the topic filters, not among them: the filter
 	// list stays "topics a normal subscriber of this node would match".
-	for _, filter := range tcpMemberFilters(ca, "b") {
+	for _, filter := range tcpMemberFilters(t, ca, "b") {
 		if strings.HasPrefix(filter, "$share/") {
-			t.Fatalf("the shared group leaked into the topic filters: %v", tcpMemberFilters(ca, "b"))
+			t.Fatalf("the shared group leaked into the topic filters: %v", tcpMemberFilters(t, ca, "b"))
 		}
 	}
 }
@@ -296,8 +296,8 @@ func TestRedisClusterAdvertisesSharedGroups(t *testing.T) {
 	// Members() reports the peers, not the node itself.
 	waitRedisMembers(t, ca, "b")
 	waitFor(t, "node a to see the shared group of node b", func() bool {
-		groups := ca.sharedGroups()
-		return len(groups["$share/g/redis/x"]) == 1 && groups["$share/g/redis/x"][0] == "b"
+		groups, ok := clusterMemberShared(t, ca, "b")
+		return ok && len(groups) == 1 && groups[0] == "$share/g/redis/x"
 	})
 }
 
@@ -314,13 +314,10 @@ func (p *summaryProvider) subscriptionFilters() []string      { return p.filters
 func (p *summaryProvider) sharedSubscriptionGroups() []string { return p.groups }
 
 // tcpMemberFilters returns the topic filters a peer advertised.
-func tcpMemberFilters(c *tcpCluster, nodeID string) []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if m, ok := c.members[nodeID]; ok {
-		return append([]string(nil), m.filters...)
-	}
-	return nil
+func tcpMemberFilters(t *testing.T, c Cluster, nodeID string) []string {
+	t.Helper()
+	filters, _ := clusterMemberSummary(t, c, nodeID)
+	return filters
 }
 
 // TestSharedAcrossTCPCluster runs the whole feature over the real TCP backend: two
@@ -352,7 +349,8 @@ func TestSharedAcrossTCPCluster(t *testing.T) {
 	// The election needs node a to see node b's group: the summary is pushed when
 	// the subscription is accepted, so wait for it instead of sleeping.
 	waitFor(t, "node a to see the group of node b", func() bool {
-		return len(ca.(*tcpCluster).sharedGroups()["$share/workers/tcp/jobs"]) == 1
+		groups, ok := clusterMemberShared(t, ca, "b")
+		return ok && len(groups) == 1 && groups[0] == "$share/workers/tcp/jobs"
 	})
 
 	const total = 8
@@ -382,14 +380,15 @@ func TestSharedAcrossRedisCluster(t *testing.T) {
 	cb := NewRedisCluster(cfg)
 	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
-	waitRedisMembers(t, ca.(*redisCluster), "b")
+	waitRedisMembers(t, ca, "b")
 
 	memberA, _ := mustConnect(t, a.Addr(), confConnect{version: mqtt.Version5, clientID: "redis-member-a", clean: true})
 	memberB, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "redis-member-b", clean: true})
 	subscribeShared(t, memberA, 1, "$share/workers/redis/jobs", 0, mqtt.Properties{})
 	subscribeShared(t, memberB, 1, "$share/workers/redis/jobs", 0, mqtt.Properties{})
 	waitFor(t, "node a to see the group of node b", func() bool {
-		return len(ca.(*redisCluster).sharedGroups()["$share/workers/redis/jobs"]) == 1
+		groups, ok := clusterRoutedShared(t, ca, "b")
+		return ok && len(groups) == 1 && groups[0] == "$share/workers/redis/jobs"
 	})
 
 	const total = 8

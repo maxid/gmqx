@@ -566,7 +566,6 @@ func TestNewRedisClusterWithSessionStore(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	backend := cluster.(*redisCluster)
 	if err := cluster.Start(context.Background(), "a", &recClusterHandler{}); err != nil {
 		t.Fatalf("start cluster: %v", err)
 	}
@@ -578,7 +577,13 @@ func TestNewRedisClusterWithSessionStore(t *testing.T) {
 		t.Fatalf("the session is not under %q", want)
 	}
 	// The layout of the two kinds of key, under one prefix, shares no segment.
-	for _, other := range []string{backend.nodeChannel("collide"), backend.ownerKey("collide"), backend.memberKey("collide"), backend.summaryKey("collide"), backend.presenceKey("", "collide")} {
+	for _, other := range []string{
+		redisTestKey(cfg, "node", "collide"),
+		redisTestKey(cfg, "owner", "collide"),
+		redisTestKey(cfg, "member", "collide"),
+		redisTestKey(cfg, "subs", "collide"),
+		redisTestPresenceKey(cfg, "", "collide"),
+	} {
 		if other == want || strings.HasPrefix(other, store.sessionKeyPrefix()) {
 			t.Fatalf("a session key collides with the cluster key %q", other)
 		}

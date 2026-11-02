@@ -245,22 +245,22 @@ func TestOnRemoteTargetDeliversAndQueues(t *testing.T) {
 // its presence, so a directed publish is still queued for it on the right node.
 func TestRedisClusterDirectedPublishUsesPresence(t *testing.T) {
 	mr := runMiniRedis(t)
-	a := startBroker(t, Config{NodeID: "a", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger()})
-	b := startBroker(t, Config{NodeID: "b", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger()})
-	ca := a.cfg.ClusterBackend.(*redisCluster)
-	cb := b.cfg.ClusterBackend.(*redisCluster)
+	cfg := redisTestConfig(mr)
+	a := startBroker(t, Config{NodeID: "a", ClusterBackend: NewRedisCluster(cfg), Logger: discardLogger()})
+	b := startBroker(t, Config{NodeID: "b", ClusterBackend: NewRedisCluster(cfg), Logger: discardLogger()})
+	ca, cb := a.cfg.ClusterBackend, b.cfg.ClusterBackend
 	waitRedisMembers(t, ca, "b")
 	waitRedisMembers(t, cb, "a")
 
 	target, _ := mustConnect(t, b.Addr(), confConnect{clientID: "redis-target", clean: true})
 	waitFor(t, "the presence record of redis-target", func() bool {
-		return mr.Exists(cb.presenceKey("", "redis-target"))
+		return mr.Exists(redisTestPresenceKey(cfg, "", "redis-target"))
 	})
 
 	// Watch both node channels: the point of presence routing is that the origin
 	// node does not publish a directed event to itself or to everyone.
 	rdb := redisTestClient(t, mr)
-	sub := rdb.Subscribe(context.Background(), ca.nodeChannel("a"), cb.nodeChannel("b"))
+	sub := rdb.Subscribe(context.Background(), redisTestKey(cfg, "node", "a"), redisTestKey(cfg, "node", "b"))
 	t.Cleanup(func() { _ = sub.Close() })
 	for i := 0; i < 2; i++ {
 		if _, err := sub.ReceiveTimeout(context.Background(), 2*time.Second); err != nil {
@@ -282,7 +282,7 @@ func TestRedisClusterDirectedPublishUsesPresence(t *testing.T) {
 		t.Fatalf("read the node channel: %v", err)
 	}
 	received, ok := msg.(*redis.Message)
-	if !ok || received.Channel != cb.nodeChannel("b") {
+	if !ok || received.Channel != redisTestKey(cfg, "node", "b") {
 		t.Fatalf("directed publish went to %v, want node b's channel", msg)
 	}
 	if extra, err := sub.ReceiveTimeout(context.Background(), 150*time.Millisecond); err == nil {
@@ -291,11 +291,11 @@ func TestRedisClusterDirectedPublishUsesPresence(t *testing.T) {
 
 	// A client id with no presence record is fire-and-forget: nil, and counted by
 	// the backend that tried to route it (node a).
-	drops := ca.dropCount()
+	drops := clusterStats(t, ca).Drops
 	if err := a.PublishToClient(context.Background(), "redis-ghost", directPublication(a, "direct/x", "lost", 0)); err != nil {
 		t.Fatalf("PublishToClient for an unknown client id = %v, want nil", err)
 	}
-	if got := ca.dropCount(); got <= drops {
+	if got := clusterStats(t, ca).Drops; got <= drops {
 		t.Fatalf("presence miss was not counted: %d drops, was %d", got, drops)
 	}
 
@@ -303,7 +303,7 @@ func TestRedisClusterDirectedPublishUsesPresence(t *testing.T) {
 	// (the node owns its queue) and the publication is queued on node b.
 	offlineSession(t, b, "redis-offline", "queue/#", 1)
 	waitFor(t, "the presence record of the offline session", func() bool {
-		return mr.Exists(cb.presenceKey("", "redis-offline"))
+		return mr.Exists(redisTestPresenceKey(cfg, "", "redis-offline"))
 	})
 	if err := a.PublishToClient(context.Background(), "redis-offline", directPublication(a, "direct/x", "queued", 1)); err != nil {
 		t.Fatalf("PublishToClient for the offline session: %v", err)
@@ -345,7 +345,7 @@ func TestTCPClusterDirectedPublishBroadcasts(t *testing.T) {
 	}
 	target.ack(pub.PacketID)
 	expectNoMessage(t, bystander, 150*time.Millisecond)
-	if got := ca.(*tcpCluster).targetFanoutCount(); got == 0 {
+	if got := clusterStats(t, ca).TargetFanouts; got == 0 {
 		t.Fatal("the directed publish was not counted as a broadcast")
 	}
 
@@ -447,7 +447,6 @@ func TestRedisClusterForgetsExpiredSessionPresence(t *testing.T) {
 		unit:                 testSecond,
 		SessionSweepInterval: 5 * time.Millisecond,
 	})
-	cb := b.cfg.ClusterBackend.(*redisCluster)
 
 	c, _ := mustConnect(t, b.Addr(), confConnect{
 		version:  mqtt.Version5,
@@ -459,7 +458,7 @@ func TestRedisClusterForgetsExpiredSessionPresence(t *testing.T) {
 	c.disconnect()
 	waitDisconnected(t, b, "expiring-presence")
 
-	key := cb.presenceKey("", "expiring-presence")
+	key := redisTestPresenceKey(cfg, "", "expiring-presence")
 	waitFor(t, "the presence record of the offline session", func() bool { return mr.Exists(key) })
 	waitFor(t, "the stored session to expire", func() bool {
 		_, ok := b.store.Load("expiring-presence")
@@ -495,12 +494,11 @@ func TestRedisClusterPresenceFollowsTakeover(t *testing.T) {
 	mr := runMiniRedis(t)
 	a := startBroker(t, Config{NodeID: "a", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger(), NotKickSeconds: -1})
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: NewRedisCluster(redisTestConfig(mr)), Logger: discardLogger(), NotKickSeconds: -1})
-	ca := a.cfg.ClusterBackend.(*redisCluster)
-	cb := b.cfg.ClusterBackend.(*redisCluster)
+	ca := a.cfg.ClusterBackend
 	waitRedisMembers(t, ca, "b")
-	waitRedisMembers(t, cb, "a")
+	waitRedisMembers(t, b.cfg.ClusterBackend, "a")
 
-	key := ca.presenceKey("", "roamer")
+	key := redisTestPresenceKey(redisTestConfig(mr), "", "roamer")
 	mustConnect(t, a.Addr(), confConnect{clientID: "roamer", clean: true})
 	waitFor(t, "the presence record of the first node", func() bool {
 		return mr.Exists(key) && presenceNode(t, mr, key) == "a"

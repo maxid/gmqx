@@ -274,7 +274,7 @@ func TestTCPClusterNamespaceIsolation(t *testing.T) {
 
 	// b advertises its summary with tenant-b; a ignores it, so b stays unknown.
 	waitDrop(t, ma, "cluster_namespace")
-	if filters, ok := ca.memberSummary("b"); ok {
+	if filters, ok := clusterMemberSummary(t, ca, "b"); ok {
 		t.Fatalf("summary of another namespace was trusted: %v", filters)
 	}
 
@@ -291,13 +291,13 @@ func TestTCPClusterNamespaceIsolation(t *testing.T) {
 	}
 
 	// An event that explicitly names another namespace cannot be produced here.
-	before := ca.dropCount()
+	before := clusterStats(t, ca).Drops
 	if err := ca.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Namespace: "tenant-b", Topic: "t/y", Payload: []byte("nope"),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := ca.dropCount(); got != before+1 {
+	if got := clusterStats(t, ca).Drops; got != before+1 {
 		t.Fatalf("foreign-namespace spread drops = %d, want %d", got-before, 1)
 	}
 	if n, _ := hb.counts(); n != 0 {
@@ -406,22 +406,14 @@ func TestRedisClusterNamespaceIsolation(t *testing.T) {
 
 	// b advertised its summary with tenant-b; a must not use it for routing.
 	deadline := time.Now().Add(3 * time.Second)
-	for !mr.Exists(b.summaryKey("b")) {
+	for !mr.Exists(redisTestKey(cfgB, "subs", "b")) {
 		if time.Now().After(deadline) {
 			t.Fatal("node b did not advertise a subscription summary")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	view, err := a.loadView()
-	if err != nil {
-		t.Fatal(err)
-	}
-	peer, ok := view["b"]
-	if !ok {
-		t.Fatal("node b is missing from a's routing view")
-	}
-	if peer.filtersKnown {
-		t.Fatalf("summary of another namespace was trusted: %v", peer.filters)
+	if _, ok := clusterRoutedSummary(t, a, "b"); ok {
+		t.Fatalf("summary of another namespace was trusted: %v", clusterRouted(t, a))
 	}
 
 	// Spread routes with a's cached view, which the housekeeping loop refreshes
@@ -429,8 +421,8 @@ func TestRedisClusterNamespaceIsolation(t *testing.T) {
 	// has no target and is a successful no-op. Wait for the cache, not just for
 	// the member key.
 	waitFor(t, "a to cache the routing view with node b", func() bool {
-		for _, id := range a.viewMembers() {
-			if id == "b" {
+		for _, r := range clusterRouted(t, a) {
+			if r.NodeID == "b" {
 				return true
 			}
 		}
@@ -444,7 +436,7 @@ func TestRedisClusterNamespaceIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline = time.Now().Add(3 * time.Second)
-	for b.dropCount() == 0 {
+	for clusterStats(t, b).Drops == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("b did not drop the foreign-namespace event")
 		}
@@ -455,13 +447,13 @@ func TestRedisClusterNamespaceIsolation(t *testing.T) {
 	}
 
 	// An event that explicitly names another namespace cannot leave a either.
-	before := a.dropCount()
+	before := clusterStats(t, a).Drops
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Namespace: "tenant-b", Topic: "t/y", Payload: []byte("nope"),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.dropCount(); got != before+1 {
+	if got := clusterStats(t, a).Drops; got != before+1 {
 		t.Fatalf("foreign-namespace spread drops = %d, want 1", got-before)
 	}
 }

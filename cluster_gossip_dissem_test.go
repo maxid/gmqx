@@ -102,41 +102,6 @@ func (h *gossipFilterHandler) setFilters(filters ...string) {
 	h.fmu.Unlock()
 }
 
-func waitGossipSummary(t *testing.T, c *gossipCluster, nodeID string, want ...string) {
-	t.Helper()
-	deadline := time.Now().Add(gossipWaitCeiling)
-	var got []string
-	for time.Now().Before(deadline) {
-		if filters, ok := c.memberSummary(nodeID); ok {
-			got = filters
-			if equalStringsUnordered(got, want) {
-				return
-			}
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("summary of %s on %s = %v, want %v", nodeID, c.nodeID, got, want)
-}
-
-func equalStringsUnordered(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	as := append([]string(nil), a...)
-	bs := append([]string(nil), b...)
-	sortStrings(as)
-	sortStrings(bs)
-	return equalStrings(as, bs)
-}
-
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
-}
-
 // TestGossipDisseminationForwardsThroughRelay pins the epidemic with a chain: the
 // origin knows a matching peer (b) and an unknown one (c), but Fanout is one, so it
 // writes only the matching peer. b forwards to the peer it did not receive the event
@@ -158,15 +123,15 @@ func TestGossipDisseminationForwardsThroughRelay(t *testing.T) {
 	b := startGossipCluster(t, "b", cfgB, hb)
 	c := startGossipCluster(t, "c", cfgC, hc)
 
-	waitGossipMembers(t, a, "b", "c")
-	waitGossipMembers(t, b, "a", "c")
-	waitGossipMembers(t, c, "a", "b")
+	waitClusterMembers(t, a, "b", "c")
+	waitClusterMembers(t, b, "a", "c")
+	waitClusterMembers(t, c, "a", "b")
 	// The origin must know that b matches before it can prefer it over c, and
 	// both hops must have a link.
-	waitGossipSummary(t, a, "b", "t/#")
-	waitGossipLink(t, a, "b")
-	waitGossipLink(t, b, "c")
-	waitGossipSettled(t, a, b)
+	waitClusterSummary(t, a, "b", "t/#")
+	waitClusterLink(t, a, "b")
+	waitClusterLink(t, b, "c")
+	waitClusterSettled(t, a, b)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "t/x", Payload: []byte("relayed"),
@@ -182,19 +147,19 @@ func TestGossipDisseminationForwardsThroughRelay(t *testing.T) {
 	if n, _ := ha.counts(); n != 0 {
 		t.Fatalf("the origin received its own publish %d times", n)
 	}
-	if got := b.forwardCount(); got == 0 {
+	if got := clusterStats(t, b).Forwards; got == 0 {
 		t.Fatal("b did not forward the event")
 	}
-	if got := a.forwardCount(); got != 0 {
+	if got := clusterStats(t, a).Forwards; got != 0 {
 		t.Fatalf("the origin forwarded %d events, want 0", got)
 	}
-	if got := a.eventWriteCount(); got != 1 {
+	if got := clusterStats(t, a).EventWrites; got != 1 {
 		t.Fatalf("the origin wrote the event to %d peers, want only the matching relay", got)
 	}
-	if got := c.dedupLen(); got != 1 {
+	if got := clusterStats(t, c).Dedup; got != 1 {
 		t.Fatalf("c dedup table has %d identities, want 1", got)
 	}
-	if got := c.dropCount(); got != 0 {
+	if got := clusterStats(t, c).Drops; got != 0 {
 		t.Fatalf("c dropped %d events, want 0", got)
 	}
 }
@@ -215,12 +180,12 @@ func TestGossipDisseminationFanoutBroadcasts(t *testing.T) {
 	c := startGossipCluster(t, "c", mk(cAddr, aAddr, bAddr), hc)
 	_ = b
 	_ = c
-	waitGossipMembers(t, a, "b", "c")
-	waitGossipMembers(t, b, "a", "c")
-	waitGossipMembers(t, c, "a", "b")
-	waitGossipLink(t, a, "b")
-	waitGossipLink(t, a, "c")
-	waitGossipSettled(t, a, b, c)
+	waitClusterMembers(t, a, "b", "c")
+	waitClusterMembers(t, b, "a", "c")
+	waitClusterMembers(t, c, "a", "b")
+	waitClusterLink(t, a, "b")
+	waitClusterLink(t, a, "c")
+	waitClusterSettled(t, a, b, c)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "broadcast/x", Payload: []byte("all"),
@@ -236,16 +201,16 @@ func TestGossipDisseminationFanoutBroadcasts(t *testing.T) {
 	if n, _ := hc.counts(); n != 1 {
 		t.Fatalf("c received %d publishes, want 1", n)
 	}
-	if got := b.dedupLen(); got != 1 {
+	if got := clusterStats(t, b).Dedup; got != 1 {
 		t.Fatalf("b dedup identities = %d, want 1", got)
 	}
-	if got := c.dedupLen(); got != 1 {
+	if got := clusterStats(t, c).Dedup; got != 1 {
 		t.Fatalf("c dedup identities = %d, want 1", got)
 	}
-	if got := a.forwardCount(); got != 0 {
+	if got := clusterStats(t, a).Forwards; got != 0 {
 		t.Fatalf("the origin forwarded %d events, want 0", got)
 	}
-	if got := a.eventWriteCount(); got != 2 {
+	if got := clusterStats(t, a).EventWrites; got != 2 {
 		t.Fatalf("the origin wrote the broadcast to %d peers, want both", got)
 	}
 }
@@ -267,14 +232,14 @@ func TestGossipRoutingSummaryPrecision(t *testing.T) {
 	a := startGossipCluster(t, "a", cfg(aAddr, bAddr, cAddr), ha)
 	b := startGossipCluster(t, "b", cfg(bAddr, aAddr, cAddr), hb)
 	c := startGossipCluster(t, "c", cfg(cAddr, aAddr, bAddr), hc)
-	waitGossipMembers(t, a, "b", "c")
-	waitGossipMembers(t, b, "a", "c")
-	waitGossipMembers(t, c, "a", "b")
-	waitGossipSummary(t, a, "b", "routed/#")
-	waitGossipSummary(t, a, "c", "other/#")
-	waitGossipLink(t, a, "b")
-	waitGossipLink(t, a, "c")
-	waitGossipSettled(t, a)
+	waitClusterMembers(t, a, "b", "c")
+	waitClusterMembers(t, b, "a", "c")
+	waitClusterMembers(t, c, "a", "b")
+	waitClusterSummary(t, a, "b", "routed/#")
+	waitClusterSummary(t, a, "c", "other/#")
+	waitClusterLink(t, a, "b")
+	waitClusterLink(t, a, "c")
+	waitClusterSettled(t, a)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "routed/x", Payload: []byte("b"),
@@ -317,21 +282,21 @@ func TestGossipRoutingUnknownSummaryFallsBack(t *testing.T) {
 	b := startGossipCluster(t, "b", cfg(bAddr, aAddr, cAddr, dAddr), hb)
 	c := startGossipCluster(t, "c", cfg(cAddr, aAddr, bAddr, dAddr), hc)
 	d := startGossipCluster(t, "d", cfg(dAddr, aAddr, bAddr, cAddr), hd)
-	waitGossipMembers(t, a, "b", "c", "d")
-	waitGossipMembers(t, b, "a", "c", "d")
-	waitGossipMembers(t, c, "a", "b", "d")
-	waitGossipMembers(t, d, "a", "b", "c")
-	waitGossipSummary(t, a, "b", "fallback/#")
-	waitGossipSummary(t, a, "c", "unmatched/#")
+	waitClusterMembers(t, a, "b", "c", "d")
+	waitClusterMembers(t, b, "a", "c", "d")
+	waitClusterMembers(t, c, "a", "b", "d")
+	waitClusterMembers(t, d, "a", "b", "c")
+	waitClusterSummary(t, a, "b", "fallback/#")
+	waitClusterSummary(t, a, "c", "unmatched/#")
 	// b must know c does not match, otherwise c is a legitimate unknown-summary
 	// relay target and could consume the one fan-out slot meant for d.
-	waitGossipSummary(t, b, "c", "unmatched/#")
-	waitGossipLink(t, a, "b")
-	waitGossipLink(t, b, "c")
-	waitGossipLink(t, b, "d")
+	waitClusterSummary(t, b, "c", "unmatched/#")
+	waitClusterLink(t, a, "b")
+	waitClusterLink(t, b, "c")
+	waitClusterLink(t, b, "d")
 	// The relay's link to d must survive startup: a frame written into a link that
 	// is being superseded is dropped and the event is not retried.
-	waitGossipSettled(t, a, b)
+	waitClusterSettled(t, a, b)
 	// d advertises nothing at all: its summary is unknown.
 
 	if err := a.Spread(context.Background(), ClusterMessage{
@@ -344,7 +309,7 @@ func TestGossipRoutingUnknownSummaryFallsBack(t *testing.T) {
 	if n, _ := hc.counts(); n != 0 {
 		t.Fatalf("the non-matching peer received %d publishes, want 0", n)
 	}
-	if b.forwardCount() == 0 {
+	if clusterStats(t, b).Forwards == 0 {
 		t.Fatal("the relay did not forward to the unknown-summary peer")
 	}
 }
@@ -357,11 +322,11 @@ func TestGossipDisseminationKickBroker(t *testing.T) {
 	cb := NewGossipCluster(gossipTestConfig(bAddr, aAddr))
 	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca, ConnectMode: ConnectModeKick, NotKickSeconds: -1})
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb, ConnectMode: ConnectModeKick, NotKickSeconds: -1})
-	waitGossipMembers(t, ca.(*gossipCluster), "b")
-	waitGossipMembers(t, cb.(*gossipCluster), "a")
-	waitGossipLink(t, ca.(*gossipCluster), "b")
-	waitGossipLink(t, cb.(*gossipCluster), "a")
-	waitGossipSettled(t, ca.(*gossipCluster), cb.(*gossipCluster))
+	waitClusterMembers(t, ca, "b")
+	waitClusterMembers(t, cb, "a")
+	waitClusterLink(t, ca, "b")
+	waitClusterLink(t, cb, "a")
+	waitClusterSettled(t, ca, cb)
 
 	remote := dialTestClient(t, b.Addr(), "dup")
 	// Let the kick b spread on the CONNECT reach a before the same client id
@@ -386,16 +351,17 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
 	startBroker(t, Config{NodeID: "c", ClusterBackend: cc})
-	gca, gcb, gcc := ca.(*gossipCluster), cb.(*gossipCluster), cc.(*gossipCluster)
-	waitGossipMembers(t, gca, "b", "c")
-	waitGossipMembers(t, gcb, "a", "c")
-	waitGossipMembers(t, gcc, "a", "b")
-	waitGossipLink(t, gca, "b")
-	waitGossipSettled(t, gca, gcb)
+	gca := ca.(*gossipCluster)
+	waitClusterMembers(t, ca, "b", "c")
+	waitClusterMembers(t, cb, "a", "c")
+	waitClusterMembers(t, cc, "a", "b")
+	waitClusterLink(t, ca, "b")
+	waitClusterSettled(t, ca, cb)
 
 	target, _ := mustConnect(t, b.Addr(), confConnect{clientID: "gossip-target", clean: true})
 	waitFor(t, "the presence claim to reach a", func() bool {
-		return gca.presenceOwner("gossip-target") == "b"
+		nodeID, ok := clusterPresence(t, ca).Presence("gossip-target")
+		return ok && nodeID == "b"
 	})
 
 	if err := a.PublishToClient(context.Background(), "gossip-target", directPublication(a, "direct/x", "once", 0)); err != nil {
@@ -406,25 +372,22 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 		t.Fatalf("directed delivery = %q %q", pub.Topic, pub.Payload)
 	}
 	expectNoMessage(t, target, 150*time.Millisecond)
-	if got := gca.targetRoutedCount(); got != 1 {
+	if got := clusterStats(t, ca).TargetRouted; got != 1 {
 		t.Fatalf("directed publishes routed by presence = %d, want 1", got)
 	}
-	if got := gca.targetFloodedCount(); got != 0 {
+	if got := clusterStats(t, ca).TargetFlooded; got != 0 {
 		t.Fatalf("directed publishes flooded = %d, want 0", got)
 	}
 	// c only ever received the connect-time kick of b's client, never the
 	// directed publish (which dedup would have made at most one identity).
-	if got := gcc.dedupLen(); got > 1 {
-		t.Fatalf("the bystander applied %d events %v, want at most the kick", got, gcc.dedup.Keys())
+	if got := clusterStats(t, cc).Dedup; got > 1 {
+		t.Fatalf("the bystander applied %d events, want at most the kick", got)
 	}
-	if got := gcc.targetForwardCount(); got != 0 {
+	if got := clusterStats(t, cc).TargetForwards; got != 0 {
 		t.Fatalf("the bystander forwarded %d directed publishes, want 0", got)
 	}
-	gcb.mu.Lock()
-	claims := len(gcb.presence)
-	gcb.mu.Unlock()
-	if claims == 0 {
-		t.Fatal("b did not keep a presence claim for its client")
+	if nodeID, ok := clusterPresence(t, cb).Presence("gossip-target"); !ok || nodeID != "b" {
+		t.Fatalf("b presence claim = (%q, %v), want itself", nodeID, ok)
 	}
 
 	// A claim that is gone (the owner died or left) must not swallow the event:
@@ -441,7 +404,7 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 		t.Fatalf("fallback delivery = %q", pub.Payload)
 	}
 	expectNoMessage(t, target, 100*time.Millisecond)
-	if got := gca.targetFloodedCount(); got != 1 {
+	if got := clusterStats(t, ca).TargetFlooded; got != 1 {
 		t.Fatalf("directed publishes flooded = %d, want 1", got)
 	}
 }
@@ -460,11 +423,11 @@ func TestGossipNamespaceIsolationAndDedup(t *testing.T) {
 	ha, hb := &gossipRecorder{}, &gossipRecorder{}
 	a := startGossipCluster(t, "a", cfgA, ha)
 	b := startGossipCluster(t, "b", cfgB, hb)
-	waitGossipMembers(t, a, "b")
-	waitGossipMembers(t, b, "a")
-	waitGossipLink(t, a, "b")
-	waitGossipLink(t, b, "a")
-	waitGossipSettled(t, a, b)
+	waitClusterMembers(t, a, "b")
+	waitClusterMembers(t, b, "a")
+	waitClusterLink(t, a, "b")
+	waitClusterLink(t, b, "a")
+	waitClusterSettled(t, a, b)
 
 	if err := a.Spread(context.Background(), ClusterMessage{
 		Type: ClusterPublish, Topic: "ns/x", Payload: []byte("a"),
@@ -483,16 +446,17 @@ func TestGossipNamespaceIsolationAndDedup(t *testing.T) {
 		Type: ClusterPublish, NodeID: "a", Origin: "a", Seq: 41,
 		Namespace: "tenant-b", Topic: "dedup/x", Payload: []byte("once"),
 	}
+	gb := b.(*gossipCluster)
 	link := &gossipLink{nodeID: "a"}
-	b.handleEvent(link, event)
-	b.handleEvent(link, event)
+	gb.handleEvent(link, event)
+	gb.handleEvent(link, event)
 	if n, _ := hb.counts(); n != 1 {
 		t.Fatalf("b applied %d copies of one event, want 1", n)
 	}
-	if got := b.dedupLen(); got != 1 {
+	if got := clusterStats(t, b).Dedup; got != 1 {
 		t.Fatalf("dedup identities = %d, want 1", got)
 	}
-	if got := b.dropCount(); got == 0 {
+	if got := clusterStats(t, b).Drops; got == 0 {
 		t.Fatal("the duplicate was not counted")
 	}
 }
@@ -506,9 +470,9 @@ func TestGossipSharedGroupsFromSummary(t *testing.T) {
 	ha, hb := &gossipRecorder{}, &summaryProvider{filters: []string{"t/#"}, groups: []string{group}}
 	a := startGossipCluster(t, "a", gossipTestConfig(aAddr, bAddr), ha)
 	startGossipCluster(t, "b", gossipTestConfig(bAddr, aAddr), hb)
-	waitGossipMembers(t, a, "b")
+	waitClusterMembers(t, a, "b")
 	waitFor(t, "the shared group advertisement", func() bool {
-		groups := a.sharedGroups()
-		return len(groups[group]) == 1 && groups[group][0] == "b"
+		groups, ok := clusterMemberShared(t, a, "b")
+		return ok && len(groups) == 1 && groups[0] == group
 	})
 }

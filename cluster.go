@@ -184,6 +184,15 @@ type Member struct {
 	// only exposes a peer list leaves it empty, which means alive; the gossip
 	// backend reports MemberAlive, MemberSuspect or MemberDead (see MemberState).
 	State MemberState
+	// Filters and Shared are the two halves of the subscription summary the node
+	// advertises: the topic filters, oldest first, and the shared subscription
+	// group keys it holds a live member of. SummaryKnown is false until its first
+	// summary arrived. A peer with an unknown summary receives every publish,
+	// because a stale view must not cost a delivery; a backend without a summary
+	// provider never sets SummaryKnown.
+	Filters      []string
+	Shared       []string
+	SummaryKnown bool
 }
 
 // MemberView is implemented by cluster backends that expose their member view.
@@ -191,6 +200,100 @@ type Member struct {
 // not have to implement membership.
 type MemberView interface {
 	Members() []Member
+}
+
+// ClusterStats is a snapshot of one backend's counters. A backend that does not
+// track a counter leaves it zero, so the struct grows additively when a backend
+// learns a new one instead of every backend having to answer every question.
+type ClusterStats struct {
+	// Drops counts the events the backend refused to deliver or forward,
+	// whatever the reason (duplicate, foreign namespace, unreachable peer,
+	// unknown target).
+	Drops uint64
+	// Dedup is how many event identities the duplicate table remembers now.
+	Dedup int
+	// Forwards counts received events this node passed on to another node.
+	Forwards uint64
+	// EventWrites counts the peer targets a locally produced event was written
+	// to: the fan-out of the origin.
+	EventWrites uint64
+	// TargetRouted counts directed publishes (ClusterTarget) routed to the node
+	// the presence view names.
+	TargetRouted uint64
+	// TargetFlooded counts directed publishes that fell back to the epidemic
+	// because no live presence claim was known.
+	TargetFlooded uint64
+	// TargetForwards counts received directed publishes this node passed on.
+	TargetForwards uint64
+	// TargetFanouts counts the peer frame writes a locally produced directed
+	// publish caused. A mesh without presence pays one write per peer and makes
+	// that trade-off observable here.
+	TargetFanouts uint64
+}
+
+// StatsView is implemented by cluster backends that expose their counters.
+// It is an optional interface, like MemberView.
+type StatsView interface {
+	Stats() ClusterStats
+}
+
+// Link is one transport connection of a cluster node. A mesh backend reports one
+// entry per physical connection, so two nodes that dial each other appear twice
+// until the reconciliation drops the loser.
+//
+//   - ID is the connection identity: it is assigned when the connection is
+//     registered and never reused, so a replaced link keeps its peer and
+//     direction but never its ID. It is what makes "the link set stopped
+//     changing" observable from outside the backend.
+//   - Peer is the node id the peer announced. It is empty until the handshake
+//     identifies the link.
+//   - Addr is the peer's advertised cluster address, and DialAddr the address
+//     this node dialed (outbound links only). An inbound link has no DialAddr.
+type Link struct {
+	ID       uint64
+	Peer     string
+	Addr     string
+	DialAddr string
+	Outbound bool
+}
+
+// LinkView is implemented by cluster backends that expose their transport links.
+// A backend without a mesh (the Redis fan-out) does not implement it.
+type LinkView interface {
+	Links() []Link
+}
+
+// PresenceView is implemented by cluster backends that track which node holds a
+// client id. Presence is a TTL'd hint, not a source of truth: a claim can be
+// missing or stale, and a directed publish then falls back to the epidemic (see
+// ClusterTarget).
+type PresenceView interface {
+	// Presence reports the node a client id's live claim names. ok is false when
+	// the backend holds no claim for it (never seen, or expired).
+	Presence(clientID string) (nodeID string, ok bool)
+}
+
+// Routed is one peer as a backend's routing view holds it: the node a locally
+// produced event would be sent to now, with the subscription summary that decision
+// is based on.
+type Routed struct {
+	NodeID string
+	// Filters and Shared are the two halves of the summary the routing view holds
+	// for the node, and SummaryKnown is false until it has seen a summary (which
+	// makes the node receive every publish rather than none).
+	Filters      []string
+	Shared       []string
+	SummaryKnown bool
+}
+
+// RoutingView is implemented by cluster backends that route through a cached copy
+// of the shared cluster state instead of their live view. The Redis fan-out is the
+// case: Members() reads the shared state, and RoutingView reports what this node
+// would actually do with an event right now, which lags membership by up to one
+// RedisClusterConfig.SummaryInterval. A test that asserts a delivery waits for the
+// routing view, not for membership.
+type RoutingView interface {
+	Routed() []Routed
 }
 
 // subscriptionProvider is implemented by a ClusterHandler that can describe the

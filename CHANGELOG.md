@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- **A backend's internals are observable without a test reaching into it.**
+  `StatsView` (`Stats() ClusterStats`) replaces the eight per-backend counter
+  accessors with one snapshot: drops, the duplicate-table size, forwards, the
+  directed-publish routing counters and the fan-out of a target broadcast.
+  `LinkView` (`Links() []Link`) reports every physical connection with an `ID`
+  that a replacement never reuses, which is what makes "the link set stopped
+  changing" observable from outside. `PresenceView` (`Presence(clientID)`) reports
+  the node a live presence claim names, and `RoutingView` (`Routed()`) reports what
+  every backend routes through a cached view — the Redis fan-out — would do with an
+  event right now, which lags `Members()` by up to one `SummaryInterval`.
+  `Member` gained `Filters`, `Shared` and `SummaryKnown`, so the advertised
+  subscription summary is part of the member view instead of a separate accessor.
+  The package's own tests now use these views instead of unexported fields and
+  accessors, which is what lets the cluster backends move to `gmqx/cluster` while
+  the tests that stay here keep working.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
