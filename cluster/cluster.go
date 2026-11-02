@@ -1,3 +1,16 @@
+// Package cluster holds the cluster backends of gmqx and the contract they share.
+//
+// Three backends implement Cluster: the gossip membership service (NewGossipCluster),
+// the static TCP mesh (NewTCPCluster) and the Redis fan-out (NewRedisCluster). A backend
+// is an optional part of a broker (Config.ClusterBackend) and is what makes a
+// publication, a client-id kick and a directed publish reach a session on another node.
+//
+// The contract is independent of the backends: Cluster is deliberately small, and the
+// observation and collaboration roles (MemberView, StatsView, LinkView, PresenceView,
+// RoutingView, SubscriptionProvider, SharedSubscriptionProvider, TargetHandler) are
+// optional interfaces a backend or a handler implements when it can. The root package
+// re-exports every contract type as an alias (docs/design/source-layout.md §2, rule L3),
+// so gmqx.Cluster and cluster.Cluster are the same type.
 package cluster
 
 import (
@@ -97,9 +110,9 @@ type ClusterMessage struct {
 }
 
 // ClusterHandler receives the remote events every backend delivers: a publish and
-// a client-id kick. A directed publish arrives through the optional targetHandler
-// (Broker implements it); a backend that receives a ClusterTarget hands it to that
-// interface when the handler provides it.
+// a client-id kick. A directed publish arrives through the optional TargetHandler
+// (a broker implements it); a backend that receives a ClusterTarget hands it to
+// that interface when the handler provides it.
 type ClusterHandler interface {
 	OnRemotePublish(msg ClusterMessage)
 	OnRemoteKick(msg ClusterMessage)

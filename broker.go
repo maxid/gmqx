@@ -150,6 +150,24 @@ const (
 const maxReceiveMaximum = 65535
 
 // New creates a Broker. Start must be called to listen.
+// defaultGossipConfig maps the broker's ClusterConfig onto the gossip backend
+// configuration. It is a function of its own because the backend lives in
+// gmqx/cluster: a test in this package can pin the mapping without naming the
+// unexported backend type.
+func defaultGossipConfig(c ClusterConfig, namespace string, metrics hook.MetricsManager, logger *slog.Logger) GossipClusterConfig {
+	return GossipClusterConfig{
+		Addr:                c.Addr,
+		Seeds:               append([]string(nil), c.Seeds...),
+		PingInterval:        c.PingInterval,
+		PingTimeout:         c.PingTimeout,
+		SuspicionMultiplier: c.SuspicionMultiplier,
+		Fanout:              c.Fanout,
+		Namespace:           namespace,
+		Metrics:             metrics,
+		Logger:              logger,
+	}
+}
+
 func New(cfg Config) (*Broker, error) {
 	if cfg.Addr == "" {
 		port := cfg.Port
@@ -265,17 +283,7 @@ func New(cfg Config) (*Broker, error) {
 	// cluster, while NewTCPCluster and NewRedisCluster stay available for the
 	// static-mesh and shared-store deployments.
 	if cfg.ClusterBackend == nil && cfg.Cluster.Enabled {
-		cfg.ClusterBackend = NewGossipCluster(GossipClusterConfig{
-			Addr:                cfg.Cluster.Addr,
-			Seeds:               append([]string(nil), cfg.Cluster.Seeds...),
-			PingInterval:        cfg.Cluster.PingInterval,
-			PingTimeout:         cfg.Cluster.PingTimeout,
-			SuspicionMultiplier: cfg.Cluster.SuspicionMultiplier,
-			Fanout:              cfg.Cluster.Fanout,
-			Namespace:           cfg.Namespace,
-			Metrics:             cfg.Metrics,
-			Logger:              logger,
-		})
+		cfg.ClusterBackend = NewGossipCluster(defaultGossipConfig(cfg.Cluster, cfg.Namespace, cfg.Metrics, logger))
 	}
 	b := &Broker{
 		cfg:       cfg,
@@ -380,9 +388,9 @@ func (b *Broker) Start(ctx context.Context) error {
 		if scoped, ok := b.cfg.ClusterBackend.(namespaceScoped); ok {
 			// The broker's namespace is authoritative for a backend attached to
 			// it: events this broker produces are stamped by the broker.
-			scoped.setNamespace(b.namespace)
+			scoped.SetNamespace(b.namespace)
 		}
-		if err := b.cfg.ClusterBackend.Start(ctx, b.nodeID, b); err != nil {
+		if err := b.cfg.ClusterBackend.Start(ctx, b.nodeID, backendHandler{b: b}); err != nil {
 			_ = b.Stop(context.Background())
 			return fmt.Errorf("gmqx: cluster start: %w", err)
 		}
@@ -887,7 +895,7 @@ func (b *Broker) register(c *client) error {
 	// The call only enqueues the presence write: no store or network call runs on
 	// the CONNECT path under the broker lock (see clientPresence).
 	if b.presence != nil {
-		b.presence.clientConnected(c.id)
+		b.presence.ClientConnected(c.id)
 	}
 
 	b.metrics().IncrementConnections()
@@ -1130,7 +1138,7 @@ func (b *Broker) subscriptionsChanged() {
 	if !ok {
 		return
 	}
-	notifier.subscriptionsChanged()
+	notifier.SubscriptionsChanged()
 }
 
 // storeRetained applies one retained publish to the retained store, whether it
@@ -1548,7 +1556,7 @@ func (b *Broker) SpreadPublication(ctx context.Context, pub Publication) error {
 // still holds its subscriptions and its queue.
 func (b *Broker) forgetClientPresence(clientID string) {
 	if b.presence != nil {
-		b.presence.clientDisconnected(clientID)
+		b.presence.ClientDisconnected(clientID)
 	}
 }
 

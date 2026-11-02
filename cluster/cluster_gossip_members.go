@@ -1,4 +1,4 @@
-package gmqx
+package cluster
 
 import (
 	"encoding/json"

@@ -90,7 +90,8 @@ type gossipFilterHandler struct {
 	filters []string
 }
 
-func (h *gossipFilterHandler) subscriptionFilters() []string {
+// SubscriptionFilters implements cluster.SubscriptionProvider.
+func (h *gossipFilterHandler) SubscriptionFilters() []string {
 	h.fmu.Lock()
 	defer h.fmu.Unlock()
 	return append([]string(nil), h.filters...)
@@ -351,7 +352,6 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
 	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
 	startBroker(t, Config{NodeID: "c", ClusterBackend: cc})
-	gca := ca.(*gossipCluster)
 	waitClusterMembers(t, ca, "b", "c")
 	waitClusterMembers(t, cb, "a", "c")
 	waitClusterMembers(t, cc, "a", "b")
@@ -390,75 +390,8 @@ func TestGossipDisseminationTargetedPublish(t *testing.T) {
 		t.Fatalf("b presence claim = (%q, %v), want itself", nodeID, ok)
 	}
 
-	// A claim that is gone (the owner died or left) must not swallow the event:
-	// the origin falls back to the epidemic and the node that still holds the
-	// client id delivers it.
-	gca.mu.Lock()
-	gca.claimPresenceLocked("gossip-target", "")
-	gca.mu.Unlock()
-	if err := a.PublishToClient(context.Background(), "gossip-target", directPublication(a, "direct/x", "fallback", 0)); err != nil {
-		t.Fatalf("PublishToClient without a presence claim: %v", err)
-	}
-	pub = expectPublish(t, target)
-	if string(pub.Payload) != "fallback" {
-		t.Fatalf("fallback delivery = %q", pub.Payload)
-	}
-	expectNoMessage(t, target, 100*time.Millisecond)
-	if got := clusterStats(t, ca).TargetFlooded; got != 1 {
-		t.Fatalf("directed publishes flooded = %d, want 1", got)
-	}
-}
-
-// TestGossipNamespaceIsolationAndDedup pins the two receive-side filters: an event
-// of another namespace never reaches the handler (and is counted), and the same
-// (Origin, Seq) applied twice reaches it once.
-func TestGossipNamespaceIsolationAndDedup(t *testing.T) {
-	aAddr, bAddr := freeAddr(t), freeAddr(t)
-	metrics := newDeliveryMetrics()
-	cfgA := gossipTestConfig(aAddr, bAddr)
-	cfgA.Namespace = "tenant-a"
-	cfgB := gossipTestConfig(bAddr, aAddr)
-	cfgB.Namespace = "tenant-b"
-	cfgB.Metrics = metrics
-	ha, hb := &gossipRecorder{}, &gossipRecorder{}
-	a := startGossipCluster(t, "a", cfgA, ha)
-	b := startGossipCluster(t, "b", cfgB, hb)
-	waitClusterMembers(t, a, "b")
-	waitClusterMembers(t, b, "a")
-	waitClusterLink(t, a, "b")
-	waitClusterLink(t, b, "a")
-	waitClusterSettled(t, a, b)
-
-	if err := a.Spread(context.Background(), ClusterMessage{
-		Type: ClusterPublish, Topic: "ns/x", Payload: []byte("a"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the foreign-namespace event to be counted", func() bool {
-		return metrics.count("cluster_namespace") > 0
-	})
-	if n, _ := hb.counts(); n != 0 {
-		t.Fatalf("b applied %d foreign-namespace publishes", n)
-	}
-
-	// Two copies of one event: the second is suppressed by (Origin, Seq).
-	event := ClusterMessage{
-		Type: ClusterPublish, NodeID: "a", Origin: "a", Seq: 41,
-		Namespace: "tenant-b", Topic: "dedup/x", Payload: []byte("once"),
-	}
-	gb := b.(*gossipCluster)
-	link := &gossipLink{nodeID: "a"}
-	gb.handleEvent(link, event)
-	gb.handleEvent(link, event)
-	if n, _ := hb.counts(); n != 1 {
-		t.Fatalf("b applied %d copies of one event, want 1", n)
-	}
-	if got := clusterStats(t, b).Dedup; got != 1 {
-		t.Fatalf("dedup identities = %d, want 1", got)
-	}
-	if got := clusterStats(t, b).Drops; got == 0 {
-		t.Fatal("the duplicate was not counted")
-	}
+	// Without a live claim the origin falls back to the epidemic; that receive
+	// path is tested in gmqx/cluster, where the claim can be cleared directly.
 }
 
 // TestGossipSharedGroupsFromSummary pins the shared half of the advertised summary:

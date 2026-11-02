@@ -1,11 +1,10 @@
-package gmqx
+package cluster
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/maxid/gmqx/internal/clusterkit"
 	"log/slog"
 	"math/rand/v2"
 	"sort"
@@ -15,6 +14,9 @@ import (
 	"time"
 
 	"github.com/maxid/gnety"
+
+	"github.com/maxid/gmqx/hook"
+	"github.com/maxid/gmqx/internal/clusterkit"
 )
 
 // GossipClusterConfig configures the built-in gossip cluster backend.
@@ -114,7 +116,7 @@ type GossipClusterConfig struct {
 	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward",
 	// "cluster_namespace", "cluster_backpressure", "cluster_unreachable" and
 	// "target_unknown" for a directed publish this node cannot route).
-	Metrics MetricsManager
+	Metrics hook.MetricsManager
 	// Logger receives membership decisions and the alone notice (default
 	// slog.Default()).
 	Logger *slog.Logger
@@ -140,7 +142,7 @@ type GossipClusterConfig struct {
 // shared.go) does need the shared half, and a node without it is simply not a
 // shared candidate.
 //
-// The summary reuses the broker's summarySet (see cluster_summary.go): the
+// The summary reuses clusterkit.Set (see internal/clusterkit/summary.go): the
 // filters are ordered oldest first and capped, so the eviction policy is the same
 // one the TCP and Redis backends use.
 type SubscriptionSummary struct {
@@ -391,9 +393,9 @@ type gossipDialRequest struct {
 	expect string
 }
 
-// setNamespace implements namespaceScoped: the broker's Config.Namespace is
+// SetNamespace implements namespaceScoped (root package): the broker's Config.Namespace is
 // authoritative for a backend attached to a broker. It must run before Start.
-func (c *gossipCluster) setNamespace(namespace string) { c.namespace = namespace }
+func (c *gossipCluster) SetNamespace(namespace string) { c.namespace = namespace }
 
 // Start implements Cluster. It listens on the configured address, starts the
 // probe, gossip and dial workers and seeds the member view by dialing Seeds.
@@ -836,7 +838,7 @@ func (c *gossipCluster) deliverEvent(msg ClusterMessage) {
 	case ClusterKick:
 		c.handler.OnRemoteKick(msg)
 	case ClusterTarget:
-		handler, ok := c.handler.(targetHandler)
+		handler, ok := c.handler.(TargetHandler)
 		if !ok {
 			c.recordDrop("target_unknown", "handler cannot receive a directed publish")
 			return
@@ -895,10 +897,10 @@ func (c *gossipCluster) eventFrame(msg *ClusterMessage) ([]byte, error) {
 }
 
 // refreshSummary rebuilds the advertised summary from the handler's local
-// subscriptions. It is the same summarySet the TCP and Redis backends use, so the
+// subscriptions. It is the same clusterkit.Set the TCP and Redis backends use, so the
 // oldest-first eviction and the shared group set behave identically.
 func (c *gossipCluster) refreshSummary() {
-	provider, ok := c.handler.(subscriptionProvider)
+	provider, ok := c.handler.(SubscriptionProvider)
 	if !ok {
 		c.mu.Lock()
 		c.summaryKnown = false
@@ -907,10 +909,10 @@ func (c *gossipCluster) refreshSummary() {
 		c.mu.Unlock()
 		return
 	}
-	current := provider.subscriptionFilters()
+	current := provider.SubscriptionFilters()
 	var groups []string
-	if sp, ok := c.handler.(sharedSubscriptionProvider); ok {
-		groups = sp.sharedSubscriptionGroups()
+	if sp, ok := c.handler.(SharedSubscriptionProvider); ok {
+		groups = sp.SharedSubscriptionGroups()
 	}
 	now := c.now()
 	c.mu.Lock()
@@ -986,11 +988,10 @@ func (c *gossipCluster) handleSummary(f gossipFrame, now time.Time) {
 	m.summaryAt = now
 }
 
-// subscriptionsChanged implements subscriptionChangeNotifier. The broker calls it
-// after a SUBSCRIBE/UNSUBSCRIBE and after a session with subscriptions goes away,
-// so the new summary is pushed as an update frame instead of waiting for the next
-// ping.
-func (c *gossipCluster) subscriptionsChanged() {
+// SubscriptionsChanged implements subscriptionChangeNotifier (root package). The broker calls
+// it after a SUBSCRIBE/UNSUBSCRIBE and after a session with subscriptions goes away, so the
+// new summary is pushed as an update frame instead of waiting for the next ping.
+func (c *gossipCluster) SubscriptionsChanged() {
 	if !c.isRunning() {
 		return
 	}
@@ -998,13 +999,12 @@ func (c *gossipCluster) subscriptionsChanged() {
 	c.signalUpdate()
 }
 
-// sharedGroups implements sharedDirectory: the shared subscription group keys each
-// peer advertised, per node id. A peer whose summary is unknown contributes no
-// groups, so a group it holds is not elected to it until the summary arrives; the
-// broker pushes a summary on every subscription change, so that window is one
-// update frame. Only peers with a live link are candidates: a node this node cannot
-// reach cannot deliver the shared copy.
-func (c *gossipCluster) sharedGroups() map[string][]string {
+// SharedGroups implements sharedDirectory (root package): the shared subscription group keys
+// each peer advertised, per node id. A peer whose summary is unknown contributes no groups, so
+// a group it holds is not elected to it until the summary arrives; the broker pushes a summary
+// on every subscription change, so that window is one update frame. Only peers with a live
+// link are candidates: a node this node cannot reach cannot deliver the shared copy.
+func (c *gossipCluster) SharedGroups() map[string][]string {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1026,11 +1026,11 @@ func (c *gossipCluster) sharedGroups() map[string][]string {
 	return out
 }
 
-// clientConnected implements clientPresence: the client id is held by this node,
-// and a claim is gossiped so a directed publish from another node can address this
-// node directly. The call only takes the local lock and signals the housekeeping
-// loop; it never performs a network write on the CONNECT path.
-func (c *gossipCluster) clientConnected(clientID string) {
+// ClientConnected implements clientPresence (root package): the client id is held by this
+// node, and a claim is gossiped so a directed publish from another node can address this node
+// directly. The call only takes the local lock and signals the housekeeping loop; it never
+// performs a network write on the CONNECT path.
+func (c *gossipCluster) ClientConnected(clientID string) {
 	if clientID == "" || !c.isRunning() {
 		return
 	}
@@ -1040,11 +1040,11 @@ func (c *gossipCluster) clientConnected(clientID string) {
 	c.signalUpdate()
 }
 
-// clientDisconnected implements clientPresence: the client id left this node, so a
-// tombstone with a newer version is gossiped. A claim of another node with a
-// higher version still wins, which is what keeps a client that reconnected
-// elsewhere from being tombstoned by its old node.
-func (c *gossipCluster) clientDisconnected(clientID string) {
+// ClientDisconnected implements clientPresence (root package): the client id left this node,
+// so a tombstone with a newer version is gossiped. A claim of another node with a higher
+// version still wins, which is what keeps a client that reconnected elsewhere from being
+// tombstoned by its old node.
+func (c *gossipCluster) ClientDisconnected(clientID string) {
 	if clientID == "" || !c.isRunning() {
 		return
 	}

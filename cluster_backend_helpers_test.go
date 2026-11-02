@@ -1,10 +1,9 @@
 package gmqx
 
-// Helpers that build and observe the built-in backends. They live apart from the
-// per-backend test files because the backends move to gmqx/cluster (see
-// docs/design/source-layout.md §4.1): these have to survive the move with the tests
-// that stay in this package, so they use only the public Cluster contract and the
-// public views in cluster.go.
+// Helpers that build and observe the built-in backends for the broker × cluster
+// tests in this package. The backends live in gmqx/cluster (see
+// docs/design/source-layout.md §4.1), so nothing here reaches into one: they use
+// only the public Cluster contract and the public views re-exported by cluster.go.
 //
 // Nothing here reaches into a backend's fields. What a test needs and cannot find
 // here has to become a public observation first, which is the point: a consumer has
@@ -14,6 +13,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,4 +204,60 @@ func waitRedisView(t *testing.T, c Cluster, want ...string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("routing view = %v, want %v", got, want)
+}
+
+// gossipWaitCeiling bounds every membership/routing wait of a gossip test. It is a
+// ceiling, not a timing assertion: the wait returns as soon as the condition it
+// observes holds, so a loaded machine costs nothing but a genuinely broken build
+// still fails instead of hanging.
+const gossipWaitCeiling = 10 * time.Second
+
+// testClusterConfig is the fast TCP mesh configuration the broker-level cluster
+// tests use: short intervals so a handshake, a summary push or a link collapse is
+// observed in a few polls instead of a few seconds.
+func testClusterConfig(addr string, seeds []string) TCPClusterConfig {
+	return TCPClusterConfig{
+		Addr:                addr,
+		Seeds:               seeds,
+		ReconnectInterval:   20 * time.Millisecond,
+		HeartbeatInterval:   50 * time.Millisecond,
+		HeartbeatMissBudget: 3,
+		SummaryInterval:     50 * time.Millisecond,
+		Logger:              discardLogger(),
+	}
+}
+
+// filterHandler advertises a mutable filter set, like a broker with local
+// subscriptions. It implements cluster.SubscriptionProvider, which is what a
+// backend type-asserts the handler it was given for; the method is exported because
+// that interface lives in gmqx/cluster.
+type filterHandler struct {
+	recClusterHandler
+	mu      sync.Mutex
+	filters []string
+}
+
+// SubscriptionFilters implements cluster.SubscriptionProvider.
+func (h *filterHandler) SubscriptionFilters() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.filters...)
+}
+
+func (h *filterHandler) setFilters(filters ...string) {
+	h.mu.Lock()
+	h.filters = filters
+	h.mu.Unlock()
+}
+
+// namesNode reports whether a shared-delivery list names nodeID. The backends use
+// the same rule to decide which node delivers a shared group; a fake backend in the
+// root package needs it too, and the backend's own copy is unexported.
+func namesNode(shared []SharedDelivery, nodeID string) bool {
+	for _, d := range shared {
+		if d.Node == nodeID {
+			return true
+		}
+	}
+	return false
 }

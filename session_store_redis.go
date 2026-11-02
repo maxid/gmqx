@@ -53,6 +53,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/maxid/gmqx/cluster"
 )
 
 // redisSessionKeySegment is the key segment session state lives under, next to the
@@ -143,7 +145,7 @@ func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, erro
 	}
 	prefix := cfg.ChannelPrefix
 	if prefix == "" {
-		prefix = defaultRedisChannelPrefix
+		prefix = cluster.DefaultRedisChannelPrefix
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -158,13 +160,13 @@ func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, erro
 		WriteTimeout: cfg.IOTimeout,
 	}
 	if opts.DialTimeout == 0 {
-		opts.DialTimeout = redisDialTimeout
+		opts.DialTimeout = cluster.RedisDialTimeout
 	}
 	if opts.ReadTimeout == 0 {
-		opts.ReadTimeout = redisIOTimeout
+		opts.ReadTimeout = cluster.RedisIOTimeout
 	}
 	if opts.WriteTimeout == 0 {
-		opts.WriteTimeout = redisIOTimeout
+		opts.WriteTimeout = cluster.RedisIOTimeout
 	}
 	return &RedisSessionStore{
 		cfg:    cfg,
@@ -364,7 +366,7 @@ func (s *RedisSessionStore) sessionKeyPrefix() string {
 func (s *RedisSessionStore) cmdContext() (context.Context, context.CancelFunc) {
 	timeout := s.cfg.IOTimeout
 	if timeout <= 0 {
-		timeout = redisIOTimeout
+		timeout = cluster.RedisIOTimeout
 	}
 	return context.WithTimeout(context.Background(), timeout)
 }

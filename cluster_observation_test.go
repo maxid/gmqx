@@ -1,7 +1,7 @@
 package gmqx
 
 // Helpers that observe a cluster backend only through its public views
-// (StatsView, LinkView, MemberView, PresenceView). The backends move to
+// (StatsView, LinkView, MemberView, PresenceView). The backends live in
 // gmqx/cluster (see docs/design/source-layout.md §4.1), so a test in the root
 // package may not reach into one: what a test cannot observe here, a consumer
 // cannot observe either.

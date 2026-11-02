@@ -1,4 +1,4 @@
-package gmqx
+package cluster
 
 // Wait policy for this file (and the rule a future change must keep): every wait is
 // on an observable condition with a generous ceiling (gossipWaitCeiling, 10 s).
@@ -36,8 +36,7 @@ const gossipWaitCeiling = 10 * time.Second
 
 // startGossipTestCluster starts a gossip node and keeps the concrete type, which
 // the membership tests below drive directly (a controlled clock, forced suspicion).
-// This file moves into gmqx/cluster with the implementation; the backend-agnostic
-// helpers the rest of the package uses live in cluster_backend_helpers_test.go.
+// The backend-agnostic starter it wraps lives in helpers_test.go.
 func startGossipTestCluster(t *testing.T, nodeID string, cfg GossipClusterConfig, handler ClusterHandler) *gossipCluster {
 	t.Helper()
 	return startGossipCluster(t, nodeID, cfg, handler).(*gossipCluster)

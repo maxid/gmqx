@@ -21,6 +21,8 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/maxid/gnety/codec/mqtt"
+
+	"github.com/maxid/gmqx/cluster"
 )
 
 // newTestRedisSessionStore builds the store against the test miniredis and closes
@@ -47,7 +49,7 @@ func sessionNode(t *testing.T, nodeID string, store SessionStore) *Broker {
 
 // sessionStoreKey is the Redis key a store with the default prefix keeps for a
 // broker session key.
-func sessionStoreKey(key string) string { return defaultRedisChannelPrefix + ":session:" + key }
+func sessionStoreKey(key string) string { return cluster.DefaultRedisChannelPrefix + ":session:" + key }
 
 // offlineSessionOn subscribes a persistent session of b to filter at qos,
 // disconnects it and waits until b stored it. The key is the namespace-qualified one

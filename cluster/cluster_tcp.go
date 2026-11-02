@@ -1,4 +1,4 @@
-package gmqx
+package cluster
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/maxid/gmqx/internal/clusterkit"
 	"log/slog"
 	"sort"
 	"strings"
@@ -16,6 +15,10 @@ import (
 	"time"
 
 	"github.com/maxid/gnety"
+
+	"github.com/maxid/gmqx/hook"
+	"github.com/maxid/gmqx/internal/clusterkit"
+	topicmatch "github.com/maxid/gmqx/internal/topic"
 )
 
 // clusterWireVersion is the version of the internal cluster frames. It is part
@@ -112,7 +115,7 @@ type TCPClusterConfig struct {
 	// "cluster_namespace", and "target_unknown" for a directed publish this node
 	// received but does not hold the client id for). Without it the drops are only
 	// counted internally.
-	Metrics MetricsManager
+	Metrics hook.MetricsManager
 	// Logger receives membership decisions such as link rejection and eviction
 	// (default slog.Default()).
 	Logger *slog.Logger
@@ -201,7 +204,7 @@ type clusterMember struct {
 	link    *clusterLink
 	filters []string
 	// shared holds the shared subscription group keys the peer advertised; it is
-	// what sharedGroups answers with.
+	// what SharedGroups answers with.
 	shared       []string
 	filtersKnown bool
 	filtersAt    time.Time
@@ -250,10 +253,10 @@ type tcpCluster struct {
 	wg sync.WaitGroup
 }
 
-// setNamespace implements namespaceScoped: the broker's Config.Namespace is
+// SetNamespace implements namespaceScoped (root package): the broker's Config.Namespace is
 // authoritative for a backend attached to a broker. It must run before Start;
 // the broker calls it that way.
-func (c *tcpCluster) setNamespace(namespace string) { c.namespace = namespace }
+func (c *tcpCluster) SetNamespace(namespace string) { c.namespace = namespace }
 
 // Start implements Cluster. It listens on the configured address, exchanges a
 // handshake on every link and starts the heartbeat, summary refresh and dial
@@ -519,12 +522,12 @@ func namesNode(shared []SharedDelivery, nodeID string) bool {
 	return false
 }
 
-// sharedGroups implements sharedDirectory: the shared subscription group keys the
-// peers of this node advertised, per node id. A peer that has not sent a summary
-// yet is not in the answer, so a group it holds is not elected to it until the
-// advertisement arrives; the summary is pushed whenever a local subscription
-// changes, so the window is one handshake or one summary frame.
-func (c *tcpCluster) sharedGroups() map[string][]string {
+// SharedGroups implements sharedDirectory (root package): the shared subscription group keys
+// the peers of this node advertised, per node id. A peer that has not sent a summary yet is
+// not in the answer, so a group it holds is not elected to it until the advertisement arrives;
+// the summary is pushed whenever a local subscription changes, so the window is one handshake
+// or one summary frame.
+func (c *tcpCluster) SharedGroups() map[string][]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.members) == 0 {
@@ -548,7 +551,7 @@ func summaryMatches(filters []string, topic string) bool {
 		return false
 	}
 	for _, f := range filters {
-		if f != "" && matchTopic(f, topic) {
+		if f != "" && topicmatch.Match(f, topic) {
 			return true
 		}
 	}
@@ -746,14 +749,14 @@ func (c *tcpCluster) handleSummary(l *clusterLink, f clusterFrame) {
 // node that subscribes to many normal filters does not push its groups out of the
 // advertisement (a group a peer cannot see is a group it cannot elect).
 func (c *tcpCluster) refreshLocalFilters() (filters, shared []string, ok bool) {
-	provider, ok := c.handler.(subscriptionProvider)
+	provider, ok := c.handler.(SubscriptionProvider)
 	if !ok {
 		return nil, nil, false
 	}
-	current := provider.subscriptionFilters()
+	current := provider.SubscriptionFilters()
 	var groups []string
-	if sp, ok := c.handler.(sharedSubscriptionProvider); ok {
-		groups = sp.sharedSubscriptionGroups()
+	if sp, ok := c.handler.(SharedSubscriptionProvider); ok {
+		groups = sp.SharedSubscriptionGroups()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -772,10 +775,10 @@ func (c *tcpCluster) advertiseSummary(l *clusterLink) {
 	}
 }
 
-// subscriptionsChanged implements subscriptionChangeNotifier. The broker calls
-// it from the SUBSCRIBE/UNSUBSCRIBE path before it acknowledges, so the new
+// SubscriptionsChanged implements subscriptionChangeNotifier (root package).
+// The broker calls it from the SUBSCRIBE/UNSUBSCRIBE path before it acknowledges, so the new
 // summary is on the wire before a subscriber is told its subscription is live.
-func (c *tcpCluster) subscriptionsChanged() {
+func (c *tcpCluster) SubscriptionsChanged() {
 	if !c.isRunning() {
 		return
 	}
@@ -834,7 +837,7 @@ func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 	case ClusterKick:
 		c.handler.OnRemoteKick(msg)
 	case ClusterTarget:
-		handler, ok := c.handler.(targetHandler)
+		handler, ok := c.handler.(TargetHandler)
 		if !ok {
 			c.recordDrop("target_unknown", "handler cannot receive a directed publish")
 			return

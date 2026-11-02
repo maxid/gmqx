@@ -3,7 +3,8 @@ package gmqx
 // The cluster contract lives in gmqx/cluster (docs/design/source-layout.md §2, rule
 // L3): the root package re-exports every type and constant as an alias, so an import
 // of either path names the same type and existing code needs no change. The
-// implementation still lives here; the backends move next.
+// implementation and its configuration types live there too; this file is the facade
+// the broker and existing consumers keep importing.
 
 import "github.com/maxid/gmqx/cluster"
 
@@ -38,6 +39,15 @@ type (
 	Routed = cluster.Routed
 	// RoutingView is implemented by backends that route through a cached view.
 	RoutingView = cluster.RoutingView
+
+	// GossipClusterConfig configures the built-in gossip cluster backend.
+	GossipClusterConfig = cluster.GossipClusterConfig
+	// TCPClusterConfig configures the built-in TCP mesh cluster backend.
+	TCPClusterConfig = cluster.TCPClusterConfig
+	// RedisClusterConfig configures the built-in Redis cluster backend.
+	RedisClusterConfig = cluster.RedisClusterConfig
+	// SubscriptionSummary is the routing metadata one gossip node advertises.
+	SubscriptionSummary = cluster.SubscriptionSummary
 )
 
 const (
@@ -46,12 +56,63 @@ const (
 	ClusterTarget  = cluster.ClusterTarget
 )
 
-// targetHandler is implemented by a ClusterHandler that can receive a directed
-// publish (ClusterTarget). It is an optional interface so the handler contract
-// stays additive: a backend delivers a target event to a handler that implements
-// it, and counts the event as undeliverable otherwise. Broker implements it.
-type targetHandler interface {
-	OnRemoteTarget(msg ClusterMessage)
+const (
+	MemberAlive   = cluster.MemberAlive
+	MemberSuspect = cluster.MemberSuspect
+	MemberDead    = cluster.MemberDead
+)
+
+// NewGossipCluster builds the gossip backend from cfg. It is a forwarder: the
+// backend lives in gmqx/cluster, and the root name stays so existing code compiles
+// unchanged (rule L3).
+func NewGossipCluster(cfg GossipClusterConfig) Cluster { return cluster.NewGossipCluster(cfg) }
+
+// NewTCPCluster builds the TCP mesh backend from cfg.
+func NewTCPCluster(cfg TCPClusterConfig) Cluster { return cluster.NewTCPCluster(cfg) }
+
+// NewRedisCluster builds the Redis backend from cfg.
+func NewRedisCluster(cfg RedisClusterConfig) Cluster { return cluster.NewRedisCluster(cfg) }
+
+// backendHandler is the ClusterHandler the broker hands a backend at Start. It
+// forwards the event sinks to the broker and adds the exported method names the
+// backends of gmqx/cluster type-assert (cluster.SubscriptionProvider and
+// cluster.SharedSubscriptionProvider). It exists as an adapter instead of growing
+// those methods on Broker: the remote-event hooks are the broker's public surface,
+// while the two summary halves are a collaboration detail only a backend reads.
+type backendHandler struct{ b *Broker }
+
+func (h backendHandler) OnRemotePublish(msg ClusterMessage) { h.b.OnRemotePublish(msg) }
+func (h backendHandler) OnRemoteKick(msg ClusterMessage)    { h.b.OnRemoteKick(msg) }
+func (h backendHandler) OnRemoteTarget(msg ClusterMessage)  { h.b.OnRemoteTarget(msg) }
+
+// SubscriptionFilters implements cluster.SubscriptionProvider.
+func (h backendHandler) SubscriptionFilters() []string { return h.b.subscriptionFilters() }
+
+// SharedSubscriptionGroups implements cluster.SharedSubscriptionProvider.
+func (h backendHandler) SharedSubscriptionGroups() []string { return h.b.sharedSubscriptionGroups() }
+
+// The collaboration seams below are implemented by a cluster backend and called by
+// the broker. The interfaces stay in the root package because they are what the
+// broker asks for; their methods are exported because the backend that implements
+// them lives in gmqx/cluster. A backend that does not implement one is simply not
+// given that job.
+
+// namespaceScoped is implemented by cluster backends that scope their traffic to
+// one broker namespace. The broker calls SetNamespace with its Config.Namespace
+// before Cluster.Start, so the broker's namespace is authoritative for a backend
+// attached to it. A backend that does not implement it is not scoped by the
+// broker: it still receives ClusterMessage.Namespace and may filter on it.
+type namespaceScoped interface {
+	SetNamespace(namespace string)
+}
+
+// subscriptionChangeNotifier is implemented by cluster backends that want to
+// push a fresh subscription summary as soon as local subscriptions change
+// instead of waiting for the next periodic refresh. The broker calls it after a
+// successful SUBSCRIBE/UNSUBSCRIBE and after a session with subscriptions goes
+// away.
+type subscriptionChangeNotifier interface {
+	SubscriptionsChanged()
 }
 
 // clientPresence is implemented by a cluster backend that tracks which node holds
@@ -61,48 +122,6 @@ type targetHandler interface {
 // implementation must not block, and must tolerate a lost or late notification
 // (presence is a TTL'd hint, refreshed by the backend, not a source of truth).
 type clientPresence interface {
-	clientConnected(clientID string)
-	clientDisconnected(clientID string)
-}
-
-const (
-	MemberAlive   = cluster.MemberAlive
-	MemberSuspect = cluster.MemberSuspect
-	MemberDead    = cluster.MemberDead
-)
-
-// subscriptionProvider is implemented by a ClusterHandler that can describe the
-// topic filters its local sessions are subscribed to. The built-in TCP cluster
-// advertises that summary to its peers for directed routing. A handler without
-// it never advertises a summary, so peers treat it as unknown and send every
-// publish to it (availability over precision).
-type subscriptionProvider interface {
-	subscriptionFilters() []string
-}
-
-// sharedSubscriptionProvider is implemented by a ClusterHandler that can describe
-// the shared subscription groups its local sessions hold a live member of. It is
-// the shared half of the advertised summary: a peer needs it to elect one node per
-// shared group (see shared.go), so a handler without it leaves shared
-// subscriptions local to the node that produced the publication.
-type sharedSubscriptionProvider interface {
-	sharedSubscriptionGroups() []string
-}
-
-// namespaceScoped is implemented by cluster backends that scope their traffic to
-// one broker namespace. The broker calls setNamespace with its Config.Namespace
-// before Cluster.Start, so the broker's namespace is authoritative for a backend
-// attached to it. A backend that does not implement it is not scoped by the
-// broker: it still receives ClusterMessage.Namespace and may filter on it.
-type namespaceScoped interface {
-	setNamespace(namespace string)
-}
-
-// subscriptionChangeNotifier is implemented by cluster backends that want to
-// push a fresh subscription summary as soon as local subscriptions change
-// instead of waiting for the next periodic refresh. The broker calls it after a
-// successful SUBSCRIBE/UNSUBSCRIBE and after a session with subscriptions goes
-// away.
-type subscriptionChangeNotifier interface {
-	subscriptionsChanged()
+	ClientConnected(clientID string)
+	ClientDisconnected(clientID string)
 }

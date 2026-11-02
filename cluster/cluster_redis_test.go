@@ -1,4 +1,4 @@
-package gmqx
+package cluster
 
 // Wait policy for this file (and the rule a future change must keep): every wait is
 // on an observable condition with a generous ceiling (redisWaitCeiling, 10 s).
@@ -27,9 +27,8 @@ import (
 )
 
 // startRedisTestCluster starts a Redis node and keeps the concrete type, which the
-// backend tests below drive directly. This file moves into gmqx/cluster with the
-// implementation; the backend-agnostic helpers live in
-// cluster_backend_helpers_test.go.
+// backend tests below drive directly. The backend-agnostic starter it wraps lives
+// in helpers_test.go.
 func startRedisTestCluster(t *testing.T, mr *miniredis.Miniredis, nodeID string, handler ClusterHandler, cfg RedisClusterConfig) *redisCluster {
 	t.Helper()
 	return startRedisCluster(t, mr, nodeID, handler, cfg).(*redisCluster)
@@ -206,7 +205,7 @@ func TestRedisClusterUnknownSummaryReceivesPublish(t *testing.T) {
 	cfg := redisTestConfig(mr)
 
 	ha := &recClusterHandler{}
-	hb := &recClusterHandler{} // no subscriptionProvider: never advertises
+	hb := &recClusterHandler{} // no SubscriptionProvider: never advertises
 	a := startRedisTestCluster(t, mr, "a", ha, cfg)
 	startRedisTestCluster(t, mr, "b", hb, cfg)
 	waitRedisMembers(t, a, "b")
@@ -578,7 +577,7 @@ func TestRedisClusterConfigValidation(t *testing.T) {
 	}
 	defer func() { _ = c.Stop(context.Background()) }()
 	rc := c.(*redisCluster)
-	if rc.prefix() != defaultRedisChannelPrefix {
+	if rc.prefix() != DefaultRedisChannelPrefix {
 		t.Fatalf("prefix = %q", rc.prefix())
 	}
 	if rc.summaryTTL() <= rc.summaryInterval() || rc.nodeTTL() <= rc.summaryInterval() {
@@ -631,48 +630,6 @@ func TestRedisClusterSummaryCap(t *testing.T) {
 
 	// A subscription change is pushed, not awaited: the same cap applies.
 	h.setFilters("a/4", "a/5", "a/6")
-	c.subscriptionsChanged()
+	c.SubscriptionsChanged()
 	waitSummary("a/4", "a/5", "a/6")
-}
-
-// TestRedisClusterBrokerCrossNodePublish runs the broker path end to end: a
-// publish on one node reaches a subscriber on another node through Redis, with
-// the subscription summary coming from the broker's own filter set.
-func TestRedisClusterBrokerCrossNodePublish(t *testing.T) {
-	mr := runMiniRedis(t)
-	cfg := redisTestConfig(mr)
-
-	ca := NewRedisCluster(cfg)
-	cb := NewRedisCluster(cfg)
-	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
-	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
-
-	sub := dialTestClient(t, b.Addr(), "sub-b")
-	body := []byte{0, 1}
-	body = appendString(body, "cluster/redis")
-	body = append(body, 0)
-	sub.writePacket(0x82, body)
-	if h, p, err := sub.readPacket(); err != nil || h>>4 != 9 || len(p) < 3 || p[2] != 0 {
-		t.Fatalf("suback: h=%x p=%v err=%v", h, p, err)
-	}
-	// The broker pushes its summary when the subscription is accepted; wait until
-	// the publishing node routes by it instead of sleeping.
-	waitRedisSummary(t, ca.(*redisCluster), "b", "cluster/redis")
-
-	pub := dialTestClient(t, a.Addr(), "pub-a")
-	pubBody := appendString(nil, "cluster/redis")
-	pubBody = append(pubBody, []byte("remote")...)
-	pub.writePacket(0x30, pubBody)
-
-	h, p, err := sub.readPacket()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h>>4 != 3 {
-		t.Fatalf("expected PUBLISH, got type %d", h>>4)
-	}
-	topic, rest, err := readString(p)
-	if err != nil || topic != "cluster/redis" || string(rest) != "remote" {
-		t.Fatalf("topic=%q payload=%q err=%v", topic, rest, err)
-	}
 }

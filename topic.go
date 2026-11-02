@@ -1,8 +1,11 @@
 package gmqx
 
-import ns "github.com/maxid/gmqx/internal/namespace"
+import (
+	"strings"
 
-import "strings"
+	ns "github.com/maxid/gmqx/internal/namespace"
+	topicmatch "github.com/maxid/gmqx/internal/topic"
+)
 
 func validTopic(topic string) bool {
 	if topic == "" {
@@ -83,53 +86,10 @@ func parseSharedFilter(filter string) (parsed sharedFilter, isShared, ok bool) {
 // matches reports whether the parsed shared filter matches topic.
 func (s sharedFilter) matches(topic string) bool { return matchTopic(s.filter, topic) }
 
-// matchTopic reports whether an MQTT topic filter matches a topic.
-//
-// The levels are walked with string slicing instead of strings.Split: routing runs
-// this for every wildcard filter of every publication, and the split allocated two
-// slices per call. The rules are the MQTT ones: "#" matches the rest of the topic
-// including the empty rest (so "a/#" matches "a"), "+" matches exactly one level,
-// and a topic whose first level starts with '$' is not matched by a filter that
-// starts with a wildcard (so "#" does not see the "$SYS" tree, while "$SYS/#"
-// does).
-func matchTopic(filter, topic string) bool {
-	rest, restTopic := filter, topic
-	first := true
-	for {
-		f, nextFilter, filterMore := nextLevel(rest)
-		t, nextTopic, topicMore := nextLevel(restTopic)
-		if first {
-			if strings.HasPrefix(t, "$") && (f == "#" || f == "+") {
-				return false
-			}
-			first = false
-		}
-		if f == "#" {
-			return true
-		}
-		if f != "+" && f != t {
-			return false
-		}
-		if !filterMore {
-			return !topicMore
-		}
-		if !topicMore {
-			// The topic ran out one level before the filter: only a trailing "#"
-			// of the filter can still match the level the topic stopped at.
-			return nextFilter == "#"
-		}
-		rest, restTopic = nextFilter, nextTopic
-	}
-}
-
-// nextLevel splits the first topic level off s: the level, the rest of the string
-// and whether a level follows.
-func nextLevel(s string) (level, rest string, more bool) {
-	if i := strings.IndexByte(s, '/'); i >= 0 {
-		return s[:i], s[i+1:], true
-	}
-	return s, "", false
-}
+// matchTopic reports whether an MQTT topic filter matches a topic. The rule lives
+// in ./internal/topic because the cluster backends route by it too and may not
+// import this package.
+func matchTopic(filter, topic string) bool { return topicmatch.Match(filter, topic) }
 
 // The key-space rules live in ./internal/namespace; these wrappers keep the root package's
 // call sites and tests unchanged.

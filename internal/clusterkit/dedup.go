@@ -2,7 +2,7 @@
 // duplicate-suppression table and the subscription summary they advertise.
 //
 // It is internal because no consumer of this package can use these types: they exist
-// for the TCP, gossip and Redis backends in the root package, and keeping them here is
+// for the TCP, gossip and Redis backends in gmqx/cluster, and keeping them here is
 // what stops three backends from each growing their own copy.
 package clusterkit
 

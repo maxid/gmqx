@@ -358,32 +358,6 @@ func TestTCPClusterDirectedPublishBroadcasts(t *testing.T) {
 	waitFor(t, "the directed publish to be queued on node b", func() bool { return offlineDepth(b) == 1 })
 }
 
-// TestTCPClusterDirectedPublishDeduplicates pins that a redelivered target event is
-// applied once: the backends deduplicate on (Origin, Seq) like every other event.
-func TestTCPClusterDirectedPublishDeduplicates(t *testing.T) {
-	aAddr, bAddr := freeAddr(t), freeAddr(t)
-	ca := NewTCPCluster(testClusterConfig(aAddr, []string{bAddr}))
-	cb := NewTCPCluster(testClusterConfig(bAddr, []string{aAddr}))
-	startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
-	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
-	waitPeers(t, ca, 1)
-	waitPeers(t, cb, 1)
-
-	target, _ := mustConnect(t, b.Addr(), confConnect{clientID: "dedup-target", clean: true})
-	backend := cb.(*tcpCluster)
-	event := ClusterMessage{
-		Type: ClusterTarget, NodeID: "a", Origin: "a", Seq: 7,
-		ClientID: "dedup-target", Topic: "direct/x", Payload: []byte("once"), QoS: 0,
-	}
-	backend.dispatchEvent(event)
-	pub := expectPublish(t, target)
-	if string(pub.Payload) != "once" {
-		t.Fatalf("directed delivery = %q", pub.Payload)
-	}
-	backend.dispatchEvent(event)
-	expectNoMessage(t, target, 200*time.Millisecond)
-}
-
 // TestDirectedPublishStaysInNamespace pins namespace isolation for the directed
 // path: two brokers of different namespaces may hold the same client id, a directed
 // publish reaches only the broker of its own scope, and a target event of another

@@ -1,4 +1,4 @@
-package gmqx
+package cluster
 
 import (
 	"context"
@@ -44,8 +44,7 @@ func (h *captureHandler) count(msg string) int {
 }
 
 // startTCPTestCluster starts a TCP node and keeps the concrete type, which the
-// membership tests below drive directly. This file moves into gmqx/cluster with the
-// implementation.
+// membership tests below drive directly.
 func startTCPTestCluster(t *testing.T, nodeID string, cfg TCPClusterConfig, handler ClusterHandler) *tcpCluster {
 	t.Helper()
 	return startTestCluster(t, nodeID, cfg, handler).(*tcpCluster)
@@ -507,6 +506,28 @@ func TestTCPClusterDedup(t *testing.T) {
 	}
 }
 
+// TestTCPClusterDirectedPublishDedup pins that a redelivered target event is
+// applied once: the TCP mesh deduplicates on (Origin, Seq) like every other event,
+// so a duplicate link or a reconnect replay cannot deliver a directed publish twice.
+func TestTCPClusterDirectedPublishDedup(t *testing.T) {
+	bAddr := freeAddr(t)
+	cb := startTCPTestCluster(t, "b", testClusterConfig(bAddr, nil), &gossipRecorder{})
+	h := cb.handler.(*gossipRecorder)
+
+	event := ClusterMessage{
+		Type: ClusterTarget, NodeID: "a", Origin: "a", Seq: 7,
+		ClientID: "dedup-target", Topic: "direct/x", Payload: []byte("once"), QoS: 0,
+	}
+	cb.dispatchEvent(event)
+	cb.dispatchEvent(event)
+	if n := h.targetCount(); n != 1 {
+		t.Fatalf("directed deliveries = %d, want 1", n)
+	}
+	if got := cb.dedup.Len(); got != 1 {
+		t.Fatalf("dedup table = %d, want 1", got)
+	}
+}
+
 // TestTCPClusterDedupBounds checks that the table never grows beyond its slot
 // count and that the oldest identity is the one evicted.
 func TestTCPClusterDedupBounds(t *testing.T) {
@@ -629,7 +650,7 @@ type filterHandler struct {
 	filters []string
 }
 
-func (h *filterHandler) subscriptionFilters() []string {
+func (h *filterHandler) SubscriptionFilters() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.filters...)
@@ -656,62 +677,11 @@ func TestTCPClusterSummaryCap(t *testing.T) {
 	peer.waitSubs(t, "a/3", "a/4", "a/5")
 
 	h.setFilters("a/4", "a/5", "a/6")
-	ca.subscriptionsChanged()
+	ca.SubscriptionsChanged()
 	peer.waitSubs(t, "a/4", "a/5", "a/6")
 
 	if filters, ok := clusterMemberSummary(t, ca, "peer"); ok {
 		t.Fatalf("summary of a peer that advertised nothing = %v", filters)
-	}
-}
-
-// TestTCPClusterBrokerDirectedRouting checks the broker path: a publish is
-// delivered to the node with a matching subscriber and not to a node without
-// one.
-func TestTCPClusterBrokerDirectedRouting(t *testing.T) {
-	aAddr, bAddr := freeAddr(t), freeAddr(t)
-	ca := NewTCPCluster(testClusterConfig(aAddr, []string{bAddr}))
-	cb := NewTCPCluster(testClusterConfig(bAddr, []string{aAddr}))
-	a := startBroker(t, Config{NodeID: "a", ClusterBackend: ca})
-	b := startBroker(t, Config{NodeID: "b", ClusterBackend: cb})
-	waitPeers(t, ca, 1)
-	waitPeers(t, cb, 1)
-	waitMembers(t, ca.(*tcpCluster), "b")
-
-	sub := dialTestClient(t, b.Addr(), "sub-b")
-	subBody := []byte{0, 1}
-	subBody = appendString(subBody, "plant/+/temp")
-	subBody = append(subBody, 0)
-	sub.writePacket(0x82, subBody)
-	if h, p, err := sub.readPacket(); err != nil || h>>4 != 9 || len(p) < 3 || p[2] != 0 {
-		t.Fatalf("suback: h=%x p=%v err=%v", h, p, err)
-	}
-	// The broker pushes its summary before it acknowledges the subscription.
-	waitMemberSummary(t, ca.(*tcpCluster), "b", "plant/+/temp")
-
-	pub := dialTestClient(t, a.Addr(), "pub-a")
-	pubBody := appendString(nil, "plant/1/temp")
-	pubBody = append(pubBody, []byte("21")...)
-	pub.writePacket(0x30, pubBody)
-
-	h, p, err := sub.readPacket()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h>>4 != 3 {
-		t.Fatalf("expected PUBLISH, got type %d", h>>4)
-	}
-	topic, rest, err := readString(p)
-	if err != nil || topic != "plant/1/temp" || string(rest) != "21" {
-		t.Fatalf("topic=%q payload=%q err=%v", topic, rest, err)
-	}
-
-	// A topic nobody subscribed to is not routed to b at all.
-	_ = sub.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	pubBody = appendString(nil, "plant/1/hum")
-	pubBody = append(pubBody, []byte("60")...)
-	pub.writePacket(0x30, pubBody)
-	if _, _, err := sub.readPacket(); err == nil {
-		t.Fatal("unexpected publish for an unsubscribed topic")
 	}
 }
 

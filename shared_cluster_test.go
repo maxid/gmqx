@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	"github.com/maxid/gmqx/cluster"
 )
 
 // sharedTestCluster is an in-memory cluster backend that behaves like the built-in
@@ -68,9 +70,9 @@ func (c *sharedTestCluster) Spread(_ context.Context, msg ClusterMessage) error 
 	return nil
 }
 
-// sharedGroups implements sharedDirectory: the groups each node advertises,
+// SharedGroups implements sharedDirectory: the groups each node advertises,
 // computed from the live handlers (plus whatever a test forces in extra).
-func (c *sharedTestCluster) sharedGroups() map[string][]string {
+func (c *sharedTestCluster) SharedGroups() map[string][]string {
 	c.mu.Lock()
 	handlers := make(map[string]ClusterHandler, len(c.nodes))
 	for id, h := range c.nodes {
@@ -84,11 +86,11 @@ func (c *sharedTestCluster) sharedGroups() map[string][]string {
 
 	out := make(map[string][]string, 4)
 	for id, h := range handlers {
-		provider, ok := h.(sharedSubscriptionProvider)
+		provider, ok := h.(cluster.SharedSubscriptionProvider)
 		if !ok {
 			continue
 		}
-		for _, group := range provider.sharedSubscriptionGroups() {
+		for _, group := range provider.SharedSubscriptionGroups() {
 			out[group] = append(out[group], id)
 		}
 	}
@@ -105,11 +107,11 @@ func (c *sharedTestCluster) sharedGroups() map[string][]string {
 
 // handlerMatches reports whether the handler has a normal filter matching topic.
 func handlerMatches(h ClusterHandler, topic string) bool {
-	provider, ok := h.(subscriptionProvider)
+	provider, ok := h.(cluster.SubscriptionProvider)
 	if !ok {
 		return false
 	}
-	for _, filter := range provider.subscriptionFilters() {
+	for _, filter := range provider.SubscriptionFilters() {
 		if matchTopic(filter, topic) {
 			return true
 		}
@@ -310,8 +312,8 @@ type summaryProvider struct {
 
 func (p *summaryProvider) OnRemotePublish(ClusterMessage)     {}
 func (p *summaryProvider) OnRemoteKick(ClusterMessage)        {}
-func (p *summaryProvider) subscriptionFilters() []string      { return p.filters }
-func (p *summaryProvider) sharedSubscriptionGroups() []string { return p.groups }
+func (p *summaryProvider) SubscriptionFilters() []string      { return p.filters }
+func (p *summaryProvider) SharedSubscriptionGroups() []string { return p.groups }
 
 // tcpMemberFilters returns the topic filters a peer advertised.
 func tcpMemberFilters(t *testing.T, c Cluster, nodeID string) []string {

@@ -63,14 +63,16 @@ import (
 
 // sharedDirectory is implemented by a cluster backend that advertises the shared
 // subscription groups its nodes hold. The broker asks it once per publication that
-// could match a shared group and elects one node per group from the answer.
+// could match a shared group and elects one node per group from the answer. The
+// method is exported because the backends live in gmqx/cluster; the interface stays
+// here because it is what the broker asks for.
 //
 // The returned map is group key ("$share/{ShareName}/{filter}") to the peer node
 // ids that have at least one live member of it; this node is never in it. A
 // backend builds it from the same subscription summary it already advertises to
 // route normal publishes, so the cost is a pass over the peers, not a round trip.
 type sharedDirectory interface {
-	sharedGroups() map[string][]string
+	SharedGroups() map[string][]string
 }
 
 // dispatchShared routes one publication through the shared subscription groups it
@@ -88,7 +90,7 @@ func (b *Broker) dispatchShared(ctx context.Context, pub Publication) []SharedDe
 	local := b.index.sharedGroups(pub.Topic)
 	var peers map[string][]string
 	if b.sharedNodes != nil {
-		peers = b.sharedNodes.sharedGroups()
+		peers = b.sharedNodes.SharedGroups()
 	}
 	if len(local) == 0 && len(peers) == 0 {
 		return nil

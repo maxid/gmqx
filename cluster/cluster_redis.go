@@ -1,11 +1,10 @@
-package gmqx
+package cluster
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/maxid/gmqx/internal/clusterkit"
 	"log/slog"
 	"sort"
 	"strings"
@@ -14,6 +13,10 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/maxid/gmqx/hook"
+	"github.com/maxid/gmqx/internal/clusterkit"
+	"github.com/maxid/gmqx/internal/namespace"
 )
 
 // redisClusterWireVersion is the version of the event frames published on the
@@ -23,9 +26,11 @@ import (
 const redisClusterWireVersion = 1
 
 const (
-	// defaultRedisChannelPrefix namespaces every channel and key this backend
-	// owns.
-	defaultRedisChannelPrefix = "gmqx:cluster"
+	// DefaultRedisChannelPrefix namespaces every channel and key this backend
+	// owns. The Redis session store uses the same default: a store passed to
+	// Config.SessionStore has to live under the prefix its cluster writes, which
+	// is why this is exported rather than a private default.
+	DefaultRedisChannelPrefix = "gmqx:cluster"
 	// redisTTLFactor turns SummaryInterval into the default key TTLs: a key has
 	// to survive a few refresh periods so scheduling jitter cannot evict a node
 	// that is alive.
@@ -33,11 +38,13 @@ const (
 	// redisMemberScanCount is the SCAN COUNT hint used to enumerate member keys.
 	// It bounds one round trip, not the view size.
 	redisMemberScanCount = 100
-	// redisDialTimeout bounds one connection attempt, so a black-holed Redis
-	// cannot pin a Spread or a Stop forever.
-	redisDialTimeout = 2 * time.Second
-	// redisIOTimeout bounds one Refresh/Spread/Members round trip.
-	redisIOTimeout = 2 * time.Second
+	// RedisDialTimeout bounds one connection attempt, so a black-holed Redis
+	// cannot pin a Spread or a Stop forever. The Redis session store defaults to
+	// the same timeout.
+	RedisDialTimeout = 2 * time.Second
+	// RedisIOTimeout bounds one Refresh/Spread/Members round trip. The Redis
+	// session store bounds one command with it too.
+	RedisIOTimeout = 2 * time.Second
 	// redisMinBackoff and redisMaxBackoff bound the receive loop's retry delay:
 	// a Redis outage must not turn into a dial storm, and recovery must not wait
 	// longer than redisMaxBackoff.
@@ -164,7 +171,7 @@ type RedisClusterConfig struct {
 	// drops ("cluster_duplicate", "cluster_loop", "cluster_forward",
 	// "cluster_namespace", and "target_unknown" for a directed publish whose client
 	// id no presence record claims), the same reasons the TCP backend reports.
-	Metrics MetricsManager
+	Metrics hook.MetricsManager
 	// Logger receives membership and connectivity decisions (default
 	// slog.Default()).
 	Logger *slog.Logger
@@ -271,7 +278,7 @@ func NewRedisCluster(cfg RedisClusterConfig) Cluster {
 //	                          absence means "summary unknown"
 //	<prefix>:client:<key>     presence of one client id, with the PresenceTTL:
 //	                          "<nodeID>\x00<incarnation>", where <key> is
-//	                          namespaceKey(Config.Namespace, ClientID). It is what
+//	                          namespace.Key(Config.Namespace, ClientID). It is what
 //	                          routes a directed publish to the one node that holds
 //	                          the client.
 //
@@ -342,10 +349,10 @@ type redisCluster struct {
 	wg sync.WaitGroup
 }
 
-// setNamespace implements namespaceScoped: the broker's Config.Namespace is
+// SetNamespace implements namespaceScoped (root package): the broker's Config.Namespace is
 // authoritative for a backend attached to a broker. It must run before Start;
 // the broker calls it that way.
-func (c *redisCluster) setNamespace(namespace string) { c.namespace = namespace }
+func (c *redisCluster) SetNamespace(namespace string) { c.namespace = namespace }
 
 // Start implements Cluster. It connects to Redis, takes ownership of the node
 // id, subscribes to this node's channel and only then registers the node, so a
@@ -408,7 +415,7 @@ func (c *redisCluster) Start(ctx context.Context, nodeID string, handler Cluster
 	c.mu.Lock()
 	c.ownerValue = owner
 	c.mu.Unlock()
-	acquireCtx, acquireCancel := context.WithTimeout(c.ctx, redisIOTimeout)
+	acquireCtx, acquireCancel := context.WithTimeout(c.ctx, RedisIOTimeout)
 	err = c.acquireOwnership(acquireCtx)
 	acquireCancel()
 	if err != nil {
@@ -459,7 +466,7 @@ func (c *redisCluster) abort() {
 		// Give the id back before closing the client: a retry of Start must not
 		// have to wait for NodeTTL. The release is a compare-and-delete, so a
 		// failed Start can never release an id another process now owns.
-		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), redisIOTimeout)
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), RedisIOTimeout)
 		_, _ = c.releaseOwnership(releaseCtx)
 		releaseCancel()
 		_ = rdb.Close()
@@ -502,7 +509,7 @@ func (c *redisCluster) Stop(ctx context.Context) error {
 	}
 	// Deregister with a context that outlives the caller's cancellation: Stop has
 	// to finish the teardown even when it is called from a cancelled context.
-	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), redisIOTimeout)
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), RedisIOTimeout)
 	owned, err := c.releaseOwnership(delCtx)
 	if err != nil {
 		// The release could not be confirmed; fall back to the unconditional
@@ -518,7 +525,7 @@ func (c *redisCluster) Stop(ctx context.Context) error {
 	// Directed publishes must stop being routed here now, not after the TTL. The
 	// delete is conditional on this process still owning each record, so a client
 	// that already moved to another node keeps its presence there.
-	clearCtx, clearCancel := context.WithTimeout(context.WithoutCancel(ctx), redisIOTimeout)
+	clearCtx, clearCancel := context.WithTimeout(context.WithoutCancel(ctx), RedisIOTimeout)
 	c.clearPresence(clearCtx)
 	clearCancel()
 	cancel()
@@ -620,7 +627,7 @@ func (c *redisCluster) Spread(ctx context.Context, msg ClusterMessage) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, redisIOTimeout)
+	ctx, cancel := context.WithTimeout(ctx, RedisIOTimeout)
 	defer cancel()
 
 	if msg.Type == ClusterTarget {
@@ -712,10 +719,10 @@ func (c *redisCluster) targetNode(ctx context.Context, clientID string) (string,
 	return value, nil
 }
 
-// clientConnected implements clientPresence: it records that this node holds the
-// client id and wakes the housekeeping loop to write the presence record. Nothing
-// here waits for Redis, because the caller is the CONNECT path of the broker.
-func (c *redisCluster) clientConnected(clientID string) {
+// ClientConnected implements clientPresence (root package): it records that this node holds
+// the client id and wakes the housekeeping loop to write the presence record. Nothing here
+// waits for Redis, because the caller is the CONNECT path of the broker.
+func (c *redisCluster) ClientConnected(clientID string) {
 	if clientID == "" {
 		return
 	}
@@ -729,10 +736,10 @@ func (c *redisCluster) clientConnected(clientID string) {
 	c.signalPresence()
 }
 
-// clientDisconnected implements clientPresence: the client id left this node, so
-// its record is deleted — by the compare-and-delete script, because the client may
-// already have reconnected to another node and its record there must survive.
-func (c *redisCluster) clientDisconnected(clientID string) {
+// ClientDisconnected implements clientPresence (root package): the client id left this node,
+// so its record is deleted — by the compare-and-delete script, because the client may already
+// have reconnected to another node and its record there must survive.
+func (c *redisCluster) ClientDisconnected(clientID string) {
 	if clientID == "" {
 		return
 	}
@@ -766,10 +773,10 @@ func (c *redisCluster) presenceValue() []byte {
 }
 
 // presenceKey is one client id's presence key. The namespace is part of the key
-// (namespaceKey), so two namespaces sharing one Redis never claim each other's
+// (namespace.Key), so two namespaces sharing one Redis never claim each other's
 // client ids.
-func (c *redisCluster) presenceKey(namespace, clientID string) string {
-	return c.prefix() + ":client:" + namespaceKey(namespace, clientID)
+func (c *redisCluster) presenceKey(ns, clientID string) string {
+	return c.prefix() + ":client:" + namespace.Key(ns, clientID)
 }
 
 // flushPresence writes the records of the client ids this node holds and deletes
@@ -805,7 +812,7 @@ func (c *redisCluster) flushPresence() {
 	if len(writes) == 0 && len(deletes) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.ctx, redisIOTimeout)
+	ctx, cancel := context.WithTimeout(c.ctx, RedisIOTimeout)
 	defer cancel()
 	value := c.presenceValue()
 	pipe := rdb.Pipeline()
@@ -893,12 +900,12 @@ func (c *redisCluster) routingTargets(view map[string]*redisPeer, msg ClusterMes
 	return out
 }
 
-// sharedGroups implements sharedDirectory: the shared subscription group keys each
-// peer advertised, per node id, read from the cached routing view. It is the same
-// view normal routing uses, so electing a node costs no round trip; a peer whose
-// summary is unknown contributes no groups, and its groups are elected to nobody
-// until the next summary refresh (one SummaryInterval).
-func (c *redisCluster) sharedGroups() map[string][]string {
+// SharedGroups implements sharedDirectory (root package): the shared subscription group keys
+// each peer advertised, per node id, read from the cached routing view. It is the same view
+// normal routing uses, so electing a node costs no round trip; a peer whose summary is unknown
+// contributes no groups, and its groups are elected to nobody until the next summary refresh
+// (one SummaryInterval).
+func (c *redisCluster) SharedGroups() map[string][]string {
 	c.viewMu.Lock()
 	view := c.view
 	c.viewMu.Unlock()
@@ -940,7 +947,7 @@ func (c *redisCluster) routingView(ctx context.Context) (map[string]*redisPeer, 
 // loadView reads the routing view with a bounded context of its own (Members has
 // no context to inherit).
 func (c *redisCluster) loadView() (map[string]*redisPeer, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisIOTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), RedisIOTimeout)
 	defer cancel()
 	return c.loadViewCtx(ctx)
 }
@@ -1144,7 +1151,7 @@ func (c *redisCluster) refreshLocal(ctx context.Context) error {
 	if rdb == nil {
 		return errors.New("gmqx: redis cluster is not running")
 	}
-	ctx, cancel := context.WithTimeout(ctx, redisIOTimeout)
+	ctx, cancel := context.WithTimeout(ctx, RedisIOTimeout)
 	defer cancel()
 
 	owned, err := c.renewOwnership(ctx)
@@ -1198,31 +1205,31 @@ func (c *redisCluster) refreshLocal(ctx context.Context) error {
 
 // localFilters recomputes the summary this node advertises: the topic filters of
 // its normal subscriptions and the shared subscription groups it holds a live
-// member of. A handler that does not implement subscriptionProvider never
+// member of. A handler that does not implement SubscriptionProvider never
 // advertises, which makes peers treat it as unknown (availability over
 // precision); a handler without the shared half advertises no groups, which keeps
 // shared subscriptions local to the node that publishes (see shared.go).
 func (c *redisCluster) localFilters() (filters, shared []string, known bool) {
-	provider, ok := c.handler.(subscriptionProvider)
+	provider, ok := c.handler.(SubscriptionProvider)
 	if !ok {
 		return nil, nil, false
 	}
-	current := provider.subscriptionFilters()
+	current := provider.SubscriptionFilters()
 	var groups []string
-	if sp, ok := c.handler.(sharedSubscriptionProvider); ok {
-		groups = sp.sharedSubscriptionGroups()
+	if sp, ok := c.handler.(SharedSubscriptionProvider); ok {
+		groups = sp.SharedSubscriptionGroups()
 	}
 	c.summaryMu.Lock()
 	defer c.summaryMu.Unlock()
 	return c.local.Refresh(current, c.maxSummaryFilters()), c.sharedLocal.Refresh(groups, c.maxSummaryFilters()), true
 }
 
-// subscriptionsChanged implements subscriptionChangeNotifier. The broker calls it
-// before it acknowledges a SUBSCRIBE/UNSUBSCRIBE, so the new summary is queued
-// immediately instead of waiting up to one SummaryInterval. The write itself
-// stays off the broker's path: a slow or unreachable Redis must not stall
-// connection handling, and the next SummaryInterval retries anyway.
-func (c *redisCluster) subscriptionsChanged() {
+// SubscriptionsChanged implements subscriptionChangeNotifier (root package). The broker calls
+// it before it acknowledges a SUBSCRIBE/UNSUBSCRIBE, so the new summary is queued immediately
+// instead of waiting up to one SummaryInterval. The write itself stays off the broker's path:
+// a slow or unreachable Redis must not stall connection handling, and the next SummaryInterval
+// retries anyway.
+func (c *redisCluster) SubscriptionsChanged() {
 	if !c.isRunning() {
 		return
 	}
@@ -1317,7 +1324,7 @@ func (c *redisCluster) probe() {
 	if rdb == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.ctx, redisIOTimeout)
+	ctx, cancel := context.WithTimeout(c.ctx, RedisIOTimeout)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		c.noteErr(err)
@@ -1402,7 +1409,7 @@ func (c *redisCluster) subscribe() (*redis.PubSub, error) {
 	if rdb == nil {
 		return nil, errors.New("gmqx: redis cluster is not running")
 	}
-	ctx, cancel := context.WithTimeout(c.ctx, redisIOTimeout)
+	ctx, cancel := context.WithTimeout(c.ctx, RedisIOTimeout)
 	defer cancel()
 	sub := rdb.Subscribe(ctx, channel)
 	if !c.attach(sub) {
@@ -1497,7 +1504,7 @@ func (c *redisCluster) handlePayload(channel, payload string) {
 // never forwarded.
 //
 // A directed publish (ClusterTarget) reaches a handler that implements
-// targetHandler — the broker does — and is counted as undeliverable otherwise. It
+// TargetHandler — the broker does — and is counted as undeliverable otherwise. It
 // is deduplicated exactly like a publish or a kick, so a presence race that sends
 // the same event twice delivers it once.
 func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
@@ -1528,7 +1535,7 @@ func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
 	case ClusterKick:
 		c.handler.OnRemoteKick(msg)
 	case ClusterTarget:
-		handler, ok := c.handler.(targetHandler)
+		handler, ok := c.handler.(TargetHandler)
 		if !ok {
 			c.recordDrop("target_unknown", "handler cannot receive a directed publish")
 			return
@@ -1570,11 +1577,11 @@ func (c *redisCluster) options() *redis.Options {
 		Password:     c.cfg.Password,
 		DB:           c.cfg.DB,
 		MaxRetries:   -1,
-		DialTimeout:  redisDialTimeout,
-		ReadTimeout:  redisIOTimeout,
-		WriteTimeout: redisIOTimeout,
+		DialTimeout:  RedisDialTimeout,
+		ReadTimeout:  RedisIOTimeout,
+		WriteTimeout: RedisIOTimeout,
 		ClientName:   "gmqx-cluster",
-		// Honour the deadlines this backend derives from redisIOTimeout instead of
+		// Honour the deadlines this backend derives from RedisIOTimeout instead of
 		// letting a command run until ReadTimeout/WriteTimeout expires; the two are
 		// equal here, so the effective bound is the documented one either way, but
 		// an honouring client never outlives its caller's context.
@@ -1655,7 +1662,7 @@ func (c *redisCluster) prefix() string {
 	if p := strings.TrimSpace(c.cfg.ChannelPrefix); p != "" {
 		return p
 	}
-	return defaultRedisChannelPrefix
+	return DefaultRedisChannelPrefix
 }
 
 func (c *redisCluster) summaryInterval() time.Duration {
