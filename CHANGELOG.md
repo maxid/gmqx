@@ -1,9 +1,56 @@
 # Changelog
 
-> Development snapshots are untagged; entries below are chronological.
+> Development snapshots are untagged. Entries are grouped by the date the change
+> landed, newest first, and a release cut that day appears under its version number
+> inside the date. An entry that is not under a version heading is part of the
+> unreleased snapshot.
 
+## 2026-11-03
 
-## [Unreleased]
+### Added
+
+- **A hook can see which listener accepted a connection.** `hook.ConnInfo` gained
+  `Transport` — `"tcp"`, `"tls"`, `"ws"` or `"wss"`, the same names `Addrs()` reports
+  — so an audit trail, a metrics sink or an ACL can tell a device on the TLS port
+  from one on the WebSocket port without keeping a second copy of the broker's
+  configuration. The listener name travels from the listener spec through
+  `conn.Client` (`SetTransport`, called before the handshake); an embedder that hands
+  a connection over itself reports an empty transport.
+
+- **`ClientConfig.TLS` derives the server name from `Addr`.** A configuration with a
+  root pool and no `ServerName` used to fail with "either ServerName or
+  InsecureSkipVerify must be specified", a requirement the field's documentation did
+  not state; the client now fills it from `Addr` the way `tls.Dial` does. An explicit
+  `ServerName` is used as given, and the caller's `tls.Config` is never mutated.
+
+- **The interoperability matrix covers the secure and WebSocket listeners.** paho
+  runs the same publish/subscribe exchange over TLS, WS, WSS and mutual TLS against
+  this broker, and the reference-broker direction gained a TLS listener (with the
+  negative case: a client that does not trust the CA must fail).
+
+### Fixed
+
+- **A failed multi-listener `Start` no longer reports addresses of listeners it
+  already stopped.** When the second listener failed to bind, `Addrs()` kept the
+  address of the first one, which had been stopped: a supervisor could read a port
+  that nothing was listening on. The rollback now clears the servers and addresses,
+  which is what "a failed Start leaves nothing behind" already meant for the
+  single-listener path.
+
+- **`MaxPacketSize` reaches the WebSocket listeners.** The WS and WSS listeners
+  passed no message limit to gnety, so they silently kept gnety's 4 MiB default: a
+  broker configured with `MaxPacketSize: 8 MiB` served a 5 MiB PUBLISH over TCP and
+  TLS and closed the same PUBLISH over WS/WSS with WebSocket status 1009. All four
+  transports now take their limit from `Config.MaxPacketSize` — 4 MiB is a library
+  default, not a protocol limit (RFC 6455 has no message size limit, and the MQTT
+  spec lets one frame carry several or partial control packets), and the other
+  transports already obeyed that single number. The limit counts one whole
+  WebSocket message, so a sender that bundles several packets into one message is
+  held to their sum. `internal/engine/transport_frame_size_test.go` is the
+  acceptance case: 5 MiB over ws and wss at an 8 MiB limit, a 2 MiB message
+  refused at a 1 MiB limit.
+
+## 2026-11-02
 
 ### Added
 
@@ -44,7 +91,6 @@
   consumer changes. The root package is down to 21 implementation files from 26, and
   the backends carry their own tests (including -race) beside them.
 
-
 - **The broker engine lives in `gmqx/server`; the root package is a facade.** The
   connection/session state machine, the routing index, the byte-rate shaper, the
   configuration, the errors and the broker side of the cluster seam moved together
@@ -56,6 +102,7 @@
   facades — and `libcheck`'s root-debt entry for gmqx is gone. `server/` is a
   waypoint, not the destination: the staged split by role (session state, routing,
   connection) is recorded in `docs/design/source-layout.md` §4.3.
+
 - **`Config.Namespace` is a `gns.Namespace`.** The isolation scope of a broker is now
   the gns namespace value, so a process that runs several brokers — or several
   middlewares — declares each namespace once with `gns.New` and passes the same value
@@ -143,6 +190,14 @@
   builds a broker. `gmqx/server` — never documented as a public path, no in-repo
   importer besides the facade — is gone.
 
+- `hook.SinkFuncs`: implement only the events that matter; a nil field is skipped and a
+  sink without a publish hook accepts the publication.
+
+- `hook.InterceptFunc`: a one-closure `Interceptor`.
+
+- `hook.NoopMetrics` (formerly `NoopMetrics` in the root package): embed it and override
+  only the counters that matter.
+
 ### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
@@ -153,13 +208,9 @@
   keeps working unchanged. The contracts now form one reviewable directory instead of a
   section of `hooks.go`, and `gmqx/hook` imports nothing from the broker.
 
-### Added
+## 2026-11-01
 
-- `hook.SinkFuncs`: implement only the events that matter; a nil field is skipped and a
-  sink without a publish hook accepts the publication.
-- `hook.InterceptFunc`: a one-closure `Interceptor`.
-- `hook.NoopMetrics` (formerly `NoopMetrics` in the root package): embed it and override
-  only the counters that matter.
+### Added
 
 - **The inbound PUBLISH no longer allocates a packet, a topic string and a payload
   per publish.** The read loop decodes a PUBLISH with `codec/mqtt`'s
@@ -224,7 +275,6 @@
   publish throughput for QoS 0/1, fanout to 10 and 100 subscribers, 10k
   subscriptions, retained replay and a client round trip, plus a churn soak that
   asserts empty tables, a bounded goroutine count and a delivery ledger.
-
 
 - **The MQTT client library is here: `github.com/maxid/gmqx/client`.**
 
@@ -319,6 +369,10 @@
   `Start`, for TCP, TLS, WS and WSS alike. Every attempt binds the next port for
   real (no check-then-bind race), the resolved address is logged and reported by
   `Addrs()`, and an ephemeral `:0` bind never falls back.
+
+## 2026-10-31
+
+### Added
 
 - **A gossip cluster backend is the default; `Config.Cluster.Enabled` now does
   something without an explicit backend.**
@@ -846,7 +900,6 @@
   topic alias invalid and 0x95 packet too large. MQTT 3.1.1 closes instead, as
   it has no server DISCONNECT.
 
-
 - **Cluster: retained replication and node id ownership.** Two defects in the
   shared cluster path are fixed.
 
@@ -917,6 +970,10 @@
 
   *Dependencies.* `github.com/redis/go-redis/v9` (client) and, for tests only,
   `github.com/alicebob/miniredis/v2`.
+
+## 2026-10-30
+
+### Added
 
 - **Built-in TCP cluster: membership, deduplication, directed routing.** The
   cluster is no longer a bare flood of `ClusterMessage` payloads.
@@ -991,65 +1048,22 @@
 
 - MQTT 3.1 (`MQIsdp`, protocol level 3) CONNECT compatibility; v3.1 client-id rules.
 
+## 2026-10-29
+
+### Added
 
 - Cluster interface (`Cluster`/`ClusterMessage`) and broker hooks for cross-node
   publish and kick; in-memory two-node test.
 
-### Added
-
-- **A hook can see which listener accepted a connection.** `hook.ConnInfo` gained
-  `Transport` — `"tcp"`, `"tls"`, `"ws"` or `"wss"`, the same names `Addrs()` reports
-  — so an audit trail, a metrics sink or an ACL can tell a device on the TLS port
-  from one on the WebSocket port without keeping a second copy of the broker's
-  configuration. The listener name travels from the listener spec through
-  `conn.Client` (`SetTransport`, called before the handshake); an embedder that hands
-  a connection over itself reports an empty transport.
-
-- **`ClientConfig.TLS` derives the server name from `Addr`.** A configuration with a
-  root pool and no `ServerName` used to fail with "either ServerName or
-  InsecureSkipVerify must be specified", a requirement the field's documentation did
-  not state; the client now fills it from `Addr` the way `tls.Dial` does. An explicit
-  `ServerName` is used as given, and the caller's `tls.Config` is never mutated.
-
-- **The interoperability matrix covers the secure and WebSocket listeners.** paho
-  runs the same publish/subscribe exchange over TLS, WS, WSS and mutual TLS against
-  this broker, and the reference-broker direction gained a TLS listener (with the
-  negative case: a client that does not trust the CA must fail).
-
-### Fixed
-
-- **A failed multi-listener `Start` no longer reports addresses of listeners it
-  already stopped.** When the second listener failed to bind, `Addrs()` kept the
-  address of the first one, which had been stopped: a supervisor could read a port
-  that nothing was listening on. The rollback now clears the servers and addresses,
-  which is what "a failed Start leaves nothing behind" already meant for the
-  single-listener path.
-
-- **`MaxPacketSize` reaches the WebSocket listeners.** The WS and WSS listeners
-  passed no message limit to gnety, so they silently kept gnety's 4 MiB default: a
-  broker configured with `MaxPacketSize: 8 MiB` served a 5 MiB PUBLISH over TCP and
-  TLS and closed the same PUBLISH over WS/WSS with WebSocket status 1009. All four
-  transports now take their limit from `Config.MaxPacketSize` — 4 MiB is a library
-  default, not a protocol limit (RFC 6455 has no message size limit, and the MQTT
-  spec lets one frame carry several or partial control packets), and the other
-  transports already obeyed that single number. The limit counts one whole
-  WebSocket message, so a sender that bundles several packets into one message is
-  held to their sum. `internal/engine/transport_frame_size_test.go` is the
-  acceptance case: 5 MiB over ws and wss at an 8 MiB limit, a 2 MiB message
-  refused at a 1 MiB limit.
-
-
-## [0.6.0-dev.1] - 2026-10-29
+### 0.6.0-dev.1
 
 - Transport migrated to gnety (`RawHandler`) for TCP/TLS/WS/WSS; MQTT codec and
   broker state machine remain in gmqx.
 
-
 - Transport migration: TCP/TLS/WebSocket/WSS listeners now come from the gnety
   transport framework (RawHandler); MQTT codec and broker state machine stay in gmqx.
 
-
-## [0.5.0] - 2026-10-29
+### 0.5.0
 
 - MQTT 5 CONNACK capability properties (retain/wildcard/subscription-id/shared/max-qos/max-packet/topic-alias).
 - Topic Alias handling (inbound and per-session resolution).
@@ -1057,41 +1071,37 @@
 - Subscription options: no-local, retain-as-published, retain-handling.
 - Tests for v5 CONNACK properties, topic alias and user property forwarding.
 
-
-## [0.4.0] - 2026-10-29
+### 0.4.0
 
 - Basic MQTT 5 support: CONNECT with properties (skipped), v5 CONNACK/SUBACK/UNSUBACK formats,
   v5 PUBLISH property block, v5 negative ACK reason codes (Not authorized, Quota exceeded,
   Client Identifier not valid), tests for v5 connect/pub-sub/auth.
 
-
-## [0.3.0] - 2026-10-29
+### 0.3.0
 
 - Multi-listener support: TCP, TLS (server cert/optional client cert), WebSocket and WSS.
 - WebSocket subprotocol validation and path configuration.
 - TLS/WS integration tests; listener address accessors.
 
-
-## [0.2.3] - 2026-10-29
+### 0.2.3
 
 - Documentation cleanup: the library README/docs are product-neutral and self-contained.
 
-
-## [0.2.2] - 2026-10-29
+### 0.2.2
 
 - Bump version constant; include connect mode tests.
 
-## [0.2.1] - 2026-10-29
+### 0.2.1
 
 - Add tests for UNIQUE/KICK connect modes.
 
-## [0.2.0] - 2026-10-29
+### 0.2.0
 
 - Broker SPIs: AuthManager, AclManager, EventSink, MetricsManager, Interceptor.
 - ConnectMode UNIQUE/KICK, connection/subscription/retained limits, connection rate limiting.
 - Metrics counters and lifecycle callbacks (connect/disconnect/lost/ping).
 
-## [0.1.0] - 2026-10-29
+### 0.1.0
 
 - Initial single-node MQTT 3.1.1 broker: TCP listener, CONNECT/SUBSCRIBE/PUBLISH/PING/DISCONNECT,
   QoS 0/1/2 basic flows, retained messages, wildcard subscriptions, will and keepalive.
