@@ -12,6 +12,7 @@
 
 - TCP、TLS、WebSocket 与 WSS 上的 MQTT 3.1、3.1.1 及基础 MQTT 5
 - 基准与浸泡套件（`go test -bench . ./...`、`GMQX_SOAK=1 go test -timeout 15m -run TestSoak ./internal/engine`）及记录在案的基线
+- 集群 × 持久化矩阵：在真实的 Redis 与 Olric 容器上跑（`go test -tags=integration ./internal/engine`，需要 Docker）
 - `interop/` 互操作矩阵：第三方客户端对接本 broker，本客户端对接参考实现 broker
 - CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、PING、DISCONNECT
 - 持久会话（Clean Session / Clean Start、Session Present）；持久会话的订阅在断连后保留，

@@ -12,7 +12,9 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 
 - MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
 - A benchmark and soak harness (`go test -bench . ./...`, `GMQX_SOAK=1 go test -timeout 15m -run TestSoak ./internal/engine`)
-  with a recorded baseline, and an interoperability matrix in `interop/` that runs a
+  with a recorded baseline, a cluster × persistence matrix that runs against real Redis
+  and Olric containers (`go test -tags=integration ./internal/engine`, needs Docker),
+  and an interoperability matrix in `interop/` that runs a
   third-party client against this broker (TCP, TLS, WS, WSS and mutual TLS) and this
   client against a reference broker (plaintext and TLS)
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT

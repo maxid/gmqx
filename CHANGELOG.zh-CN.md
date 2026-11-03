@@ -8,6 +8,17 @@
 
 ### 新增
 
+- **集群 × 持久化矩阵在真实后端上跑。** `-tags=integration` 下，
+  `internal/engine/cluster_persistence_integration_test.go` 用 testcontainers 起
+  `redis:7-alpine` 与 `ghcr.io/olric-data/olric:latest`，对"节点本地默认"和两个共享后端跑同一组
+  场景：保留消息在任何一种后端下都能到达另一个节点（集群复制它），但只有共享后端能跨重启活下来；
+  会话只有共享后端才能在另一个节点续上。`TestSoakClusterSharedStore` 保留浸泡的连接抖动（churn），并加上
+  在两个节点之间迁移的会话；`cluster_persistence_bench_integration_test.go` 给出两条路径的代价，
+  数字记在 [PERFORMANCE.zh-CN.md](docs/PERFORMANCE.zh-CN.md)。
+  [PERSISTENCE.zh-CN.md](docs/PERSISTENCE.zh-CN.md) 现在写明这些用例守的那条规矩：集群不会替你选
+  后端——`Config.Store` 不配置时就是节点本地，开不开集群都一样。仅测试用的新增依赖：
+  `testcontainers-go`、`gcache/olric`、`olric-data/olric`；`go test ./...` 仍然不需要 Docker。
+
 - **hook 现在能看到连接是由哪个监听器接受的。** `hook.ConnInfo` 增加 `Transport`（`"tcp"/"tls"/"ws"/"wss"`，与 `Addrs()` 同名），审计、指标或 ACL 不必再自己保存一份 broker 配置就能区分 TLS 端口与 WebSocket 端口上的设备。监听器名字从 listener spec 穿过 `conn.Client`（`SetTransport`，握手前调用）；自己把连接交给 broker 的嵌入方报告空值。
 
 - **`client.Config.TLS` 会从 `Addr` 补 `ServerName`。** 只给了根证书池、没给 `ServerName` 的配置原先会报 "either ServerName or InsecureSkipVerify must be specified"，而这个要求字段文档里没写；现在客户端按 `tls.Dial` 的方式从 `Addr` 取值，显式 `ServerName` 照旧优先，且不会改动调用方的 `tls.Config`。

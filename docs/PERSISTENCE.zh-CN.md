@@ -102,6 +102,28 @@ broker 在内存里保存保留消息并写穿透到 store。SUBSCRIBE 扫描热
 同进程的两个 broker 各拿各的 store——没有全局实例。与别的应用同进程嵌入 gmqx（或跑两个隔离域不同
 的 broker）时，给各自一个 gcache 实例或各自的 `KeyPrefix`。
 
+## 集群不会替你选后端
+
+集群后端与持久化后端是两条轴，启用一条永远不会顺带启用另一条：
+
+- `Cluster` / `ClusterBackend` 共享的是**路由与事件**——哪个节点有订阅者、踢人、保留消息发布；
+  它不在节点之间搬运会话或保留消息；
+- `Store` 决定这两类状态**是否共享**。不配置时仍是 `gcache/memory`，即节点本地——开不开集群
+  都一样。
+
+这是刻意的：由 `Config` 起出来的 broker 从不替调用方选 store。同进程的两个 broker、两个隔离域、
+两个测试都必须能各拿各的 gcache 实例；隐式选一个还意味着由库来决定一个部署的数据落在哪里。所以
+后果也是明写的：
+
+- 开了集群但没配 `Store` 的部署，会话与保留消息**留在本节点**：客户端连到另一个节点会开新会话
+  （没有 Session Present、订阅不恢复、没有离线队列），A 节点发布的保留消息在 B 节点看不见；
+- 要让会话能在别的节点续上、保留消息全局可见，把 `Store` 配成 `gcache/redis` 或 `gcache/olric`，
+  并配 `Locker`（不配就是 load-then-delete，只对"单节点写入"的 store 安全）。
+
+`internal/engine/cluster_persistence_integration_test.go` 就是这句话两半的验收用例：真实两节点
+集群、逐个后端跑（`go test -tags=integration ./internal/engine`）；同目录的 benchmark 给出共享
+后端的代价。
+
 ## inflight 队列不是丢失点
 
 会话的 pending 队列满时，broker 不丢弃投递：它把会话转为离线——像连接丢失那样关闭连接，正常

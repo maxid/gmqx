@@ -315,6 +315,45 @@ goroutine 回到两条的基线，存活堆始终低于 1 MiB——十分钟共�
 - **表必须为空，而不是有界。** 浸泡中的每个会话都是 clean session，因此 `Stop` 之后残留的会话或客户端条目是 bug，而非容量效应。断言检查 broker 的客户端表、会话存储、路由索引、retained 存储与待发 will。
 - **投递账本。** 每批中，worker 收到确认的每一条 QoS 1/2 消息都必须出现在该批的已投递集合中；最终总量须满足 `delivered_qos12 >= acknowledged`。重复会被报告但不判失败，因为至少一次语义允许重复；上文每次运行的重复均为 0。
 
+## 集群 × 持久化后端
+
+`internal/engine/cluster_persistence_integration_test.go` 里的矩阵，以及
+`cluster_persistence_bench_integration_test.go` 里的基准，只在 `-tags=integration` 下跑：
+Redis 与 Olric 那两行需要 Docker（testcontainers：`redis:7-alpine` 与
+`ghcr.io/olric-data/olric:latest`）。它们回答单进程基准回答不了的两个问题：一条保留消息要送到对端
+节点并写穿到 store 时花多少，以及把一个会话从 A 挪到 B 在每个后端上花多少。它们验证的规矩见
+[PERSISTENCE.zh-CN.md](PERSISTENCE.zh-CN.md#集群不会替你选后端)。
+
+2026-11-03 在[环境](#环境)那台机器上测，`-benchtime=300x`，跑一次。两个容器都在同一台宿主机上，
+且 Olric 镜像是 `linux/amd64`、在这台 arm64 机器上走模拟，所以容器两行包含了原生部署没有的往返
+（Olric 还有模拟）开销：把它们当作**后端之间的相对成本**，不是绝对值。Redis 的保留消息一例在这台
+机器上多次运行落在 0.3 ms 到 1.0 ms 之间。
+
+| 用例 | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| 保留消息发布，单节点（基线） | 59 586 | 1 989 | 23 |
+| 保留消息发布，两节点集群，memory | 87 383 | 6 208 | 69 |
+| 保留消息发布，两节点集群，Redis | 1 001 853 | 6 730 | 85 |
+| 保留消息发布，两节点集群，Olric | 237 212 | 7 841 | 109 |
+| 会话迁移，两节点集群，memory | 608 042 | 336 623 | 408 |
+| 会话迁移，两节点集群，Redis | 1 823 065 | 336 916 | 457 |
+| 会话迁移，两节点集群，Olric | 1 278 459 | 338 453 | 490 |
+
+这些数字说明：
+
+- **贵的不是集群。** 两节点集群 + 节点本地 store 的一条保留消息，只比单节点基线多约 28 µs：
+  一次广播加一次回环投递。贵的是后端——一次容器往返比进程内写入高一到两个数量级（这里 Redis 比
+  Olric 慢是客户端自身的批处理，不是两种 store 的高低）。
+- **一次会话迁移是两次 MQTT 握手加一次 store 写和一次取。** memory 那行（608 µs）是地板：同一条
+  路径，没有 store 往返。共享后端那两行多出 0.7–1.2 ms，就是两次 store 操作；每行那 ~337 KB/op
+  是连接建立，不是 store。
+- **两条路径都不在稳态发布路径上。** 普通发布从不碰 store（见
+  [PERSISTENCE.zh-CN.md](PERSISTENCE.zh-CN.md)），所以这里没有它的后端对照行：给普通发布做基准，
+  比的是集群后端的路由，而不是持久化。
+
+同形状的 5 秒浸泡（下文 `TestSoakClusterSharedStore`）跑完 3 452 次迁移、70 305 条已确认消息，
+结束时两个节点的 store 与路由索引都是空的。
+
 ## 复现
 
 在仓库根（`libs/gmqx`）下：
@@ -344,6 +383,14 @@ GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./inter
 
 # 更短的浸泡，适合合并前检查。
 GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./internal/engine
+
+# 集群 × 持久化矩阵（需要 Docker）及其基准。
+go test -tags=integration -timeout 15m -run 'TestCluster' ./internal/engine
+go test -tags=integration -run '^$' -bench 'Matrix' -benchtime=300x ./internal/engine
+
+# 带共享 store 的集群浸泡（需要 Docker）。
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -tags=integration -timeout 15m \
+    -run TestSoakClusterSharedStore -v ./internal/engine
 ```
 
 `scripts/bench.sh` 与 `scripts/soak.sh` 封装了上述两条命令（`BENCHTIME=2s ./scripts/bench.sh`、`GMQX_SOAK_DURATION=30s ./scripts/soak.sh`）。

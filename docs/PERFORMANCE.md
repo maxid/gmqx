@@ -568,6 +568,55 @@ The bounds are deliberately conservative, and this is the rationale:
   but not failed, because at-least-once semantics permit them; every run above
   had zero.
 
+## Cluster × persistence backends
+
+The matrix in `internal/engine/cluster_persistence_integration_test.go` and its
+benchmarks in `cluster_persistence_bench_integration_test.go` run only under
+`-tags=integration`, because the Redis and Olric rows need Docker (testcontainers:
+`redis:7-alpine` and `ghcr.io/olric-data/olric:latest`). They answer what the
+single-process benchmarks cannot: what a retained publish costs when it must reach a
+peer and be written through, and what moving one session between two nodes costs on
+each backend. The behavior they pin is described in
+[PERSISTENCE.md](PERSISTENCE.md#a-cluster-does-not-pick-a-store).
+
+Measured 2026-11-03 on the machine in [Environment](#environment), `-benchtime=300x`,
+one run. Both containers run on the same host, and the Olric image is `linux/amd64`
+under emulation on this arm64 machine, so the container rows pay a round trip (and,
+for Olric, emulation) that a native deployment would not: read them as *relative*
+costs between backends, not absolutes. The Redis retained-publish case varied between
+0.3 ms and 1.0 ms across runs on this machine.
+
+| Case | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Retained publish, single node (baseline) | 59 586 | 1 989 | 23 |
+| Retained publish, 2-node cluster, memory | 87 383 | 6 208 | 69 |
+| Retained publish, 2-node cluster, Redis | 1 001 853 | 6 730 | 85 |
+| Retained publish, 2-node cluster, Olric | 237 212 | 7 841 | 109 |
+| Session migration, 2-node cluster, memory | 608 042 | 336 623 | 408 |
+| Session migration, 2-node cluster, Redis | 1 823 065 | 336 916 | 457 |
+| Session migration, 2-node cluster, Olric | 1 278 459 | 338 453 | 490 |
+
+What the numbers say:
+
+- **The cluster is not the expensive part.** A retained publish on a two-node cluster
+  with the node-local store costs about 28 µs more than the single-node baseline: one
+  broadcast and one delivery over loopback. The backend is what costs — a container
+  round trip is one to two orders of magnitude above an in-process write (`Redis`
+  being slower than `Olric` here is the client's own batching, not a ranking of the
+  stores).
+- **A session migration is two MQTT handshakes plus a store write and a take.** The
+  memory row (608 µs) is the floor: the same path with no store round trip. The
+  shared rows add 0.7–1.2 ms for the two store operations, and the ~337 KB/op every
+  row allocates is the connection setup, not the store.
+- **Neither path is on the steady-state publish path.** A plain publish never reaches
+  the store (see [PERSISTENCE.md](PERSISTENCE.md)), which is why there is no backend
+  row for it here: benchmarking one would compare the cluster backends' routing, not
+  persistence.
+
+A five-second soak of the same shape (`TestSoakClusterSharedStore`, below) finished
+3 452 migrations and 70 305 acknowledged messages with the store empty and both
+routing indexes empty afterwards.
+
 ## Reproduce
 
 From the repository root (`libs/gmqx`):
@@ -597,6 +646,14 @@ GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -timeout 15m -run TestSoak -v ./inter
 
 # Shorter soak, useful in a pre-merge check.
 GMQX_SOAK=1 GMQX_SOAK_DURATION=3s go test -timeout 15m -run TestSoak -v ./internal/engine
+
+# The cluster × persistence matrix (needs Docker) and its benchmarks.
+go test -tags=integration -timeout 15m -run 'TestCluster' ./internal/engine
+go test -tags=integration -run '^$' -bench 'Matrix' -benchtime=300x ./internal/engine
+
+# The clustered soak with a shared store (needs Docker).
+GMQX_SOAK=1 GMQX_SOAK_DURATION=10s go test -tags=integration -timeout 15m \
+    -run TestSoakClusterSharedStore -v ./internal/engine
 ```
 
 `scripts/bench.sh` and `scripts/soak.sh` wrap the two commands

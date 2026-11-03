@@ -131,6 +131,36 @@ instance. A deployment that embeds gmqx next to another application (or runs two
 brokers with different isolation scopes) gives each its own gcache instance or its
 own `KeyPrefix`.
 
+## A cluster does not pick a store
+
+The cluster backend and the persistence backend are two axes, and enabling one never
+enables the other:
+
+- `Cluster` / `ClusterBackend` shares **routing and events** — which node has a
+  subscriber, a kick, a retained publish. It carries no session or retained state
+  between nodes;
+- `Store` decides whether those two states are **shared at all**. It stays
+  `gcache/memory`, i.e. node-local, when unset — cluster or no cluster.
+
+This is deliberate: a broker started from a `Config` never picks a store. Two brokers
+in one process, two isolation scopes or two tests must be able to hold different gcache
+instances, and an implicit store would mean the library decides where a deployment's
+data lives. The consequences are explicit as well:
+
+- a clustered deployment that leaves `Store` unset keeps sessions and retained messages
+  **node-local**: a client reconnecting to another node starts a fresh session (no
+  Session Present, no restored subscriptions, no offline queue), and a retained message
+  published on node A is invisible on node B;
+- to make a session resumable on another node and a retained message readable on every
+  node, set `Store` to `gcache/redis` or `gcache/olric`, and set `Locker` for the atomic
+  take (without one it is load-then-delete, which is only safe for a store a single
+  node writes).
+
+`internal/engine/cluster_persistence_integration_test.go` is the acceptance case for
+both halves of that statement, over a real two-node cluster against each backend
+(`go test -tags=integration ./internal/engine`); the benchmarks there price the shared
+backends.
+
 ## The inflight queue is not a loss point
 
 When a session's pending queue overflows, the broker does not drop the delivery: it

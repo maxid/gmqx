@@ -9,6 +9,21 @@
 
 ### Added
 
+- **The cluster × persistence matrix runs against real backends.** Under
+  `-tags=integration`, `internal/engine/cluster_persistence_integration_test.go`
+  starts `redis:7-alpine` and `ghcr.io/olric-data/olric:latest` with testcontainers and
+  runs the same scenarios against the node-local default and both shared stores: a
+  retained publish reaches the other node in every case (the cluster replicates it),
+  it survives a restart only on a shared store, and a session resumes on another node
+  only on a shared store. `TestSoakClusterSharedStore` keeps the soak's connection
+  churn and adds sessions migrating between two nodes; the benchmarks in
+  `cluster_persistence_bench_integration_test.go` price both paths and
+  [PERFORMANCE.md](docs/PERFORMANCE.md) records the numbers.
+  [PERSISTENCE.md](docs/PERSISTENCE.md) now states the rule these cases pin: a cluster
+  does not pick a store — `Config.Store` stays node-local when unset, cluster or no
+  cluster. Test-only dependencies: `testcontainers-go`, `gcache/olric`,
+  `olric-data/olric`; `go test ./...` still needs no Docker.
+
 - **A hook can see which listener accepted a connection.** `hook.ConnInfo` gained
   `Transport` — `"tcp"`, `"tls"`, `"ws"` or `"wss"`, the same names `Addrs()` reports
   — so an audit trail, a metrics sink or an ACL can tell a device on the TLS port
