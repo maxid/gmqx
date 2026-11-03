@@ -226,3 +226,34 @@ func TestPortFallbackKeepsTLSListener(t *testing.T) {
 		t.Fatalf("CONNACK over the fallback TLS listener = %d, %v", code, err)
 	}
 }
+
+// TestPortFallbackKeepsWSSTransport is the fourth transport of the same rule: a
+// secure WebSocket listener that had to move to the next port is still the same
+// transport — TLS handshake, WebSocket upgrade, MQTT CONNECT — and Addrs() reports
+// the port it moved to.
+func TestPortFallbackKeepsWSSTransport(t *testing.T) {
+	certFile, keyFile := selfSignedCert(t)
+	b, port := startOnBusyPort(t,
+		func(addr string) Config {
+			// Only the WSS listener: see the note on startOnBusyPort about a second
+			// ":0" listener stealing the successor port.
+			return Config{
+				TLS:                 TLSConfig{Enabled: true, Cert: certFile, Key: keyFile},
+				WebsocketSecureAddr: addr,
+				WebsocketPath:       "/mqtt",
+			}
+		},
+		func(b *Broker) string { return b.WebsocketSecureAddr() })
+
+	want := fmt.Sprintf("127.0.0.1:%d", port+1)
+	if got := b.WebsocketSecureAddr(); got != want {
+		t.Fatalf("WebsocketSecureAddr() = %q, want the fallback %q", got, want)
+	}
+	if got := b.Addrs()["wss"]; got != want {
+		t.Fatalf("Addrs()[wss] = %q, want %q", got, want)
+	}
+
+	conn := dialTestWebSocket(t, "wss", b.WebsocketSecureAddr(), "/mqtt",
+		&tls.Config{RootCAs: certPool(t, certFile)})
+	connectOverConn(t, conn, "fallback-wss")
+}
