@@ -884,9 +884,11 @@ func (b *Broker) register(c *conn.Client) error {
 		return ErrMaxConnections
 	}
 
+	var tookStored bool
 	if c.ResumesSession() {
 		if stored, ok := b.takeStoredSession(key); ok {
 			c.Adopt(stored)
+			tookStored = true
 		} else if takeover != nil {
 			c.Adopt(takeover)
 		}
@@ -928,6 +930,13 @@ func (b *Broker) register(c *conn.Client) error {
 	// with this node's identity, namespace and sequence number, so their
 	// deduplication and namespace rules apply unchanged (see spreadKick).
 	b.spreadKick(c.Context(), c.ID(), c.ConnectedAt())
+	// The session was taken out of the store, which the node that wrote it cannot
+	// notice by itself: its routing index keeps pointing at a key that no longer
+	// exists. The release event is the cleanup hint that lets it drop the entry
+	// (see OnRemoteSessionReleased).
+	if tookStored {
+		b.spreadSessionReleased(c.Context(), c.ID(), key)
+	}
 	// A backend that tracks client-id presence is told about the connection, so a
 	// directed publish for this id can address this node instead of every node.
 	// The call only enqueues the presence write: no store or network call runs on
@@ -1729,6 +1738,52 @@ func (b *Broker) spreadKick(ctx context.Context, clientID string, connectTime ti
 	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
 		b.log.Warn("gmqx cluster kick spread failed", "err", err)
 	}
+}
+
+// spreadSessionReleased tells the peers that this node took key out of the store.
+// The node that stored the session still has an offline routing entry for it and no
+// way to learn it is gone, so a publication routed there would be queued into a key
+// nobody will ever read.
+func (b *Broker) spreadSessionReleased(ctx context.Context, clientID, key string) {
+	if b.cfg.ClusterBackend == nil || clientID == "" {
+		return
+	}
+	msg := ClusterMessage{
+		Type:      ClusterSessionReleased,
+		NodeID:    b.nodeID,
+		Namespace: b.namespace,
+		ClientID:  clientID,
+		Topic:     key,
+	}
+	if err := b.cfg.ClusterBackend.Spread(ctx, msg); err != nil {
+		b.log.Warn("gmqx cluster session release spread failed", "err", err)
+	}
+}
+
+// OnRemoteSessionReleased implements cluster.SessionReleaseHandler.
+//
+// A peer took a stored session; if this node still routes for it, the route is now
+// stale. The decision is made against this node's own store rather than against a
+// flag: a node whose store still holds the session (a node-local store, or one the
+// peer cannot see) keeps its entry, and only a node that cannot load it any more
+// drops it. A live connection always wins — its entries are current.
+func (b *Broker) OnRemoteSessionReleased(msg ClusterMessage) {
+	if msg.Namespace != b.namespace {
+		b.metrics().RecordDroppedMessage("cluster_namespace")
+		b.log.Debug("gmqx session release dropped", "namespace", msg.Namespace, "client", msg.ClientID)
+		return
+	}
+	key := namespaceKey(b.namespace, msg.ClientID)
+	if _, ok := b.persist.LoadSession(key); ok {
+		b.log.Debug("gmqx session release ignored: the session is still in this node's store", "client", msg.ClientID)
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, connected := b.clients[key]; connected {
+		return
+	}
+	b.offlineQueued = max(0, b.offlineQueued-b.index.Remove(key))
 }
 
 // OnRemotePublish implements ClusterHandler.

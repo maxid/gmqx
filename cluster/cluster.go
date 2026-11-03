@@ -41,6 +41,21 @@ const (
 	// of misapplying it, so a rolling upgrade degrades a directed publish to a lost
 	// one — which is the transport's at-most-once behaviour anyway.
 	ClusterTarget ClusterEventType = "target"
+
+	// ClusterSessionReleased tells the peers that this node took a stored session
+	// out of the shared store, so the node that wrote it can drop the offline
+	// routing entry it still holds. A take is not otherwise broadcast: the reading
+	// node sees the key disappear but has no reason to look, and its routing index
+	// would keep sending publications for a session that no longer exists until it
+	// saw the client id again or restarted.
+	//
+	// The event is a cleanup hint, not a correctness requirement: a peer that does
+	// not know the type (an older build) drops it and keeps a stale index entry,
+	// which is what happened before the event existed. The receiving node applies
+	// it only when its own store no longer holds the session and no live connection
+	// owns the client id, so a node-local store, where the peer still has its own
+	// copy, keeps its entry.
+	ClusterSessionReleased ClusterEventType = "session-released"
 )
 
 // ClusterMessage is a cross-node cluster event.
@@ -116,6 +131,14 @@ type ClusterMessage struct {
 type ClusterHandler interface {
 	OnRemotePublish(msg ClusterMessage)
 	OnRemoteKick(msg ClusterMessage)
+}
+
+// SessionReleaseHandler is the optional half of a ClusterHandler that receives
+// ClusterSessionReleased. It is optional for the same reason TargetHandler is: a
+// backend written before the event existed does not have to learn it, and a
+// handler that does not implement it simply never hears about a take.
+type SessionReleaseHandler interface {
+	OnRemoteSessionReleased(msg ClusterMessage)
 }
 
 // Cluster is a pluggable cluster backend (e.g. Redis pub/sub, gossip).

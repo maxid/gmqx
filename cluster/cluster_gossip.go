@@ -610,7 +610,7 @@ func (c *gossipCluster) Spread(_ context.Context, msg ClusterMessage) error {
 	if !c.isRunning() {
 		return errors.New("gmqx: cluster is not running")
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget && msg.Type != ClusterSessionReleased {
 		return fmt.Errorf("gmqx: unknown cluster event type %q", msg.Type)
 	}
 	if msg.Origin != "" && msg.Origin != c.nodeID {
@@ -678,7 +678,7 @@ func (c *gossipCluster) spreadTargets(msg *ClusterMessage, now time.Time) ([]str
 			// epidemically so a node that can reach it still delivers.
 		}
 		return c.floodTargetsLocked("", now), "flooded"
-	case ClusterKick:
+	case ClusterKick, ClusterSessionReleased:
 		return c.floodTargetsLocked("", now), ""
 	case ClusterPublish:
 		if msg.Retain {
@@ -844,6 +844,13 @@ func (c *gossipCluster) deliverEvent(msg ClusterMessage) {
 			return
 		}
 		handler.OnRemoteTarget(msg)
+	case ClusterSessionReleased:
+		handler, ok := c.handler.(SessionReleaseHandler)
+		if !ok {
+			c.recordDrop("session_release_unknown", "handler cannot receive a session release")
+			return
+		}
+		handler.OnRemoteSessionReleased(msg)
 	}
 }
 
@@ -854,7 +861,7 @@ func (c *gossipCluster) forwardEvent(msg *ClusterMessage, from string) {
 	c.mu.Lock()
 	var targets []string
 	switch {
-	case msg.Type == ClusterKick || msg.Retain:
+	case msg.Type == ClusterKick || msg.Type == ClusterSessionReleased || msg.Retain:
 		targets = c.floodTargetsExcludingLocked(from, msg.Origin, now)
 	case msg.Type == ClusterTarget:
 		// A target event only reaches this path when no presence claim exists:

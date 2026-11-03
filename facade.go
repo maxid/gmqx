@@ -211,6 +211,9 @@ const (
 	ClusterPublish = cluster.ClusterPublish
 	ClusterKick    = cluster.ClusterKick
 	ClusterTarget  = cluster.ClusterTarget
+	// ClusterSessionReleased tells the peers that this node took a stored session
+	// out of the shared store, so the node that wrote it drops its offline route.
+	ClusterSessionReleased = cluster.ClusterSessionReleased
 )
 
 const (

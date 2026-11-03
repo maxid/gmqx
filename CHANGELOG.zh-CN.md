@@ -8,6 +8,13 @@
 
 ### 新增
 
+- **取走会话的节点会让 peer 释放它的路由。** 一个节点取走已存储的会话时广播
+  `ClusterSessionReleased`（新集群事件 `session-released`），于是写过它的节点会删掉自己已经服务不了
+  的离线路由项，而不是继续往一个没人读的 key 里排队。接收方先查自己的 store，会话仍在就保留路由，
+  因此节点本地 store 的行为与以前完全一致；不认识该事件的旧版本 peer 直接丢弃，也只回到旧行为。
+  三个内置后端都覆盖：TCP 与 gossip 像 kick 一样泛洪，Redis 走发布订阅；
+  `cluster.SessionReleaseHandler` 是与 `TargetHandler` 并列的可选处理接口。
+
 - **集群 × 持久化矩阵在真实后端上跑。** `-tags=integration` 下，
   `internal/engine/cluster_persistence_integration_test.go` 用 testcontainers 起
   `redis:7-alpine` 与 `ghcr.io/olric-data/olric:latest`，对"节点本地默认"和两个共享后端跑同一组

@@ -161,6 +161,31 @@ both halves of that statement, over a real two-node cluster against each backend
 (`go test -tags=integration ./internal/engine`); the benchmarks there price the shared
 backends.
 
+### What a taking node tells its peers
+
+A take is not otherwise visible: node B reads the key out of the store and only B
+knows. Node A, which wrote the session when the client disconnected, keeps an
+offline routing entry for it and would keep queuing publications into a key nobody
+reads any more. So a node that takes a stored session broadcasts
+`ClusterSessionReleased` (client id only). A node that receives it drops its offline
+route **only if its own store no longer holds the session and no live connection owns
+the client id** — the check is against the store, not against a flag, so a node-local
+store (where the peer still has its own copy) keeps its route. A peer running an
+older build drops the unknown event and keeps a stale entry, exactly as before.
+
+One consequence is worth knowing: a session that moves between nodes is a takeover,
+and `Config.NotKickSeconds` (30 s by default) refuses a CONNECT that would displace a
+connection younger than that. A deployment that lets devices roam between nodes
+normally never sees it, because the connection is gone before the reconnect; a
+deployment that migrates sessions on purpose (a load balancer draining a node, a test
+driver) sets `ConnectMode: gmqx.ConnectModeKick` and `NotKickSeconds: -1`, or accepts
+the refusal and retries.
+
+### The rule in one sentence
+
+A clustered deployment that wants a session to resume on another node configures
+`Store` and `Locker`; everything else stays node-local on purpose.
+
 ## The inflight queue is not a loss point
 
 When a session's pending queue overflows, the broker does not drop the delivery: it

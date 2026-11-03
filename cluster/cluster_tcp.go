@@ -433,7 +433,7 @@ func (c *tcpCluster) Spread(_ context.Context, msg ClusterMessage) error {
 	if !c.isRunning() {
 		return errors.New("gmqx: cluster is not running")
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget && msg.Type != ClusterSessionReleased {
 		return fmt.Errorf("gmqx: unknown cluster event type %q", msg.Type)
 	}
 	if msg.Origin != "" && msg.Origin != c.nodeID {
@@ -489,7 +489,7 @@ func (c *tcpCluster) routingTargets(msg ClusterMessage) []*clusterLink {
 			continue
 		}
 		switch {
-		case msg.Type == ClusterKick || msg.Type == ClusterTarget || msg.Retain:
+		case msg.Type == ClusterKick || msg.Type == ClusterTarget || msg.Type == ClusterSessionReleased || msg.Retain:
 			// A kick names a client id and a directed publish names one too; this
 			// backend has no presence, so both go to every peer, and each peer
 			// applies the event only if it holds that client id.
@@ -813,7 +813,7 @@ func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 	if c.handler == nil {
 		return
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget && msg.Type != ClusterSessionReleased {
 		return
 	}
 	if msg.Namespace != c.namespace {
@@ -843,6 +843,13 @@ func (c *tcpCluster) dispatchEvent(msg ClusterMessage) {
 			return
 		}
 		handler.OnRemoteTarget(msg)
+	case ClusterSessionReleased:
+		handler, ok := c.handler.(SessionReleaseHandler)
+		if !ok {
+			c.recordDrop("session_release_unknown", "handler cannot receive a session release")
+			return
+		}
+		handler.OnRemoteSessionReleased(msg)
 	}
 }
 

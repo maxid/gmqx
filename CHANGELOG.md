@@ -9,6 +9,17 @@
 
 ### Added
 
+- **A taking node releases the session's route on its peers.** `ClusterSessionReleased`
+  (a new cluster event, `session-released`) is broadcast when a node takes a stored
+  session, so the node that wrote it drops the offline routing entry it can no longer
+  serve instead of queuing publications into a key nobody reads. The receiving node
+  checks its own store first and keeps the route when the session is still there, so
+  a node-local store behaves exactly as before; a peer that does not know the event
+  (an older build) drops it, which is also the old behaviour. The event touches all
+  three built-in backends — TCP and gossip flood it like a kick, Redis publishes it —
+  and `cluster.SessionReleaseHandler` is the optional handler half, next to
+  `TargetHandler`.
+
 - **The cluster × persistence matrix runs against real backends.** Under
   `-tags=integration`, `internal/engine/cluster_persistence_integration_test.go`
   starts `redis:7-alpine` and `ghcr.io/olric-data/olric:latest` with testcontainers and

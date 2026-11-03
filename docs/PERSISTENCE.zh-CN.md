@@ -124,6 +124,23 @@ broker 在内存里保存保留消息并写穿透到 store。SUBSCRIBE 扫描热
 集群、逐个后端跑（`go test -tags=integration ./internal/engine`）；同目录的 benchmark 给出共享
 后端的代价。
 
+### 取走会话的节点会告诉 peer
+
+取走本身是不可见的：B 把 key 从 store 里读走，只有 B 知道。写过这条会话的 A 还留着离线路由项，
+会继续把发布塞进一个再没人读的 key。所以取走会话的节点会广播 `ClusterSessionReleased`（只带
+client id）。收到的一方**只有在自己 store 里也已经没有这条会话、且没有活连接持有该 client id 时**
+才删离线路由——判断依据是 store 而不是某个标志位，因此节点本地 store（peer 各有一份）会保留自己
+的路由。跑旧版本的 peer 会丢掉这个未知事件并留着陈旧项，与事件出现之前一致。
+
+有一个后果值得知道：会话在节点间迁移本身就是 takeover，`Config.NotKickSeconds`（默认 30 秒）会
+拒绝抢占一个建立不足该秒数的连接。设备正常漫游不会撞上（重连时旧连接早已消失）；故意迁移会话的
+部署（负载均衡摘节点、测试驱动）可以设 `ConnectMode: gmqx.ConnectModeKick` 与
+`NotKickSeconds: -1`，或者接受拒绝后重试。
+
+### 一句话版本
+
+集群部署要让会话能在别的节点续上，就配 `Store` 与 `Locker`；其余状态刻意留在节点本地。
+
 ## inflight 队列不是丢失点
 
 会话的 pending 队列满时，broker 不丢弃投递：它把会话转为离线——像连接丢失那样关闭连接，正常

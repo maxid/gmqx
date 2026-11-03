@@ -599,7 +599,7 @@ func (c *redisCluster) Spread(ctx context.Context, msg ClusterMessage) error {
 	if !c.isRunning() {
 		return errors.New("gmqx: cluster is not running")
 	}
-	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget {
+	if msg.Type != ClusterPublish && msg.Type != ClusterKick && msg.Type != ClusterTarget && msg.Type != ClusterSessionReleased {
 		return fmt.Errorf("gmqx: unknown cluster event type %q", msg.Type)
 	}
 	if msg.Origin != "" && msg.Origin != c.nodeID {
@@ -1541,6 +1541,13 @@ func (c *redisCluster) dispatchEvent(msg ClusterMessage) {
 			return
 		}
 		handler.OnRemoteTarget(msg)
+	case ClusterSessionReleased:
+		handler, ok := c.handler.(SessionReleaseHandler)
+		if !ok {
+			c.recordDrop("session_release_unknown", "handler cannot receive a session release")
+			return
+		}
+		handler.OnRemoteSessionReleased(msg)
 	}
 }
 

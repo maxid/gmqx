@@ -60,6 +60,9 @@ const (
 	ClusterPublish = cluster.ClusterPublish
 	ClusterKick    = cluster.ClusterKick
 	ClusterTarget  = cluster.ClusterTarget
+	// ClusterSessionReleased is the cleanup hint a taking node sends (see
+	// cluster.ClusterSessionReleased).
+	ClusterSessionReleased = cluster.ClusterSessionReleased
 )
 
 const (
@@ -90,6 +93,10 @@ type backendHandler struct{ b *Broker }
 func (h backendHandler) OnRemotePublish(msg ClusterMessage) { h.b.OnRemotePublish(msg) }
 func (h backendHandler) OnRemoteKick(msg ClusterMessage)    { h.b.OnRemoteKick(msg) }
 func (h backendHandler) OnRemoteTarget(msg ClusterMessage)  { h.b.OnRemoteTarget(msg) }
+
+func (h backendHandler) OnRemoteSessionReleased(msg ClusterMessage) {
+	h.b.OnRemoteSessionReleased(msg)
+}
 
 // SubscriptionFilters implements cluster.SubscriptionProvider.
 func (h backendHandler) SubscriptionFilters() []string { return h.b.subscriptionFilters() }

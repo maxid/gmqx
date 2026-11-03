@@ -215,12 +215,26 @@ func TestClusterSessionMatrix(t *testing.T) {
 					t.Fatal("the node-local default resumed a session another node stored")
 				}
 				expectNoConfPublish(t, back, negativeWindow)
+				// The release event is still sent, and node a still holds its own copy,
+				// so its offline route has to survive: dropping it on the hint alone
+				// would lose the session this node can still serve.
+				if !a.index.Has(namespaceKey(a.namespace, "roamer")) {
+					t.Fatal("the release event dropped a route whose session node a still holds")
+				}
 				return
 			}
 
 			if !ack.SessionPresent {
 				t.Fatalf("node b did not resume the session node a stored in %s", b.name)
 			}
+			// The take is broadcast, so the node that stored the session drops the
+			// offline route it can no longer serve. Without it the index would keep a
+			// target for a key that no longer exists until this node saw the client id
+			// again or restarted.
+			waitFor(t, "node a to drop the released route", func() bool {
+				return !a.index.Has(namespaceKey(a.namespace, "roamer"))
+			})
+
 			first := expectPublish(t, back)
 			second := expectPublish(t, back)
 			if first.Topic != "roam/one" || string(first.Payload) != "one" {
