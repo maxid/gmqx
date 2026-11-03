@@ -28,6 +28,10 @@ type Client struct {
 	closedCh  chan struct{}
 	closed    atomic.Bool
 
+	// routes is the client-side dispatch table: handler per filter, plus
+	// Config.OnMessage as the fallback (see router.go).
+	routes router
+
 	// connErr carries the failure of the current connection from its reader to
 	// the supervisor. It has room for one error, so a failing reader never blocks.
 	connErr chan error
@@ -290,9 +294,14 @@ func (c *Client) stopDelivery() {
 	c.deliverOnce.Do(func() { close(c.deliverStop) })
 }
 
-// deliverLoop invokes OnMessage for every queued inbound message. It is the only
-// goroutine that runs the callback, so deliveries stay in order and never run
-// while a client method holds a lock.
+// deliverLoop dispatches every queued inbound message. It is the only goroutine
+// that runs a handler, so deliveries stay in order and never run while a client
+// method holds a lock.
+//
+// Dispatch is the client's job because the broker does not say which subscription a
+// publication belongs to: every route whose filter matches the topic is called, in
+// registration order, and Config.OnMessage answers a publication no route claimed
+// (the same split paho draws between its routes and DefaultPublishHandler).
 func (c *Client) deliverLoop() {
 	defer close(c.deliverDone)
 	for {
@@ -302,18 +311,36 @@ func (c *Client) deliverLoop() {
 		case <-c.closedCh:
 			return
 		case msg := <-c.deliverq:
-			if fn := c.cfg.OnMessage; fn != nil {
+			handlers := c.routes.match(msg.Topic)
+			if len(handlers) == 0 {
+				if fn := c.cfg.OnMessage; fn != nil {
+					fn(msg)
+				}
+				continue
+			}
+			for _, fn := range handlers {
 				fn(msg)
 			}
 		}
 	}
 }
 
-// deliver queues one inbound message for OnMessage. It blocks while the delivery
-// queue is full (that is the documented backpressure of a slow callback) and
+// AddRoute binds handler to filter for inbound publications. It is the client-side
+// dispatch table paho exposes under the same name: the route is independent of the
+// subscription state (it survives a reconnect and an Unsubscribe) and a publication
+// matching several routes calls every one of them.
+//
+// A shared-subscription filter ("$share/<group>/<filter>") is registered under the
+// inner filter, because that is what an arriving publication's topic matches.
+func (c *Client) AddRoute(filter string, handler MessageHandler) {
+	c.routes.add(filter, handler)
+}
+
+// deliver queues one inbound message for dispatch. It blocks while the delivery
+// queue is full (that is the documented backpressure of a slow handler) and
 // reports false when the connection or the client ended first.
 func (c *Client) deliver(cs *connState, msg *Message) bool {
-	if c.cfg.OnMessage == nil {
+	if c.cfg.OnMessage == nil && c.routes.len() == 0 {
 		return true
 	}
 	select {

@@ -398,9 +398,12 @@ stabilization are on the roadmap (see [ROADMAP.md](ROADMAP.md)).
 
 ## MQTT client
 
-`github.com/maxid/gmqx/client` is the client half of the library: an MQTT 3.1.1
-and MQTT 5 client that depends only on the standard library and the gnety MQTT
-codec. It implements the client state machines itself instead of wrapping another
+`github.com/maxid/gmqx/client` is the client half of the library: an MQTT 3.1,
+3.1.1 and MQTT 5 client that depends only on the standard library and the gnety
+MQTT codec. Handlers are bound to filters (`client.Subscription.Handler` or
+`Client.AddRoute`), with `Config.OnMessage` as the fallback — the same dispatch
+model as paho's; [`docs/CLIENT.md`](docs/CLIENT.md) has the mapping table for a
+migration. It implements the client state machines itself instead of wrapping another
 client:
 
 ```go
@@ -411,14 +414,20 @@ c, err := client.Dial(ctx, client.Config{
     CleanStart: true,
     Version:    mqtt.Version5,
     Reconnect:  client.ReconnectPolicy{Enabled: true},
-    OnMessage:  func(m *client.Message) { fmt.Println(m.Topic, string(m.Payload)) },
+    // Optional: the fallback for publications no route claims.
+    OnMessage: func(m *client.Message) { fmt.Println(m.Topic, string(m.Payload)) },
 })
 if err != nil {
     return err
 }
 defer c.Close()
 
-if _, err := c.Subscribe(ctx, client.Subscription{Filter: "sensors/+/temp", QoS: 1}); err != nil {
+// A subscription can carry its own handler, the way paho's Subscribe takes one.
+if _, err := c.Subscribe(ctx, client.Subscription{
+    Filter:  "sensors/+/temp",
+    QoS:     1,
+    Handler: func(m *client.Message) { fmt.Println(m.Topic, string(m.Payload)) },
+}); err != nil {
     return err
 }
 if err := c.Publish(ctx, "sensors/a/temp", []byte("21.5"), 1, false); err != nil {

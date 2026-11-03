@@ -9,6 +9,14 @@
 
 ### Added
 
+- **Handlers are bound to filters, the way paho binds them.** `client.Subscription`
+  gained `Handler`, `Client.AddRoute(filter, handler)` registers a route without a
+  subscription, and `Config.OnMessage` became the fallback for publications no route
+  claimed (paho's `DefaultPublishHandler`). Every route matching a publication runs,
+  in registration order, on the delivery goroutine; a shared subscription registers
+  under the inner filter. `docs/CLIENT.md` (and its Chinese version) carries the
+  paho → gmqx mapping table, including what a `Token`-based caller has to change.
+
 - **The CI gate covers what local runs covered.** The workflow gained a `-race` job
   (the broker is a concurrency program), an `integration` job that runs the
   container-backed matrix with a Docker daemon, and a short fuzz job over the two

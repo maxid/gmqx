@@ -104,15 +104,20 @@ type Config struct {
 	// Reconnect is the backoff policy used when an established connection is
 	// lost. Close never reconnects.
 	Reconnect ReconnectPolicy
-	// OnMessage receives every inbound PUBLISH, in the order the server sent it.
-	// It runs on the client's delivery goroutine, never while a client method
-	// holds a lock, and it must return promptly: a slow callback backpressures the
-	// connection (the server's TCP window and keepalive then decide what happens).
-	// It may call Publish and Subscribe, but it must not call Close. A callback
-	// that blocks for long — including a QoS 1/2 publish made from the callback
-	// while the delivery queue is already full — stalls the connection, so a
-	// callback that has real work to do should hand it to its own goroutine. Nil
-	// discards inbound messages after acknowledging them.
+	// OnMessage is the fallback handler: it receives an inbound PUBLISH that no route
+	// claimed (no Subscription.Handler and no AddRoute matched its topic). A client
+	// with routes and no OnMessage drops the publications its routes do not cover.
+	//
+	// Handlers — OnMessage and every route — run one at a time on the client's
+	// delivery goroutine, in the order the server sent the messages, in route
+	// registration order, and never while a client method holds a lock. A handler
+	// must return promptly: a slow one backpressures the connection (the server's TCP
+	// window and keepalive then decide what happens). It may call Publish and
+	// Subscribe, but it must not call Close. A handler that blocks for long —
+	// including a QoS 1/2 publish made from it while the delivery queue is already
+	// full — stalls the connection, so real work belongs on its own goroutine. Nil
+	// means "no fallback": unmatched publications are discarded after being
+	// acknowledged.
 	OnMessage func(*Message)
 	// OnConnect is called after the opening CONNECT of the first connection and
 	// of every reconnect, with the Session Present flag of the CONNACK. On the

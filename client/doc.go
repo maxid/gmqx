@@ -1,7 +1,8 @@
 // Package client is the MQTT client of the gmqx family.
 //
-// It speaks MQTT 3.1.1 (mqtt.Version311) and MQTT 5 (mqtt.Version5) over TCP or
-// TLS, and it implements the client half of the protocol: the QoS 1 and QoS 2
+// It speaks MQTT 3.1 (Version31), 3.1.1 (mqtt.Version311) and MQTT 5
+// (mqtt.Version5) over TCP or TLS, and it implements the client half of the
+// protocol: the QoS 1 and QoS 2
 // state machines in both directions, reconnection with exponential backoff and
 // jitter, keepalive, MQTT 5 properties, and the flow-control limits a server
 // advertises. It depends only on the standard library and the MQTT wire codec
@@ -16,6 +17,15 @@
 // that owns the connection lifetime (it is what performs a reconnect). Nothing
 // runs per message. Every one of those goroutines is stopped and joined by
 // Close, so a closed client leaves no goroutine behind.
+//
+// # Dispatch
+//
+// Inbound publications are dispatched by a route table: a handler bound to a filter
+// (Subscription.Handler at Subscribe time, or AddRoute) receives everything that
+// filter matches, and Config.OnMessage answers what no route claimed. Every matching
+// route runs, one handler at a time on the delivery goroutine, in registration
+// order — the model paho calls its routes and DefaultPublishHandler. See
+// docs/CLIENT.md for the mapping table.
 //
 // # Ordering, backpressure and memory bounds
 //

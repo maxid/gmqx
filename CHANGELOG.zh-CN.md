@@ -8,6 +8,12 @@
 
 ### 新增
 
+- **handler 绑在 filter 上，与 paho 一致。** `client.Subscription` 新增 `Handler`，
+  `Client.AddRoute(filter, handler)` 可以只注册路由不订阅，`Config.OnMessage` 降为"没有路由认领时"
+  的兜底（即 paho 的 `DefaultPublishHandler`）。一条发布命中的每条路由都会跑，按注册顺序，在投递
+  goroutine 上；共享订阅按内层 filter 注册。`docs/CLIENT.md`（中文版同步）给出 paho → gmqx 的
+  映射表，以及用 `Token` 的调用方需要改什么。
+
 - **CI 覆盖到本地跑过的那些闸。** 工作流加了 `-race` 作业（broker 是并发程序）、带 Docker 的
   `integration` 作业（跑容器矩阵）、以及一个短时 fuzz 作业，跑两个由 peer 控制输入的解析器：
   `FuzzMatch`（主题过滤）与 `FuzzDecodePropertyBlock`（MQTT 5 属性块）。

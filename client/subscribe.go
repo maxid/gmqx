@@ -27,6 +27,10 @@ type requestResult struct {
 // SUBACK. Subscriptions granted by the server are remembered, so a later
 // reconnect can restore them.
 //
+// A Subscription may carry a Handler (see AddRoute for the same dispatch table
+// without a subscription): it is registered before the SUBSCRIBE is written, so
+// deliveries of this filter reach it even if the server sends one immediately.
+//
 // A subscription carries a Subscription Identifier, which is a SUBSCRIBE packet
 // property: filters with different identifiers are split into several SUBSCRIBE
 // packets (still in the order of this call), and the returned codes follow the
@@ -47,6 +51,15 @@ func (c *Client) Subscribe(ctx context.Context, subs ...Subscription) ([]byte, e
 		}
 		if s.RetainHandling > 2 {
 			return nil, fmt.Errorf("%w: retain handling %d is reserved", ErrInvalidConfig, s.RetainHandling)
+		}
+	}
+
+	// A subscription that carries a handler registers its route before the SUBSCRIBE
+	// goes out, so a publication the server delivers immediately after the SUBACK
+	// cannot arrive before its handler exists.
+	for _, s := range subs {
+		if s.Handler != nil {
+			c.routes.add(s.Filter, s.Handler)
 		}
 	}
 

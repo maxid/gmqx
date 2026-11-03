@@ -257,6 +257,11 @@ type Subscription struct {
 	// carry different identifiers is split into one SUBSCRIBE packet per
 	// identifier, preserving the order of the filters.
 	SubscriptionIdentifier uint32
+	// Handler receives the publications of this filter. It is registered as a route
+	// when the SUBSCRIBE goes out, which is the convenient form of Client.AddRoute:
+	// nil means "no route", and the publication is then offered to
+	// Config.OnMessage or dropped.
+	Handler MessageHandler
 	// Properties carries the MQTT 5 SUBSCRIBE properties of this filter. Only
 	// UserProperties is used; a packet is built from the first subscription of
 	// each SubscriptionIdentifier group. It is ignored on MQTT 3.1.1.
