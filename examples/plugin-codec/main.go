@@ -21,7 +21,9 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/maxid/gplugin"
@@ -31,48 +33,68 @@ import (
 	"github.com/maxid/gmqx/hook"
 )
 
+const steps = 6
+
 func main() {
 	format := flag.String("format", "json", `input format: "json" (JSON in, binary out) or "csv" (CSV in, JSON out)`)
 	topic := flag.String("topic", "demo/telemetry", "topic the plugin transcodes")
 	timeout := flag.Duration("timeout", 10*time.Second, "overall deadline of the demo")
+
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), `plugin-codec loads a data-protocol plugin into an in-process broker and
+prints what a subscriber actually receives after the plugin transcoded it.
+
+Examples:
+  go run ./examples/plugin-codec
+  go run ./examples/plugin-codec -format csv
+  go run ./examples/plugin-codec -topic demo/telemetry -format json
+
+Flags:
+`)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if *format != "json" && *format != "csv" {
-		log.Fatalf("gmqx-plugin-codec: -format %q is not json or csv", *format)
+		log.Fatalf("plugin-codec: -format %q is not json or csv", *format)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(sigCtx, *timeout)
 	defer cancel()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	broker, err := gmqx.New(gmqx.Config{Addr: "127.0.0.1:0", Logger: logger})
 	if err != nil {
-		log.Fatalf("gmqx-plugin-codec: create broker: %v", err)
+		log.Fatalf("plugin-codec: create broker: %v", err)
 	}
 	if err := broker.Start(ctx); err != nil {
-		log.Fatalf("gmqx-plugin-codec: start broker: %v", err)
+		log.Fatalf("plugin-codec: start broker: %v", err)
 	}
+	// Stop takes the cancelled ctx off the table, so Ctrl-C still closes it.
 	defer func() { _ = broker.Stop(context.Background()) }()
+	fmt.Printf("[1/%d] broker listening on %s\n", steps, broker.Addr())
 
 	// Load the plugin the way a deployment does: add it, then start it. The host is
 	// the broker, and the plugin installs its codecs and its transcoder through it.
 	plugin := &codecPlugin{plan: map[string][2]string{*topic: plan(*format)}}
 	if err := broker.Plugins().Add(plugin); err != nil {
-		log.Fatalf("gmqx-plugin-codec: add plugin: %v", err)
+		log.Fatalf("plugin-codec: add plugin: %v", err)
 	}
 	if err := broker.Plugins().Start(plugin.Name()); err != nil {
-		log.Fatalf("gmqx-plugin-codec: start plugin: %v", err)
+		log.Fatalf("plugin-codec: start plugin: %v", err)
 	}
 	defer func() { _ = broker.Plugins().Stop(plugin.Name()) }()
 
 	for _, status := range mustSnapshot(broker) {
-		fmt.Printf("plugin %s: %s (codecs %v)\n", status.ID, status.State, broker.Codecs().MediaTypes())
+		fmt.Printf("[2/%d] plugin %s is %s (codecs %v)\n", steps, status.ID, status.State, broker.Codecs().MediaTypes())
 	}
 
 	delivered := make(chan []byte, 4)
 	c, err := client.Dial(ctx, client.Config{
 		Addr:       broker.Addr(),
-		ClientID:   "gmqx-plugin-codec",
+		ClientID:   "plugin-codec",
 		Version:    5,
 		KeepAlive:  30 * time.Second,
 		CleanStart: true,
@@ -85,44 +107,53 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("gmqx-plugin-codec: dial: %v", err)
+		log.Fatalf("plugin-codec: dial: %v", err)
 	}
 	defer func() { _ = c.Close() }()
 	if _, err := c.Subscribe(ctx, client.Subscription{Filter: *topic, QoS: 0}); err != nil {
-		log.Fatalf("gmqx-plugin-codec: subscribe: %v", err)
+		log.Fatalf("plugin-codec: subscribe: %v", err)
 	}
+	fmt.Printf("[3/%d] client %q subscribed to %s\n", steps, c.ClientID(), *topic)
 
 	payload, outMediaType := input(*format)
 	if err := c.Publish(ctx, *topic, payload, 0, false); err != nil {
-		log.Fatalf("gmqx-plugin-codec: publish: %v", err)
+		log.Fatalf("plugin-codec: publish: %v", err)
 	}
-	got := receive(delivered, "the transcoded publication")
-	fmt.Printf("published %s: %s\n", *format, payload)
-	fmt.Printf("received as %s: %s\n", outMediaType, got)
+	got, ok := receive(ctx, delivered, "the transcoded publication")
+	if !ok {
+		fmt.Println("[stop] interrupted")
+		return
+	}
+	fmt.Printf("[4/%d] published %s, received as %s: %s\n", steps, *format, outMediaType, got)
 
 	out, ok := broker.Codecs().Lookup(outMediaType)
 	if !ok {
-		log.Fatalf("gmqx-plugin-codec: no codec for %s", outMediaType)
+		log.Fatalf("plugin-codec: no codec for %s", outMediaType)
 	}
 	decoded, err := out.Decode(got)
 	if err != nil {
-		log.Fatalf("gmqx-plugin-codec: decode %s: %v", outMediaType, err)
+		log.Fatalf("plugin-codec: decode %s: %v", outMediaType, err)
 	}
-	fmt.Printf("decoded: %v\n", decoded)
+	fmt.Printf("[5/%d] decoded with the same codec set: %v\n", steps, decoded)
 
 	// Unload: the transcoder and the codecs go away, and the broker is back to
 	// moving opaque bytes.
 	if err := broker.Plugins().Stop(plugin.Name()); err != nil {
-		log.Fatalf("gmqx-plugin-codec: stop plugin: %v", err)
+		log.Fatalf("plugin-codec: stop plugin: %v", err)
 	}
 	if err := c.Publish(ctx, *topic, payload, 0, false); err != nil {
-		log.Fatalf("gmqx-plugin-codec: publish after unload: %v", err)
+		log.Fatalf("plugin-codec: publish after unload: %v", err)
 	}
-	if again := receive(delivered, "the passthrough publication"); !bytes.Equal(again, payload) {
-		log.Fatalf("gmqx-plugin-codec: passthrough payload = %q, want %q", again, payload)
-	} else {
-		fmt.Printf("after unloading the plugin, the payload passes through unchanged: %s\n", again)
+	again, ok := receive(ctx, delivered, "the passthrough publication")
+	if !ok {
+		fmt.Println("[stop] interrupted")
+		return
 	}
+	if !bytes.Equal(again, payload) {
+		log.Fatalf("plugin-codec: passthrough payload = %q, want %q", again, payload)
+	}
+	fmt.Printf("[6/%d] plugin unloaded; the payload passes through unchanged (%d bytes)\n", steps, len(again))
+	fmt.Println("[done] codecs registered, transcoded and removed by an application-side plugin")
 }
 
 // plan maps the input format to the codec pair the transcoder uses.
@@ -144,19 +175,24 @@ func input(format string) ([]byte, string) {
 func mustSnapshot(broker *gmqx.Broker) []gplugin.Status {
 	statuses, err := broker.Plugins().Snapshot()
 	if err != nil {
-		log.Fatalf("gmqx-plugin-codec: snapshot: %v", err)
+		log.Fatalf("plugin-codec: snapshot: %v", err)
 	}
 	return statuses
 }
 
-func receive(ch chan []byte, what string) []byte {
+// receive waits for one delivery. A false result means the demo was interrupted:
+// the caller prints the [stop] line and returns, so the deferred closes still run.
+func receive(ctx context.Context, ch chan []byte, what string) ([]byte, bool) {
 	select {
 	case payload := <-ch:
-		return payload
-	case <-time.After(5 * time.Second):
-		log.Fatalf("gmqx-plugin-codec: timed out waiting for %s", what)
-		return nil
+		return payload, true
+	case <-ctx.Done():
 	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil, false
+	}
+	log.Fatalf("plugin-codec: wait for %s: %v", what, ctx.Err())
+	return nil, false
 }
 
 // codecPlugin is the application-side plugin: it contributes three encodings and one
