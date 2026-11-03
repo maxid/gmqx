@@ -82,15 +82,36 @@ func (c *Client) dialPeer(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.cfg.TLS == nil {
+	tlsCfg := c.tlsConfig()
+	if tlsCfg == nil {
 		return raw, nil
 	}
-	conn := tls.Client(raw, c.cfg.TLS)
+	conn := tls.Client(raw, tlsCfg)
 	if err := conn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}
 	return conn, nil
+}
+
+// tlsConfig is the TLS configuration of one dial. A Config.TLS that names no
+// server gets its ServerName from Addr, the way tls.Dial derives it: a caller
+// that supplied a root pool and nothing else would otherwise be told to set
+// either ServerName or InsecureSkipVerify for a field whose documentation says
+// nothing about it. An explicit ServerName always wins, and the caller's
+// configuration is never mutated — the copy lives for one dial.
+func (c *Client) tlsConfig() *tls.Config {
+	cfg := c.cfg.TLS
+	if cfg == nil || cfg.ServerName != "" {
+		return cfg
+	}
+	host, _, err := net.SplitHostPort(c.cfg.Addr)
+	if err != nil {
+		return cfg
+	}
+	clone := cfg.Clone()
+	clone.ServerName = host
+	return clone
 }
 
 // inboundLimit is the decoder bound of inbound packet bodies: the Maximum Packet

@@ -62,7 +62,10 @@ type Config struct {
 	// or mqtt.Version5.
 	Version byte
 	// TLS, when non-nil, wraps the connection in TLS after Dialer returns and
-	// completes the handshake before CONNECT is written.
+	// completes the handshake before CONNECT is written. A configuration with an
+	// empty ServerName gets one derived from Addr, as tls.Dial does; an explicit
+	// ServerName (and InsecureSkipVerify) is used exactly as given. The
+	// configuration is cloned for each dial, so the client never mutates it.
 	TLS *tls.Config
 	// Dialer opens the transport connection. Nil selects net.Dialer. It is called
 	// for the initial connection and for every reconnect attempt, with a context
