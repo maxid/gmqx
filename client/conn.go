@@ -2,8 +2,10 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -183,6 +185,71 @@ func (c *Client) connectPacket() *mqtt.Connect {
 	return m
 }
 
+// encodeConnect renders the CONNECT frame, in the MQTT 3.1 spelling when the client
+// asked for it.
+func encodeConnect(c *Client) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := mqtt.Encode(&buf, c.connectPacket()); err != nil {
+		return nil, err
+	}
+	if c.cfg.Version != Version31 {
+		return buf.Bytes(), nil
+	}
+	return mqtt31Connect(buf.Bytes())
+}
+
+// mqtt31Connect rewrites a 3.1.1 CONNECT frame as MQTT 3.1: the protocol name
+// "MQTT" (length 4) becomes "MQIsdp" (length 6) and level 4 becomes 3, so the
+// remaining length grows by two. This is the mirror image of the broker's
+// normalizeV31Connect, and the reason the codec never has to model 3.1: the rest of
+// the packet layout is identical.
+func mqtt31Connect(frame []byte) ([]byte, error) {
+	if len(frame) < 2 || frame[0]>>4 != mqtt.TypeConnect {
+		return nil, fmt.Errorf("%w: CONNECT frame is malformed", ErrInvalidConfig)
+	}
+	length, body, err := readConnectLength(frame[1:])
+	if err != nil {
+		return nil, err
+	}
+	if length != len(body) {
+		return nil, fmt.Errorf("%w: remaining length %d does not match the body (%d)", ErrInvalidConfig, length, len(body))
+	}
+	const name = "MQTT"
+	if len(body) < 2+len(name)+1 || binary.BigEndian.Uint16(body) != uint16(len(name)) || string(body[2:2+len(name)]) != name {
+		return nil, fmt.Errorf("%w: CONNECT does not carry the 3.1.1 protocol name", ErrInvalidConfig)
+	}
+	if got := body[2+len(name)]; got != mqtt.Version311 {
+		return nil, fmt.Errorf("%w: CONNECT level is %d, want 4", ErrInvalidConfig, got)
+	}
+
+	out := make([]byte, 0, len(frame)+2)
+	out = append(out, frame[0])
+	// The body grows by two bytes, which can push the remaining length across a
+	// varint boundary (127 -> 129), so it is re-encoded instead of patched.
+	out = mqtt.AppendRemainingLength(out, len(body)+2)
+	out = append(out, 0, byte(len("MQIsdp")))
+	out = append(out, "MQIsdp"...)
+	out = append(out, Version31)
+	return append(out, body[2+len(name)+1:]...), nil
+}
+
+// readConnectLength decodes the remaining length that follows the fixed header and
+// returns it with the body.
+func readConnectLength(b []byte) (int, []byte, error) {
+	value, multiplier := 0, 1
+	for i := 0; i < 4; i++ {
+		if i >= len(b) {
+			return 0, nil, fmt.Errorf("%w: truncated remaining length", ErrInvalidConfig)
+		}
+		value += int(b[i]&0x7f) * multiplier
+		if b[i]&0x80 == 0 {
+			return value, b[i+1:], nil
+		}
+		multiplier *= 128
+	}
+	return 0, nil, fmt.Errorf("%w: malformed remaining length", ErrInvalidConfig)
+}
+
 // establish opens one connection: dial, CONNECT, CONNACK, then the reader and
 // writer goroutines, the resumed state and the OnConnect report. It is the only
 // place a connection is created, for Dial and for every reconnect attempt.
@@ -225,13 +292,17 @@ func (c *Client) establish(ctx context.Context) (*connState, bool, error) {
 	}
 	_ = raw.SetDeadline(deadline)
 
-	if err := mqtt.Encode(raw, c.connectPacket()); err != nil {
+	connect, err := encodeConnect(c)
+	if err != nil {
+		return nil, false, fmt.Errorf("gmqx/client: write CONNECT: %w", err)
+	}
+	if _, err := raw.Write(connect); err != nil {
 		return nil, false, fmt.Errorf("gmqx/client: write CONNECT: %w", err)
 	}
 	// The bufio.Reader may already hold bytes that follow the CONNACK, so it is
 	// kept for the read loop instead of being recreated after the handshake.
 	br := bufio.NewReaderSize(raw, 4096)
-	dec := mqtt.Decoder{Version: c.cfg.Version, MaxPacketSize: c.inboundLimit()}
+	dec := mqtt.Decoder{Version: c.wireVersion(), MaxPacketSize: c.inboundLimit()}
 	msg, err := dec.Decode(br)
 	if err != nil {
 		return nil, false, fmt.Errorf("gmqx/client: read CONNACK: %w", err)

@@ -30,6 +30,14 @@ const (
 )
 
 // Config configures a Client.
+// Version31 is the protocol level of MQTT 3.1 (protocol name "MQIsdp").
+//
+// gnety's wire codec models MQTT 3.1.1 and 5 only, so the client speaks 3.1 by
+// rewriting its CONNECT to the older spelling and decoding every other packet as
+// 3.1.1 — the two versions differ in nothing but the CONNECT header (see
+// mqtt31Connect in conn.go).
+const Version31 byte = 3
+
 type Config struct {
 	// Addr is the server address in "host:port" form. It is passed to Dialer
 	// together with the "tcp" network.
@@ -58,8 +66,8 @@ type Config struct {
 	// the session ends with the connection. It is ignored on MQTT 3.1.1, which
 	// keys session persistence off CleanSession.
 	SessionExpiry uint32
-	// Version is the protocol level to speak: mqtt.Version311 (the zero value)
-	// or mqtt.Version5.
+	// Version is the protocol level to speak: mqtt.Version311 (the zero value),
+	// Version31, or mqtt.Version5.
 	Version byte
 	// TLS, when non-nil, wraps the connection in TLS after Dialer returns and
 	// completes the handshake before CONNECT is written. A configuration with an
@@ -211,7 +219,7 @@ func (c Config) validate() error {
 	if c.Addr == "" {
 		return fmt.Errorf("%w: Addr is required", ErrInvalidConfig)
 	}
-	if c.Version != mqtt.Version311 && c.Version != mqtt.Version5 {
+	if c.Version != Version31 && c.Version != mqtt.Version311 && c.Version != mqtt.Version5 {
 		return fmt.Errorf("%w: protocol version %d is not MQTT 3.1.1 or 5", ErrInvalidConfig, c.Version)
 	}
 	if len(c.Password) > 0 && c.Username == "" {

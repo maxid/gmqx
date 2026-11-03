@@ -9,6 +9,21 @@
 
 ### Added
 
+- **The CI gate covers what local runs covered.** The workflow gained a `-race` job
+  (the broker is a concurrency program), an `integration` job that runs the
+  container-backed matrix with a Docker daemon, and a short fuzz job over the two
+  parsers a peer controls: `FuzzMatch` for topic filters and
+  `FuzzDecodePropertyBlock` for MQTT 5 property blocks.
+
+- **`gmqx/client` speaks MQTT 3.1.** `client.Version31` asks for it; the client writes
+  its CONNECT as `MQIsdp`/3 and talks 3.1.1 for everything else, which is the mirror
+  image of the broker's `normalizeV31Connect` and needs no codec change.
+
+- **`docs/DEPLOYMENT.md`** (and its Chinese version) is the cluster recipe: a
+  three-node seed list, the persistence choice with its locker, the `NotKickSeconds`
+  takeover window, the listener knobs and what a rolling upgrade does and does not
+  keep.
+
 - **A taking node releases the session's route on its peers.** `ClusterSessionReleased`
   (a new cluster event, `session-released`) is broadcast when a node takes a stored
   session, so the node that wrote it drops the offline routing entry it can no longer

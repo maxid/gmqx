@@ -181,6 +181,22 @@ deployment that migrates sessions on purpose (a load balancer draining a node, a
 driver) sets `ConnectMode: gmqx.ConnectModeKick` and `NotKickSeconds: -1`, or accepts
 the refusal and retries.
 
+### Two cluster semantics worth knowing
+
+Both follow from where the state lives, and neither is going to change without a
+new mechanism:
+
+- **A node that dies takes its clients' wills with it.** A will is held in the memory
+  of the connection that owns it, so the node publishing it on a lost connection is
+  the node that was serving that connection. A clean `Stop` publishes the wills whose
+  delay has elapsed and drops the pending ones; a crashed process publishes nothing.
+  Replicating wills to peers would be a feature, not a fix.
+- **`MaxTotalOfflineMessages` is a per-node limit.** `offlineQueued` counts what this
+  process knows about — the sessions it stored plus the ones it loaded — so a
+  deployment with N nodes sharing one store admits up to N times the configured
+  global cap. The per-session `MaxOfflineQueueSize` is exact, because it is part of the
+  record itself.
+
 ### The rule in one sentence
 
 A clustered deployment that wants a session to resume on another node configures

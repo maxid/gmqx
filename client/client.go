@@ -192,7 +192,17 @@ func (c *Client) ServerInfo() ServerInfo {
 
 // header is the protocol level every packet of this client carries.
 func (c *Client) header() mqtt.MessageHeader {
-	return mqtt.MessageHeader{Level: c.cfg.Version}
+	return mqtt.MessageHeader{Level: c.wireVersion()}
+}
+
+// wireVersion is the protocol level the codec speaks. MQTT 3.1 exists only in the
+// CONNECT: every other packet keeps the 3.1.1 layout, so the codec is handed 4 and
+// the CONNECT is rewritten on its way out (see mqtt31Connect).
+func (c *Client) wireVersion() byte {
+	if c.cfg.Version == Version31 {
+		return mqtt.Version311
+	}
+	return c.cfg.Version
 }
 
 // run is the supervisor goroutine: it waits for the active connection to fail,

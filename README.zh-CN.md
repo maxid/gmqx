@@ -8,9 +8,16 @@
 > 可插拔的认证/ACL/事件/指标钩子，连接模式与限制。
 > API 在 v1.0 之前可能变化。
 
+## 部署
+
+集群配方（端口、seeds、持久化选型、抢占窗口）见
+[`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md)。
+
 ## 特性
 
-- TCP、TLS、WebSocket 与 WSS 上的 MQTT 3.1、3.1.1 及基础 MQTT 5
+- TCP、TLS、WebSocket 与 WSS 上的 MQTT 3.1、3.1.1 及基础 MQTT 5；`gmqx/client` 支持 3.1.1、5 以及（2026-11-03 起）3.1
+- 从不发送 MQTT 5 的 Reason String，也不在 CONNACK/DISCONNECT 上带 User Property——客户端的
+  Request Problem Information 因此天然满足
 - 基准与浸泡套件（`go test -bench . ./...`、`GMQX_SOAK=1 go test -timeout 15m -run TestSoak ./internal/engine`）及记录在案的基线
 - 集群 × 持久化矩阵：在真实的 Redis 与 Olric 容器上跑（`go test -tags=integration ./internal/engine`，需要 Docker）
 - `interop/` 互操作矩阵：第三方客户端对接本 broker，本客户端对接参考实现 broker

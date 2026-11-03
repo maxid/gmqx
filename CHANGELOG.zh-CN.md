@@ -8,6 +8,16 @@
 
 ### 新增
 
+- **CI 覆盖到本地跑过的那些闸。** 工作流加了 `-race` 作业（broker 是并发程序）、带 Docker 的
+  `integration` 作业（跑容器矩阵）、以及一个短时 fuzz 作业，跑两个由 peer 控制输入的解析器：
+  `FuzzMatch`（主题过滤）与 `FuzzDecodePropertyBlock`（MQTT 5 属性块）。
+
+- **`gmqx/client` 支持 MQTT 3.1。** 用 `client.Version31` 选择；客户端把 CONNECT 写成
+  `MQIsdp`/3，其余一律按 3.1.1 收发——正是 broker `normalizeV31Connect` 的镜像，不需要改编解码器。
+
+- **新增 `docs/DEPLOYMENT.md`**（中文版同步）：三节点 seed 列表、持久化选型与 locker、
+  `NotKickSeconds` 抢占窗口、监听器旋钮，以及滚动升级保留什么、不保留什么。
+
 - **取走会话的节点会让 peer 释放它的路由。** 一个节点取走已存储的会话时广播
   `ClusterSessionReleased`（新集群事件 `session-released`），于是写过它的节点会删掉自己已经服务不了
   的离线路由项，而不是继续往一个没人读的 key 里排队。接收方先查自己的 store，会话仍在就保留路由，

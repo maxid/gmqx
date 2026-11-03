@@ -8,9 +8,15 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 > pluggable authentication/ACL/event/metrics hooks, connect modes and limits.
 > API may change before v1.0.
 
+## Deployment
+
+A cluster recipe (ports, seeds, persistence choice, takeover window) lives in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 ## Features
 
-- MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
+- MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS; `gmqx/client`
+  speaks 3.1.1, 5 and (since 2026-11-03) 3.1
 - A benchmark and soak harness (`go test -bench . ./...`, `GMQX_SOAK=1 go test -timeout 15m -run TestSoak ./internal/engine`)
   with a recorded baseline, a cluster × persistence matrix that runs against real Redis
   and Olric containers (`go test -tags=integration ./internal/engine`, needs Docker),
@@ -18,6 +24,8 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   third-party client against this broker (TCP, TLS, WS, WSS and mutual TLS) and this
   client against a reference broker (plaintext and TLS)
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
+- No MQTT 5 Reason String or CONNACK/DISCONNECT user property is ever sent, so a
+  client's Request Problem Information is satisfied by construction
 - Persistent sessions (Clean Session / Clean Start, Session Present); the
   subscriptions of a persistent session survive a disconnect and a clean
   connection discards them
