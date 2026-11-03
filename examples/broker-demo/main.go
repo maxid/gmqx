@@ -107,7 +107,18 @@ Flags:
 		Version:    byte(*version),
 		KeepAlive:  30 * time.Second,
 		CleanStart: true,
-		OnMessage: func(m *client.Message) {
+	})
+	if err != nil {
+		log.Fatalf("broker-demo: dial subscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	codes, err := sub.Subscribe(ctx, client.Subscription{
+		Filter: *topic,
+		QoS:    byte(*qos),
+		// The handler travels with the subscription (see examples/client-demo); the
+		// retained replay the broker sends after the SUBACK arrives here.
+		Handler: func(m *client.Message) {
 			// The payload is only valid during the callback, so the demo copies
 			// what it keeps (the whole message is small).
 			copied := *m
@@ -118,12 +129,6 @@ Flags:
 			}
 		},
 	})
-	if err != nil {
-		log.Fatalf("broker-demo: dial subscriber: %v", err)
-	}
-	defer func() { _ = sub.Close() }()
-
-	codes, err := sub.Subscribe(ctx, client.Subscription{Filter: *topic, QoS: byte(*qos)})
 	if err != nil {
 		log.Fatalf("broker-demo: subscribe: %v", err)
 	}

@@ -54,6 +54,7 @@ go run ./examples/broker-demo -addr 127.0.0.1:1883 -qos 0 -version 4
 ```sh
 go run ./examples/client-demo
 go run ./examples/client-demo -topic demo/hello -message "hello" -qos 2 -version 5
+go run ./examples/client-demo -version 3      # MQTT 3.1
 go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello
 ```
 
@@ -67,7 +68,12 @@ go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello
 ```
 
 第 3 步的 granted 是**服务端授予**的 QoS，不是你请求的：`-qos 2` 遇到只授予 1 的服务端会显示
-`granted [1]`。
+`granted [1]`。`-version 3` 用 MQTT 3.1 跑同一趟往返。
+
+handler 是**挂在订阅上**给的（`client.Subscription.Handler`），这就是客户端的分发模型：发布按注册
+过的 filter 匹配，命中的每个都会跑，`Config.OnMessage` 只接"没有任何 filter 认领"的那些。
+`Client.AddRoute` 可以在不订阅的情况下注册同样的东西。这与 paho 一致——映射表见
+[`docs/CLIENT.zh-CN.md`](../docs/CLIENT.zh-CN.md)。
 
 ## cluster-node
 

@@ -50,6 +50,11 @@
 
 ### 变更
 
+- **示例改成教客户端的分发模型。** `client-demo`、`broker-demo`、`plugin-codec` 把 handler 挂在
+  订阅上（`client.Subscription.Handler`），不再用 `Config.OnMessage`——后者现在是"没有路由认领"
+  时的兜底，`Client.AddRoute` 填的是同一张表。`client-demo` 另外支持 `-version 3`，让客户端新加的
+  MQTT 3.1 路径有可运行的例子。
+
 - **会话与保留消息共用一个持久化接缝。** `Config.Store` 是一个
   [`gcache.RemoteStore`](https://github.com/maxid/gcache)，`Config.Locker` 让它成为多节点共享
   的 store；broker 用同一套键方案与带版本的 JSON 编码写入持久会话（订阅、离线队列、QoS 2 状态、

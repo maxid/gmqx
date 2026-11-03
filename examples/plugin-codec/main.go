@@ -98,19 +98,20 @@ Flags:
 		Version:    5,
 		KeepAlive:  30 * time.Second,
 		CleanStart: true,
-		OnMessage: func(m *client.Message) {
-			// The payload is only valid during the callback; the demo copies it.
-			select {
-			case delivered <- append([]byte(nil), m.Payload...):
-			default:
-			}
-		},
 	})
 	if err != nil {
 		log.Fatalf("plugin-codec: dial: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	if _, err := c.Subscribe(ctx, client.Subscription{Filter: *topic, QoS: 0}); err != nil {
+	// The handler is bound to the filter: every publication of this topic that the
+	// plugin transcodes arrives here, and no fallback handler is needed.
+	if _, err := c.Subscribe(ctx, client.Subscription{Filter: *topic, QoS: 0, Handler: func(m *client.Message) {
+		// The payload is only valid during the callback; the demo copies it.
+		select {
+		case delivered <- append([]byte(nil), m.Payload...):
+		default:
+		}
+	}}); err != nil {
 		log.Fatalf("plugin-codec: subscribe: %v", err)
 	}
 	fmt.Printf("[3/%d] client %q subscribed to %s\n", steps, c.ClientID(), *topic)

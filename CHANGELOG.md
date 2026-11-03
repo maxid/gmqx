@@ -79,6 +79,20 @@
 
 ### Changed
 
+- **The examples teach the client's dispatch model.** `client-demo`, `broker-demo`
+  and `plugin-codec` pass their handler on the subscription
+  (`client.Subscription.Handler`) instead of `Config.OnMessage`, which is now the
+  fallback for publications no route claimed — the same table `Client.AddRoute`
+  fills. `client-demo` also takes `-version 3`, so the MQTT 3.1 path the client
+  gained has a runnable example.
+
+- **The examples teach the client's dispatch model.** `client-demo`, `broker-demo`
+  and `plugin-codec` pass their handler on the subscription
+  (`client.Subscription.Handler`) instead of `Config.OnMessage`, which is now the
+  fallback for publications no route claimed — the same table `Client.AddRoute`
+  fills. `client-demo` also takes `-version 3`, so the MQTT 3.1 path the client
+  gained has a runnable example.
+
 - **One persistence seam for sessions and retained messages.** `Config.Store` is a
   [`gcache.RemoteStore`](https://github.com/maxid/gcache) and `Config.Locker` makes it
   a store several nodes write; the broker writes a persistent session (subscriptions,

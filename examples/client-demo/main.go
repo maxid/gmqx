@@ -29,7 +29,7 @@ func main() {
 	topic := flag.String("topic", "demo/hello", "topic to subscribe to and publish on")
 	message := flag.String("message", "hello from the gmqx MQTT client", "message body to publish")
 	qos := flag.Int("qos", 1, "QoS of the subscription and the publish (0, 1 or 2)")
-	version := flag.Int("version", 4, "MQTT protocol level: 4 (3.1.1) or 5")
+	version := flag.Int("version", 4, "MQTT protocol level: 3 (3.1), 4 (3.1.1) or 5")
 	timeout := flag.Duration("timeout", 10*time.Second, "overall deadline of the demo")
 
 	flag.Usage = func() {
@@ -39,6 +39,7 @@ github.com/maxid/gmqx/client.
 Examples:
   go run ./examples/client-demo
   go run ./examples/client-demo -topic demo/hello -message "hello" -qos 2 -version 5
+  go run ./examples/client-demo -version 3        # MQTT 3.1
   go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello
 
 Flags:
@@ -50,8 +51,8 @@ Flags:
 	if *qos < 0 || *qos > 2 {
 		log.Fatalf("client-demo: -qos %d is not 0, 1 or 2", *qos)
 	}
-	if *version != 4 && *version != 5 {
-		log.Fatalf("client-demo: -version %d is not 4 or 5", *version)
+	if *version != 3 && *version != 4 && *version != 5 {
+		log.Fatalf("client-demo: -version %d is not 3, 4 or 5", *version)
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -85,7 +86,20 @@ Flags:
 		Version:    byte(*version),
 		KeepAlive:  30 * time.Second,
 		CleanStart: true,
-		OnMessage: func(m *client.Message) {
+	})
+	if err != nil {
+		log.Fatalf("client-demo: dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	fmt.Printf("[2/%d] connected as %q (MQTT level %d)\n", steps, c.ClientID(), *version)
+
+	// The handler is bound to the filter, the way paho binds one: a publication that
+	// matches it is delivered here, and OnMessage (which this demo leaves unset) is
+	// only the fallback for whatever no route claims.
+	codes, err := c.Subscribe(ctx, client.Subscription{
+		Filter: *topic,
+		QoS:    byte(*qos),
+		Handler: func(m *client.Message) {
 			// The payload is only valid during the callback, so the demo copies
 			// what it keeps (the whole message is small).
 			copied := *m
@@ -96,13 +110,6 @@ Flags:
 			}
 		},
 	})
-	if err != nil {
-		log.Fatalf("client-demo: dial: %v", err)
-	}
-	defer func() { _ = c.Close() }()
-	fmt.Printf("[2/%d] connected as %q (MQTT level %d)\n", steps, c.ClientID(), *version)
-
-	codes, err := c.Subscribe(ctx, client.Subscription{Filter: *topic, QoS: byte(*qos)})
 	if err != nil {
 		log.Fatalf("client-demo: subscribe: %v", err)
 	}

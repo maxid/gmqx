@@ -60,6 +60,7 @@ round trip and prints the delivery.
 ```sh
 go run ./examples/client-demo
 go run ./examples/client-demo -topic demo/hello -message "hello" -qos 2 -version 5
+go run ./examples/client-demo -version 3      # MQTT 3.1
 go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello
 ```
 
@@ -74,6 +75,13 @@ go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello
 
 The granted QoS in step 3 is the server's answer, not the requested one: subscribe
 with `-qos 2` and a server that only grants 1 shows up as `granted [1]`.
+`-version 3` runs the same round trip over MQTT 3.1.
+
+The handler is passed **on the subscription** (`client.Subscription.Handler`), which
+is the client's dispatch model: a publication is matched against the registered
+filters, every matching one runs, and `Config.OnMessage` only answers what no filter
+claimed. `Client.AddRoute` registers the same thing without a subscription. This is
+the paho model — [`docs/CLIENT.md`](../docs/CLIENT.md) has the mapping table.
 
 ## cluster-node
 
