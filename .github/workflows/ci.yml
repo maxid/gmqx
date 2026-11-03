@@ -8,6 +8,7 @@ permissions:
   contents: read
 
 jobs:
+  # The gate every change must pass: the ordinary suite on every platform, plus vet.
   test:
     strategy:
       matrix:
@@ -23,3 +24,46 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
+
+  # The broker is a concurrency program: the race detector is where a session, kick
+  # or cluster bug shows up first. Ubuntu only — one platform runs the detector
+  # meaningfully, and three would triple the slowest job in the matrix.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - name: Test with the race detector
+        run: go test -race ./...
+
+  # The cluster × persistence matrix starts real Redis and Olric containers
+  # (testcontainers), so it needs a Docker daemon — the one thing the default `go
+  # test ./...` must never require. It is a release gate, not a per-package gate, so
+  # it runs here once instead of on every platform.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - name: Container-backed matrix
+        run: go test -tags=integration -timeout 20m ./...
+
+  # A short fuzz run over the two parsers a peer controls: topic filters and MQTT 5
+  # property blocks. Ten seconds each catches the cheap crashes (index out of range,
+  # unbounded allocation) without turning CI into a fuzzing farm; a longer run is a
+  # local or nightly job.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - name: Fuzz topic matching
+        run: go test ./internal/topic -run '^$' -fuzz FuzzMatch -fuzztime 10s
+      - name: Fuzz MQTT 5 property blocks
+        run: go test ./internal/mqtt5 -run '^$' -fuzz FuzzDecodePropertyBlock -fuzztime 10s
