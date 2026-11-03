@@ -801,8 +801,7 @@ in-process store is.
 
 The key scheme and the encoding are documented in full in
 [`docs/PERSISTENCE.md`](docs/PERSISTENCE.md), together with the backend matrix
-(`memory` / `redis` / `olric`, the last one currently without enumeration) and the
-sizing worksheet.
+(`memory` / `redis` / `olric`) and the sizing worksheet.
 
 **Expiry.** MQTT 5's Session Expiry Interval is a deadline:
 `ConnectInfo.SessionExpiry` is stamped on disconnect as `now + interval`, and a

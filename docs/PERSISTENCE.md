@@ -123,7 +123,7 @@ the backend's TTL removes them even if nobody subscribes.
 |---|---|---|---|---|
 | `gcache/memory` (default) | no | no | no | Zero configuration; the same behavior as the in-memory broker. |
 | `gcache/redis` | yes | yes | yes (`Scanner`) | One Redis for the deployment; keys under `Config.KeyPrefix`. Use `Config.Locker` for multi-node takes. |
-| `gcache/olric` | yes | yes | **no** (no `Scanner` yet) | Reads/writes and TTL work; without enumeration a restarted node cannot index sessions or retained messages stored by peers. Fine for a single long-lived node, not for shared-cluster semantics until gcache implements `Scan`. |
+| `gcache/olric` | yes | yes | yes (`Scanner`) | Reads/writes, TTL and enumeration work; a DMap walk visits every partition and filters each key with a regexp, so the start-up load is one pass over the whole map. `Config.Locker` is yours to supply — gcache ships the Olric store, not a locker. |
 | Your own `gcache.RemoteStore` | as you make it | as you make it | if you implement `Scanner` | Anything that satisfies the port works; a SQL table, a file, another cache. |
 
 Two brokers in one process each get the store they are given — there is no global

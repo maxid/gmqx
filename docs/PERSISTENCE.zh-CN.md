@@ -96,7 +96,7 @@ broker 在内存里保存保留消息并写穿透到 store。SUBSCRIBE 扫描热
 |---|---|---|---|---|
 | `gcache/memory`（默认） | 否 | 否 | 否 | 零配置；与内存 broker 行为一致。 |
 | `gcache/redis` | 是 | 是 | 是（`Scanner`） | 一套 Redis；键在 `Config.KeyPrefix` 下。多节点取走要配 `Config.Locker`。 |
-| `gcache/olric` | 是 | 是 | **否**（尚无 `Scanner`） | 读写与 TTL 可用；没有枚举时，重启的节点无法索引 peer 存下的会话与保留消息。单节点长期运行可以，共享集群语义要等 gcache 实现 `Scan`。 |
+| `gcache/olric` | 是 | 是 | 是（`Scanner`） | 读写、TTL 与枚举都可用；DMap 遍历要走遍每个分区并用正则过滤每个 key，启动载入是一次全表遍历。`Config.Locker` 需要你自己提供——gcache 只发布 Olric 的 store，不发布 locker。 |
 | 自实现的 `gcache.RemoteStore` | 取决于你 | 取决于你 | 实现 `Scanner` 即可 | 满足端口的任何实现（SQL 表、文件、别的缓存）。 |
 
 同进程的两个 broker 各拿各的 store——没有全局实例。与别的应用同进程嵌入 gmqx（或跑两个隔离域不同

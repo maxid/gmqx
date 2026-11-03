@@ -604,7 +604,7 @@ broker, _ := gmqx.New(gmqx.Config{
 是 load-then-delete，store 为单写者——默认的进程内 store 正是这种。
 
 键方案与编码的完整说明见 [`docs/PERSISTENCE.zh-CN.md`](docs/PERSISTENCE.zh-CN.md)，其中包括后端
-对照表（`memory`/`redis`/`olric`，最后一个当前不支持枚举）与 `docs/PERSISTENCE.zh-CN.md`。
+对照表（`memory`/`redis`/`olric`）与容量估算表。
 
 **过期。** MQTT 5 的 Session Expiry Interval 是一个截止时间：断连时把
 `ConnectInfo.SessionExpiry` 记为 `now + interval`，有界清扫器（`SessionSweepInterval`，
