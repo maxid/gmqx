@@ -74,6 +74,11 @@ type Client struct {
 	conn   net.Conn
 	connID ConnectionID
 	r      *bufio.Reader
+	// transport is the listener that accepted this connection: "tcp", "tls",
+	// "ws" or "wss" ("" when the connection was not accepted by a broker
+	// listener). Written by SetTransport before the handshake, read only when a
+	// hook.ConnInfo is built, so it needs no lock.
+	transport string
 	// wmu serializes every write on the socket: the writer goroutine, the
 	// synchronous handshake writes and the final server DISCONNECT.
 	wmu sync.Mutex
@@ -293,6 +298,7 @@ func (c *Client) connInfo(info hook.ConnectInfo) hook.ConnInfo {
 		Namespace:       c.namespace,
 		RemoteAddr:      info.RemoteAddr,
 		ProtocolVersion: c.version,
+		Transport:       c.transport,
 	}
 }
 
@@ -914,6 +920,14 @@ func connectInfo(m *mqtt.Connect) hook.ConnectInfo {
 	}
 	return info
 }
+
+// SetTransport names the listener that accepted this connection, for
+// hook.ConnInfo.Transport ("tcp", "tls", "ws" or "wss", the names Addrs()
+// reports). It applies to the hook contexts created from now on, so it is called
+// right after New and before Handshake, which is where the connection-scoped
+// context is first built. Leaving it unset is valid: an embedder that produced
+// the connection itself reports an empty transport.
+func (c *Client) SetTransport(transport string) { c.transport = transport }
 
 // Handshake runs the CONNECT exchange up to the point the connection is ready to
 // serve: it reads and validates the CONNECT, authenticates, registers the session

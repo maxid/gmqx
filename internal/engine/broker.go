@@ -490,7 +490,10 @@ func (b *Broker) bindListener(ctx context.Context, spec listenerSpec) (*gnety.Se
 			AllowAnyOrigin: spec.allowAnyOrigin,
 			TLS:            spec.tls,
 			MaxFrameSize:   spec.maxFrameSize,
-			RawHandler:     b.handleRaw,
+			// The listener's own name travels with the connection: it is what
+			// hook.ConnInfo.Transport reports, and the only place that knows it is
+			// the spec this server was started for.
+			RawHandler: func(netConn net.Conn) { b.handleRaw(spec.name, netConn) },
 		})
 		if err == nil {
 			err = srv.Start(ctx)
@@ -579,7 +582,7 @@ func fallbackAddrs(addr string, extra int) []string {
 	return addrs
 }
 
-func (b *Broker) handleRaw(conn net.Conn) {
+func (b *Broker) handleRaw(transport string, conn net.Conn) {
 	if b.limiter != nil && !b.limiter.allow() {
 		b.metrics().RecordDroppedMessage("connection_rate_limit")
 		_ = conn.Close()
@@ -596,7 +599,7 @@ func (b *Broker) handleRaw(conn net.Conn) {
 			return
 		}
 	}
-	b.serve(conn)
+	b.serve(transport, conn)
 }
 
 func addrOrPort(addr string, port int) string {
@@ -742,12 +745,13 @@ func (b *Broker) Stop(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-func (b *Broker) serve(netConn net.Conn) {
+func (b *Broker) serve(transport string, netConn net.Conn) {
 	// Byte-rate shaping is applied by the transport wrapper, so every byte read
 	// from or written to this connection — the CONNECT phase, the packet codec
 	// and the shutdown DISCONNECT alike — passes one bucket (see byte_rate.go).
 	netConn = b.shapeConn(netConn)
 	c := conn.New(b, netConn)
+	c.SetTransport(transport)
 	// A safety net: close cancels the context as soon as the connection is gone,
 	// this covers a connection that failed before close was reached.
 	defer c.StopContext()

@@ -29,6 +29,12 @@ type ConnInfo struct {
 	// ProtocolVersion is the negotiated protocol level: mqtt.Version311 (4) or
 	// mqtt.Version5 (5). MQTT 3.1 clients use the 3.1.1 layout and report 4.
 	ProtocolVersion byte
+	// Transport is the listener that accepted the connection: "tcp", "tls", "ws"
+	// or "wss" — the names Addrs() reports. A hook can therefore tell a device on
+	// the TLS port from one on the WebSocket port without inspecting the broker's
+	// configuration. It is empty when the connection was not accepted by a broker
+	// listener (an embedder that handed one over itself).
+	Transport string
 }
 
 type connInfoKey struct{}

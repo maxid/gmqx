@@ -44,7 +44,7 @@ func pipeClient(t *testing.T, b *Broker, cc confConnect) *confClient {
 	t.Helper()
 	server, peer := net.Pipe()
 	t.Cleanup(func() { _ = server.Close() })
-	go b.serve(server)
+	go b.serve("tcp", server)
 	c := newConfClient(t, peer, cc.version, cc.clientID)
 	c.sendConnect(cc)
 	if ack := readConf[*mqtt.Connack](t, c); ack.ReasonCode != 0 {
