@@ -17,6 +17,7 @@ package interop
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -42,9 +43,13 @@ const (
 	// containerPrefix names every container this suite creates, so a leftover is
 	// recognizable and a human can find it with docker ps -a.
 	containerPrefix = "gmqx-interop-"
-	// containerPort is the listener inside the container; the host port is
-	// picked fresh per run.
+	// containerPort is the plaintext listener inside the container; the host port
+	// is picked fresh per run.
 	containerPort = "1883"
+	// containerTLSPort is the TLS listener inside the container. The certificate
+	// files are written next to the config and the whole directory is mounted, so
+	// mosquitto reads them from /mosquitto/config.
+	containerTLSPort = "8883"
 	// hostAlias is how a container reaches services on the host. Docker Desktop
 	// resolves it by itself; the explicit host-gateway entry makes the same name
 	// work against a Linux daemon (see the docker run call).
@@ -65,21 +70,31 @@ const (
 	// referenceClientTimeout bounds one docker exec of a reference client.
 	referenceClientTimeout = 30 * time.Second
 
-	// mosquittoConfig is the configuration of the reference broker: one plain
-	// listener that accepts anonymous clients (mosquitto 2.x refuses anonymous
-	// access unless it is enabled), no persistence.
+	// mosquittoConfig is the configuration of the reference broker: a plaintext
+	// listener and a TLS listener, both accepting anonymous clients (mosquitto 2.x
+	// refuses anonymous access unless it is enabled), no persistence. The
+	// certificate files resolve inside the mounted config directory.
 	mosquittoConfig = `listener 1883 0.0.0.0
 allow_anonymous true
 persistence false
 log_dest stdout
+
+listener 8883 0.0.0.0
+certfile /mosquitto/config/server.pem
+keyfile /mosquitto/config/server.key
+allow_anonymous true
 `
 )
 
 // referenceBroker is a running eclipse-mosquitto container.
 type referenceBroker struct {
 	name string
-	// addr is the mapped listener as the host sees it: 127.0.0.1:<port>.
+	// addr is the mapped plaintext listener as the host sees it: 127.0.0.1:<port>.
 	addr string
+	// tlsAddr is the mapped TLS listener as the host sees it, and caFile is the
+	// CA its certificate chains to.
+	tlsAddr string
+	caFile  string
 }
 
 // startMosquitto starts the reference broker and registers its removal.
@@ -88,15 +103,26 @@ func startMosquitto(t *testing.T) *referenceBroker {
 	requireDocker(t)
 	ensureImage(t, mosquittoImage)
 
+	ca := newInteropCA(t)
+	serverCert, serverKey, _ := ca.issue(t, "server", 2, []net.IP{net.ParseIP("127.0.0.1")}, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "mosquitto.conf")
 	if err := os.WriteFile(configPath, []byte(mosquittoConfig), 0o644); err != nil {
 		t.Fatalf("write the mosquitto config: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "server.pem"), readFile(t, serverCert), 0o644); err != nil {
+		t.Fatalf("write the reference broker certificate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.key"), readFile(t, serverKey), 0o600); err != nil {
+		t.Fatalf("write the reference broker key: %v", err)
+	}
 
 	name := fmt.Sprintf("%s%d-%08x", containerPrefix, os.Getpid(), rand.Uint32())
 	port := freePort(t)
+	tlsPort := freePort(t)
 	addr := net.JoinHostPort("127.0.0.1", port)
+	tlsAddr := net.JoinHostPort("127.0.0.1", tlsPort)
 
 	t.Cleanup(func() { removeContainer(t, name) })
 
@@ -104,7 +130,8 @@ func startMosquitto(t *testing.T) *referenceBroker {
 		"--name", name,
 		"--add-host", hostAlias+":host-gateway",
 		"-p", addr+":"+containerPort,
-		"-v", configPath+":/mosquitto/config/mosquitto.conf:ro",
+		"-p", tlsAddr+":"+containerTLSPort,
+		"-v", dir+":/mosquitto/config:ro",
 		mosquittoImage)
 	if err != nil {
 		t.Skipf("the reference broker container could not be started: %v", err)
@@ -113,7 +140,22 @@ func startMosquitto(t *testing.T) *referenceBroker {
 
 	waitDial(t, name, addr, containerReadyTimeout)
 	waitMQTT(t, name, addr, containerReadyTimeout)
-	return &referenceBroker{name: name, addr: addr}
+	// The TLS listener needs the same readiness signal: a container that lost its
+	// certificate fails here instead of in the first TLS case.
+	waitDial(t, name, tlsAddr, containerReadyTimeout)
+	return &referenceBroker{name: name, addr: addr, tlsAddr: tlsAddr, caFile: ca.file}
+}
+
+// readFile returns the bytes of file. The certificate files are written from the
+// PEM the CA helper produced, so a case reads them back rather than keeping a second
+// copy around.
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
 }
 
 // execReference runs one of the clients bundled in the image inside the
