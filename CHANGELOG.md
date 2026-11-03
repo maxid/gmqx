@@ -1,10 +1,9 @@
 # Changelog
 
 > Development snapshots are untagged. Entries are grouped by the date the change
-> landed, newest first, and a release cut that day appears under its version number
-> inside the date. An entry that is not under a version heading is part of the
-> unreleased snapshot. A date records the final state of that day's work: superseded
-> steps fold into the entry that says where things ended up, not one entry per step.
+> landed, newest first, and each date records the final state of that day's work:
+> superseded steps fold into the entry that says where things ended up, not one entry
+> per step.
 
 ## 2026-11-03
 
@@ -1029,56 +1028,33 @@
 
 ### Added
 
-- Cluster interface (`Cluster`/`ClusterMessage`) and broker hooks for cross-node
-  publish and kick; in-memory two-node test.
+- **A single-node MQTT 3.1.1 broker.** A TCP listener,
+  CONNECT/SUBSCRIBE/PUBLISH/PING/DISCONNECT, QoS 0/1/2, retained messages, wildcard
+  subscriptions, will and keepalive.
 
-### 0.6.0-dev.1
+- **Extension SPIs and connection governance.** `AuthManager`, `AclManager`,
+  `EventSink`, `MetricsManager` and `Interceptor` are the seams; `ConnectMode`
+  (`UNIQUE`/`KICK`, both covered by tests), the connection/subscription/retained
+  limits and the connection rate limit are the bounds; metrics counters and the
+  lifecycle callbacks (connect/disconnect/lost/ping) report them.
 
-- Transport migrated to gnety (`RawHandler`) for TCP/TLS/WS/WSS; MQTT codec and
-  broker state machine remain in gmqx.
+- **Four listeners: TCP, TLS (server certificate, optional client certificate),
+  WebSocket and WSS.** The WebSocket listener validates the `mqtt` subprotocol and
+  takes its path from `Config.WebsocketPath`, `Addrs()` reports each listener's
+  resolved address, and TLS/WebSocket integration tests cover the transports.
 
-- Transport migration: TCP/TLS/WebSocket/WSS listeners now come from the gnety
-  transport framework (RawHandler); MQTT codec and broker state machine stay in gmqx.
+- **MQTT 5.** CONNECT with properties, the v5 CONNACK/SUBACK/UNSUBACK formats, the
+  PUBLISH property block (topic alias inbound and per-session, plus forwarded user
+  properties, content type, response topic and correlation data), CONNACK capability
+  properties, the subscription options (no-local, retain-as-published,
+  retain-handling) and the negative ACK reason codes (Not authorized, Quota exceeded,
+  Client Identifier not valid), with tests for v5 connect/pub-sub/auth.
 
-### 0.5.0
+- **The cluster seam.** `Cluster`/`ClusterMessage` and the broker hooks that publish
+  and kick across nodes, with an in-memory two-node test.
 
-- MQTT 5 CONNACK capability properties (retain/wildcard/subscription-id/shared/max-qos/max-packet/topic-alias).
-- Topic Alias handling (inbound and per-session resolution).
-- Publish property forwarding (User Property, content type, response topic, correlation data).
-- Subscription options: no-local, retain-as-published, retain-handling.
-- Tests for v5 CONNACK properties, topic alias and user property forwarding.
+### Changed
 
-### 0.4.0
-
-- Basic MQTT 5 support: CONNECT with properties (skipped), v5 CONNACK/SUBACK/UNSUBACK formats,
-  v5 PUBLISH property block, v5 negative ACK reason codes (Not authorized, Quota exceeded,
-  Client Identifier not valid), tests for v5 connect/pub-sub/auth.
-
-### 0.3.0
-
-- Multi-listener support: TCP, TLS (server cert/optional client cert), WebSocket and WSS.
-- WebSocket subprotocol validation and path configuration.
-- TLS/WS integration tests; listener address accessors.
-
-### 0.2.3
-
-- Documentation cleanup: the library README/docs are product-neutral and self-contained.
-
-### 0.2.2
-
-- Bump version constant; include connect mode tests.
-
-### 0.2.1
-
-- Add tests for UNIQUE/KICK connect modes.
-
-### 0.2.0
-
-- Broker SPIs: AuthManager, AclManager, EventSink, MetricsManager, Interceptor.
-- ConnectMode UNIQUE/KICK, connection/subscription/retained limits, connection rate limiting.
-- Metrics counters and lifecycle callbacks (connect/disconnect/lost/ping).
-
-### 0.1.0
-
-- Initial single-node MQTT 3.1.1 broker: TCP listener, CONNECT/SUBSCRIBE/PUBLISH/PING/DISCONNECT,
-  QoS 0/1/2 basic flows, retained messages, wildcard subscriptions, will and keepalive.
+- The library README/docs are product-neutral and self-contained.
+- **Transports come from gnety.** The TCP/TLS/WS/WSS listeners are gnety's
+  `RawHandler`; the MQTT codec and the broker state machine stay in gmqx.

@@ -2,7 +2,7 @@
 
 # 变更日志
 
-> 开发快照不打 tag。条目按变更落地日期分组（新到旧），当日发布的版本作为该日期节内的版本号子标题；没有挂在版本号下的条目属于未发布快照。每个日期只记当天**最终状态**：被后续步骤取代的中间步骤并入描述最终形态的那一条，不按步骤各记一条。本文为中文摘要版，逐条技术细节以英文版为准。
+> 开发快照不打 tag。条目按变更落地日期分组（新到旧），每个日期只记当天**最终状态**：被后续步骤取代的中间步骤并入描述最终形态的那一条，不按步骤各记一条。本文为中文摘要版，逐条技术细节以英文版为准。
 
 ## 2026-11-03
 
@@ -91,46 +91,29 @@
 
 ## 2026-10-29
 
-### 0.6.0-dev.1
+### 新增
 
-- Transport 迁移到 gnety（`RawHandler`）：TCP/TLS/WS/WSS listener 由 gnety 提供，MQTT codec 与 broker 状态机仍在 gmqx。
+- **单节点 MQTT 3.1.1 broker。** TCP listener、CONNECT/SUBSCRIBE/PUBLISH/PING/DISCONNECT、
+  QoS 0/1/2、retained、wildcard 订阅、will 与 keepalive。
 
-### 0.5.0
+- **扩展 SPI 与连接治理。** `AuthManager`、`AclManager`、`EventSink`、`MetricsManager`、
+  `Interceptor` 是扩展缝；`ConnectMode`（`UNIQUE`/`KICK`，两者都有测试）、连接/订阅/retained
+  限额与连接速率限制是边界；metrics counter 与生命周期回调（connect/disconnect/lost/ping）负责上报。
 
-- MQTT 5 CONNACK capability 属性（retain/wildcard/subscription-id/shared/max-qos/max-packet/topic-alias）。
-- Topic Alias（入站与 per-session 解析）。
-- Publish 属性转发（User Property、content type、response topic、correlation data）。
-- Subscription options：no-local、retain-as-published、retain-handling。
-- v5 CONNACK 属性、topic alias、user property 转发测试。
+- **四个监听器：TCP、TLS（服务端证书，可选客户端证书）、WebSocket、WSS。** WebSocket 监听器校验
+  `mqtt` 子协议、path 取自 `Config.WebsocketPath`，`Addrs()` 报告每个监听器真正绑定的地址，
+  TLS/WebSocket 集成测试覆盖这些传输。
 
-### 0.4.0
+- **MQTT 5。** 带 properties 的 CONNECT、v5 CONNACK/SUBACK/UNSUBACK 格式、PUBLISH property block
+  （入站与 per-session 的 topic alias，外加转发 User Property、content type、response topic、
+  correlation data）、CONNACK capability 属性、订阅选项（no-local、retain-as-published、
+  retain-handling）与负向 ACK reason code（Not authorized、Quota exceeded、Client Identifier not
+  valid），并有 v5 connect/pub-sub/auth 测试。
 
-- 基础 MQTT 5：带 properties 的 CONNECT（跳过）、v5 CONNACK/SUBACK/UNSUBACK 格式、v5 PUBLISH property block、v5 负向 ACK reason code（Not authorized、Quota exceeded、Client Identifier not valid），以及 v5 connect/pub-sub/auth 测试。
+- **集群缝。** `Cluster`/`ClusterMessage` 与跨节点 publish/kick 的 broker hook，配一个内存双节点测试。
 
-### 0.3.0
+### 变更
 
-- 多 listener：TCP、TLS（server cert/可选 client cert）、WebSocket、WSS。
-- WebSocket subprotocol 校验与 path 配置。
-- TLS/WS 集成测试与 listener address 访问器。
-
-### 0.2.3
-
-- 文档清理：README/docs 产品中性、自包含。
-
-### 0.2.2
-
-- 升版本常量；补 connect mode 测试。
-
-### 0.2.1
-
-- 补 UNIQUE/KICK connect mode 测试。
-
-### 0.2.0
-
-- Broker SPI：AuthManager、AclManager、EventSink、MetricsManager、Interceptor。
-- ConnectMode UNIQUE/KICK、连接/订阅/retained 限额、连接速率限制。
-- Metrics counter 与生命周期回调（connect/disconnect/lost/ping）。
-
-### 0.1.0
-
-- 初始单节点 MQTT 3.1.1 broker：TCP listener、CONNECT/SUBSCRIBE/PUBLISH/PING/DISCONNECT、QoS 0/1/2 基础流程、retained、wildcard 订阅、will 与 keepalive。
+- README/docs 产品中性、自包含。
+- **传输来自 gnety。** TCP/TLS/WS/WSS 监听器是 gnety 的 `RawHandler`；MQTT codec 与 broker 状态机
+  仍留在 gmqx。
