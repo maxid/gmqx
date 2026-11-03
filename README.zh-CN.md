@@ -212,13 +212,15 @@ broker, _ := gmqx.New(gmqx.Config{
 的 `main` 包，各自回答一个问题：
 
 ```sh
- go run ./examples/broker-demo    # 嵌入 broker，看到保留消息被重放
- go run ./examples/client-demo    # 用这个 client 跑一次发布/订阅往返
- go run ./examples/plugin-codec   # 应用侧插件注册 codec 并转码
- go run ./examples/cluster-node -h  # 加入集群的节点（长期运行）
+ go run ./examples/broker-demo           # 嵌入 broker，看到保留消息被重放
+ go run ./examples/broker-demo -serve    # 把 broker 挂着给 MQTTX 等真实客户端连
+ go run ./examples/client-demo           # 用这个 client 跑一次发布/订阅往返
+ go run ./examples/plugin-codec          # 应用侧插件注册 codec 并转码
+ go run ./examples/cluster-node -h       # 加入集群的节点（长期运行）
 ```
 
-每个都支持 `-h`（给出可复制的命令）、都能用 Ctrl-C 停止，每步打印一行 `[n/N]`。
+每个都支持 `-h`（给出可复制的命令）、都能用 Ctrl-C 停止；脚本演示每步打印一行 `[n/N]`，
+`broker-demo -serve` 与 `cluster-node` 则一直运行到你停为止。
 [示例 README](examples/README.zh-CN.md) 逐个说明回答什么问题、怎么跑、应该看到什么。
 
 ## 配置（部分）

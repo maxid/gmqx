@@ -8,6 +8,12 @@
 
 ### 新增
 
+- **`broker-demo -serve`：把 broker 挂着给真正的 MQTT 客户端连。** 演示跑完脚本就退出，
+  MQTTX 没有可连的进程。`-serve` 跳过演示，直接在 `127.0.0.1:1883` 上提供一个空的嵌入
+  broker（端口被占用时用 `gnety.AvailablePortOn` 顺延到下一个空闲端口并打印出来），
+  Ctrl-C 才停；每个被接受的连接照旧得到 `<topic>_reply` 上的 retained 问候。脚本演示
+  路径不变。
+
 - **`Broker.PublishMessage`：宿主自己注入一条发布。** 嵌入方原先没有办法发一条"不是客户端发来的"
   消息——连接问候、告警、来自其它子系统的命令。它走正常的接受路径：retained 发布在路由前先入库
   （并写透持久化），`Config.Dispatcher` 决定活副本去哪，因此集群会像对待任何发布一样扩散它。它不跑

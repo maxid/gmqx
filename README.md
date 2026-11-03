@@ -302,14 +302,16 @@ broker, _ := gmqx.New(gmqx.Config{
 self-contained `main` package that answers one question:
 
 ```sh
- go run ./examples/broker-demo    # embed a broker; a retained message is replayed
- go run ./examples/client-demo    # one publish/subscribe round trip with this client
- go run ./examples/plugin-codec   # an application-side plugin registers codecs
- go run ./examples/cluster-node -h  # a node that joins a cluster (long-running)
+ go run ./examples/broker-demo           # embed a broker; a retained message is replayed
+ go run ./examples/broker-demo -serve    # keep it running for MQTTX and other real clients
+ go run ./examples/client-demo           # one publish/subscribe round trip with this client
+ go run ./examples/plugin-codec          # an application-side plugin registers codecs
+ go run ./examples/cluster-node -h       # a node that joins a cluster (long-running)
 ```
 
-Each takes `-h` with commands you can copy, stops on Ctrl-C, and prints one
-`[n/N]` line per step. The [examples README](examples/README.md) lists, for every
+Each takes `-h` with commands you can copy and stops on Ctrl-C. The scripted demos
+print one `[n/N]` line per step; `broker-demo -serve` and `cluster-node` stay up
+until you stop them. The [examples README](examples/README.md) lists, for every
 demo, what it answers, how to run it and what it should print.
 
 ## Configuration (selected)

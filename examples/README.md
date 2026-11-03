@@ -6,8 +6,9 @@ Four runnable programs, each answering one question. Every one is a self-contain
 `main` package, so `go run ./examples/<name>` from the repository root is enough —
 no third-party MQTT server, no configuration file.
 
-- [broker-demo](#broker-demo) — how to embed a broker in your own process, and what a
-  retained message does for a subscriber that arrives later.
+- [broker-demo](#broker-demo) — how to embed a broker in your own process, what a
+  retained message does for a subscriber that arrives later, and how to hold the
+  broker open for a real MQTT client (`-serve`).
 - [client-demo](#client-demo) — how to use `github.com/maxid/gmqx/client`.
 - [cluster-node](#cluster-node) — how to run a node that joins a cluster.
 - [plugin-codec](#plugin-codec) — how an application-side plugin contributes codecs
@@ -15,12 +16,14 @@ no third-party MQTT server, no configuration file.
 
 ## Common conventions
 
-- Each demo prints one line per step — `[1/5] action … result` — and `[done] …` when
+- Each demo prints one line per step — `[n/N] action … result` — and `[done] …` when
   it finishes. `cluster-node` is the exception: it is a long-running node and logs
-  through `slog`.
+  through `slog`. `broker-demo -serve` is the other long-running mode: it skips the
+  steps and serves the broker instead.
 - Failures go to stderr as `<example>: <action>: <error>` with a non-zero exit code.
 - Ctrl-C stops any example. A demo prints `[stop] interrupted`, `cluster-node`
-  prints `[stop] node <id> stopped`, and both exit 0 — an example is not a service.
+  prints `[stop] node <id> stopped`, `broker-demo -serve` prints `[stop] broker
+  stopped`, and all exit 0 — an example is not a service.
 - `-h` prints what the example answers plus commands you can copy verbatim.
 - Noisy broker internals stay quiet: the demos set a `warn`-level logger and print
   their own progress. `cluster-node -v` is the way to see the broker's debug log.
@@ -36,10 +39,11 @@ afterwards. Everything it prints on the last step is the retained replay.
 go run ./examples/broker-demo
 go run ./examples/broker-demo -topic demo/retained -message "hello from gmqx"
 go run ./examples/broker-demo -addr 127.0.0.1:1883 -qos 0 -version 4
+go run ./examples/broker-demo -serve                        # hold the broker for MQTTX
 ```
 
 ```
-[1/5] broker listening on 127.0.0.1:60653
+[1/6] broker listening on 127.0.0.1:60653
 [2/6] publisher "broker-demo-pub" connected (MQTT level 5)
 [3/6] published retained "hello from the gmqx broker demo" to demo/retained (QoS 1)
 [4/6] subscriber "broker-demo-sub" subscribed to demo/retained and demo/retained_reply (granted [1 0])
@@ -55,9 +59,35 @@ accepted connection and answers with a greeting of its own — a **retained** `h
 before the client has subscribed to anything, so a plain publish would have nobody to
 reach.
 
-`-addr 127.0.0.1:0` (the default) picks an ephemeral port, so the demo never collides
-with a broker you already run. Client details — QoS 2, reconnects, MQTT 3.1.1 versus
+`-addr` defaults to `127.0.0.1:0` in the scripted demo, so it never collides with a
+broker you already run. Client details — QoS 2, reconnects, MQTT 3.1.1 versus
 5 — are `client-demo`'s subject.
+
+### Serving it to a real MQTT client
+
+The scripted demo exits, so there is nothing left for MQTTX to connect to. With
+`-serve` it skips the demo and holds the broker open instead:
+
+```sh
+go run ./examples/broker-demo -serve                        # 127.0.0.1:1883
+go run ./examples/broker-demo -serve -addr 127.0.0.1:1884   # a specific port
+```
+
+```
+[serve] broker listening on 127.0.0.1:1883
+[serve] every accepted connection gets a retained "hi!" on demo/retained_reply
+[serve] connect an MQTT client to it; Ctrl-C stops the broker
+```
+
+Point MQTTX — or `mosquitto_pub`, or another `gmqx` client — at that address. The
+broker starts empty: no scripted clients, no retained demo message. The `EventSink`
+greeting still runs, so every accepted connection triggers a retained `hi!` on
+`<topic>_reply` (`-topic` sets the base) and the external client can subscribe to a
+publication the broker made itself.
+
+`127.0.0.1:1883` is `cluster-node`'s default too, so the port may already be taken:
+the demo announces the next free port and listens there, and an explicit `-addr`
+behaves the same way. Ctrl-C drains and prints `[stop] broker stopped`, exit 0.
 
 ## client-demo
 

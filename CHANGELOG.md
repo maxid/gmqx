@@ -9,6 +9,13 @@
 
 ### Added
 
+- **`broker-demo -serve` holds the broker open for a real MQTT client.** The demo
+  ended after its scripted steps, which left nothing for MQTTX to connect to. With
+  `-serve` it skips the demo and serves an empty embedded broker on `127.0.0.1:1883`,
+  moving to the next free port when that one is taken (`gnety.AvailablePortOn`) and
+  announcing the move, until Ctrl-C; every accepted connection still gets the
+  retained greeting on `<topic>_reply`. The scripted path is unchanged.
+
 - **`Broker.PublishMessage` injects a publication from the host.** An embedding
   program had no way to publish something the broker did not receive from a client —
   a greeting on connect, an alert, a command from another subsystem. It takes the
