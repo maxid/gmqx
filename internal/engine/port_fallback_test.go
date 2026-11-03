@@ -57,6 +57,12 @@ func occupyPortWithFreeNext(t *testing.T) (int, net.Listener) {
 // probe that the successor is free cannot reserve it — an unrelated process may
 // take it before the broker binds — so a case that sees a further port retries with
 // a fresh pair instead of depending on the machine's port churn.
+//
+// A case must not add a second listener on ":0" next to the one under test: the
+// occupied port comes from the ephemeral range, and the kernel hands the successor
+// to that same broker's own ":0" listener often enough that the TLS and WebSocket
+// cases fell back to port+2 and skipped themselves (the skipped run logged its own
+// tcp listener taking 54441 while the TLS listener asked for 54440).
 func startOnBusyPort(t *testing.T, cfg func(addr string) Config, addrOf func(*Broker) string) (*Broker, int) {
 	t.Helper()
 	for attempt := 0; attempt < 8; attempt++ {
@@ -156,7 +162,9 @@ func TestPortFallbackDisabledFails(t *testing.T) {
 func TestPortFallbackKeepsWebSocketTransport(t *testing.T) {
 	b, port := startOnBusyPort(t,
 		func(addr string) Config {
-			return Config{Addr: "127.0.0.1:0", WebsocketAddr: addr, WebsocketPath: "/mqtt"}
+			// Only the WebSocket listener: see the note on startOnBusyPort about a
+			// second ":0" listener stealing the successor port.
+			return Config{WebsocketAddr: addr, WebsocketPath: "/mqtt"}
 		},
 		func(b *Broker) string { return b.WebsocketAddr() })
 
@@ -192,8 +200,8 @@ func TestPortFallbackKeepsTLSListener(t *testing.T) {
 	certFile, keyFile := selfSignedCert(t)
 	b, port := startOnBusyPort(t,
 		func(addr string) Config {
+			// Only the TLS listener, for the same reason.
 			return Config{
-				Addr:       "127.0.0.1:0",
 				TLS:        TLSConfig{Enabled: true, Cert: certFile, Key: keyFile},
 				SecureAddr: addr,
 			}
