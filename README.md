@@ -142,6 +142,55 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   and subscription restore, keepalive, MQTT 5 properties, and bounded ordered
   writer and delivery queues (see **MQTT client** below)
 
+## Architecture
+
+gmqx is one public package and one engine. `github.com/maxid/gmqx` (the root)
+declares no behavior — it re-exports types from the packages below. The broker's
+state machine, routing table, session state and cluster backends live in their own
+packages, and the assembly layer is `internal/engine`: it is the only package that
+knows all of them, and it is not importable from outside the module.
+
+```mermaid
+flowchart TD
+  root["gmqx<br/>facade.go · version.go"]
+  engine["internal/engine<br/>assembly · conn.Host · session bookkeeping"]
+  conn["conn<br/>connection state machine"]
+  routing["routing<br/>Index · Target · Election"]
+  session["session<br/>State · SessionStore"]
+  cluster["cluster<br/>gossip · TCP · Redis"]
+  hook["hook<br/>extension contracts"]
+  retained["retained"]
+  client["client<br/>MQTT client library"]
+
+  root --> engine
+  root --> cluster
+  root --> hook
+  root --> session
+  engine --> conn
+  engine --> routing
+  engine --> session
+  engine --> cluster
+  engine --> hook
+  engine --> retained
+  conn --> routing
+  conn --> session
+  conn --> hook
+  routing --> session
+  routing --> hook
+  session --> cluster
+  session --> hook
+  cluster --> hook
+```
+
+The arrows only point away from the root: a subpackage never imports `gmqx`, and no
+role package imports the engine. That is what lets `conn` run against a small
+`conn.Host` fake in tests and keeps the public API in exactly one place — the root's
+aliases make `gmqx.Broker` and the engine's `Broker` the same type.
+
+`docs/ARCHITECTURE.md` is the full map: what each package owns, how a connection
+and a session move through the broker, the lock and handoff rules that make offline
+queueing exact, and a "where to change what" table.
+
 ## Extension points
 
 The hook contracts live in [`gmqx/hook`](hook/): `ConnectInfo`, `AuthManager`,
@@ -161,9 +210,11 @@ Three adapters remove the boilerplate of the wide interfaces:
 - `hook.InterceptFunc` — a one-closure interceptor;
 - `hook.NoopMetrics` — embed it and override only the counters that matter.
 
-The routing seam (`Dispatcher`, `Publication`, `LocalTarget`) stays in the root package on
-purpose: it hands the broker's own routing primitives to a dispatcher, so it cannot move
-without exporting implementation details.
+The routing seam (`Dispatcher`, `Publication`, `LocalTarget`) is part of the public API
+but defined where it is used — `Dispatcher` and `Publication` in the engine, `LocalTarget`
+in `routing` — and re-exported by the root package as aliases. It cannot move into `hook`:
+it hands the broker's own routing primitives to a dispatcher, so moving it would export
+implementation details.
 
 ### Plugins at run time
 

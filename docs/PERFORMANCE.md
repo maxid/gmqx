@@ -8,8 +8,8 @@ behave on this machine?" — and deliberately not "how many connections will it
 serve in production?". See [Limits of these numbers](#limits-of-these-numbers).
 
 The numbers below were produced by the committed benchmarks in
-[`bench_test.go`](../bench_test.go) and the soak test in
-[`soak_test.go`](../soak_test.go). Re-measure before drawing conclusions from a
+[`bench_test.go`](../internal/engine/bench_test.go) and the soak test in
+[`soak_test.go`](../internal/engine/soak_test.go). Re-measure before drawing conclusions from a
 different version, machine, or Go toolchain: they are indicative, not a capacity
 guarantee.
 

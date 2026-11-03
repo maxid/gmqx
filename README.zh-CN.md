@@ -102,6 +102,51 @@
   带退避与订阅恢复的重连、keepalive、MQTT 5 属性，以及有界且有序的写队列与投递队列
   （见下面的 **MQTT 客户端**）
 
+## 架构
+
+gmqx 只有一个公开包和一个引擎。`github.com/maxid/gmqx`（根包）不声明任何行为——它把下面这些包的类型
+重新导出。broker 的状态机、路由表、会话状态与集群后端各自成包，装配层是 `internal/engine`：它是唯一
+同时认识它们的包，且模块外不可 import。
+
+```mermaid
+flowchart TD
+  root["gmqx<br/>facade.go · version.go"]
+  engine["internal/engine<br/>装配 · conn.Host · 会话簿记"]
+  conn["conn<br/>连接状态机"]
+  routing["routing<br/>Index · Target · Election"]
+  session["session<br/>State · SessionStore"]
+  cluster["cluster<br/>gossip · TCP · Redis"]
+  hook["hook<br/>扩展点契约"]
+  retained["retained"]
+  client["client<br/>MQTT 客户端库"]
+
+  root --> engine
+  root --> cluster
+  root --> hook
+  root --> session
+  engine --> conn
+  engine --> routing
+  engine --> session
+  engine --> cluster
+  engine --> hook
+  engine --> retained
+  conn --> routing
+  conn --> session
+  conn --> hook
+  routing --> session
+  routing --> hook
+  session --> cluster
+  session --> hook
+  cluster --> hook
+```
+
+箭头只离开根包：子包从不 import `gmqx`，角色包也从不 import 引擎。这正是 `conn` 能在测试里对着一个
+很小的 `conn.Host` 假实现跑、并且公开 API 恰好只在一处的原因——根包的别名让 `gmqx.Broker` 与引擎里的
+`Broker` 是同一个类型。
+
+`docs/ARCHITECTURE.md` 是完整地图：每个包拥有什么、一条连接与一个会话在 broker 里如何流动、让离线
+排队精确的锁与交接规则，以及“想改什么去哪里”的对照表。
+
 ## 扩展点
 
 钩子契约定义在 [`gmqx/hook`](hook/)：`ConnectInfo`、`AuthManager`、`AuthExchange`、
@@ -119,8 +164,9 @@ var _ gmqx.EventSink = hook.SinkFuncs{ /* ... */ }  // 同一个类型
 - `hook.InterceptFunc`——一个闭包就能当拦截器；
 - `hook.NoopMetrics`——嵌入后只覆写自己在意的计数器。
 
-路由接缝（`Dispatcher`、`Publication`、`LocalTarget`）有意留在根包：它把 broker 自己的路由
-原语交给 dispatcher，要移出去就得导出实现细节。
+路由接缝（`Dispatcher`、`Publication`、`LocalTarget`）属于公开 API，但定义在用到它的地方——
+`Dispatcher` 与 `Publication` 在引擎里、`LocalTarget` 在 `routing`——由根包以别名重新导出。它不能
+进 `hook`：它把 broker 自己的路由原语交给 dispatcher，移过去就要导出实现细节。
 
 ## 安装
 

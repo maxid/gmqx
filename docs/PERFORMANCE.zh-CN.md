@@ -4,7 +4,7 @@
 
 本文记录本仓库 broker 与 client 的基准与浸泡基线。它只回答一个窄问题——"当前代码在这台机器上表现如何"——而刻意不回答"生产环境能扛多少连接"。参见[这些数字的边界](#这些数字的边界)。
 
-下列数字由 [`bench_test.go`](../bench_test.go) 中的基准与 [`soak_test.go`](../soak_test.go) 中的浸泡测试产生。换版本、换机器或换 Go 工具链之前请重新测量：它们是参考值，不是容量承诺。
+下列数字由 [`bench_test.go`](../internal/engine/bench_test.go) 中的基准与 [`soak_test.go`](../internal/engine/soak_test.go) 中的浸泡测试产生。换版本、换机器或换 Go 工具链之前请重新测量：它们是参考值，不是容量承诺。
 
 ## 环境
 
