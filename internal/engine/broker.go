@@ -356,6 +356,13 @@ func (b *Broker) Start(ctx context.Context) error {
 				_ = startedSrv.Stop(context.Background())
 			}
 			_ = b.Stop(context.Background())
+			// A failed Start leaves nothing behind, and that includes what Addrs()
+			// reports: the listeners bound before the failure are stopped, so the
+			// addresses of a broker that never started must not be readable.
+			b.mu.Lock()
+			b.servers = nil
+			b.addrs = make(map[string]string)
+			b.mu.Unlock()
 			return errors.Join(errs...)
 		}
 		started = append(started, srv)
