@@ -2878,6 +2878,35 @@ type Publication struct {
 	propsSet bool
 }
 
+// PublishMessage injects one publication from the host rather than from a client.
+//
+// It is the seam for what a deployment says on its own: a greeting when a device
+// connects, an alert raised by a plugin, a command from another subsystem. The
+// publication takes the ordinary accepted path — a retained one is stored in the
+// retained table (and through the persistence seam) before routing, and the
+// configured Dispatcher decides where it goes, so a cluster spreads it exactly like
+// a client's publication. It runs no Interceptor and no EventSink.OnPublish: those
+// are the *inbound* hooks of a connection, and this publication did not arrive on
+// one.
+//
+// Namespace falls back to the broker's when empty. A topic must not be empty or
+// contain a wildcard.
+func (b *Broker) PublishMessage(ctx context.Context, pub Publication) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !topicmatch.ValidTopic(pub.Topic) {
+		return fmt.Errorf("%w: %q", ErrBadTopic, pub.Topic)
+	}
+	if pub.Namespace == "" {
+		pub.Namespace = b.namespace
+	}
+	if pub.Retain {
+		b.storeRetained(pub.Namespace, pub.Topic, pub.Payload, pub.QoS, pub.props)
+	}
+	return b.dispatcher.Dispatch(ctx, pub)
+}
+
 // Dispatcher is the single decision point for where an accepted publication
 // goes. The broker authorizes, runs every Interceptor and calls the EventSink
 // first; only a publication the sink accepted reaches Dispatch. Suppressing it

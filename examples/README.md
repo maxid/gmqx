@@ -40,12 +40,20 @@ go run ./examples/broker-demo -addr 127.0.0.1:1883 -qos 0 -version 4
 
 ```
 [1/5] broker listening on 127.0.0.1:60653
-[2/5] publisher "broker-demo-pub" connected (MQTT level 5)
-[3/5] published retained "hello from the gmqx broker demo" to demo/retained (QoS 1)
-[4/5] subscriber "broker-demo-sub" subscribed to demo/retained (granted [1])
-[5/5] replayed demo/retained to a subscriber that connected later (QoS 1, retain true): hello from the gmqx broker demo
+[2/6] publisher "broker-demo-pub" connected (MQTT level 5)
+[3/6] published retained "hello from the gmqx broker demo" to demo/retained (QoS 1)
+[4/6] subscriber "broker-demo-sub" subscribed to demo/retained and demo/retained_reply (granted [1 0])
+[5/6] replayed demo/retained to a subscriber that connected later (QoS 1, retain true): hello from the gmqx broker demo
+[6/6] the broker's own publish reached demo/retained_reply: hi!
 [done] retained message replayed to a later subscriber; broker stopped
 ```
+
+Steps 2 and 4 also show the other half: the broker has an `EventSink` that sees every
+accepted connection and answers with a greeting of its own — a **retained** `hi!` on
+`<topic>_reply`, published through `Broker.PublishMessage` and routed by the
+`Dispatcher` like any other publication. It is retained on purpose: `OnConnect` runs
+before the client has subscribed to anything, so a plain publish would have nobody to
+reach.
 
 `-addr 127.0.0.1:0` (the default) picks an ephemeral port, so the demo never collides
 with a broker you already run. Client details — QoS 2, reconnects, MQTT 3.1.1 versus

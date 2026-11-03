@@ -9,6 +9,15 @@
 
 ### Added
 
+- **`Broker.PublishMessage` injects a publication from the host.** An embedding
+  program had no way to publish something the broker did not receive from a client —
+  a greeting on connect, an alert, a command from another subsystem. It takes the
+  ordinary accepted path: a retained publication is stored (and persisted) before
+  routing, and `Config.Dispatcher` decides where the live copy goes, so a cluster
+  spreads it like any other. It runs no `Interceptor` and no `EventSink.OnPublish`,
+  which belong to an inbound connection. `broker-demo` uses it: its `EventSink`
+  answers every accepted connection with a retained `hi!` on `<topic>_reply`.
+
 - **Handlers are bound to filters, the way paho binds them.** `client.Subscription`
   gained `Handler`, `Client.AddRoute(filter, handler)` registers a route without a
   subscription, and `Config.OnMessage` became the fallback for publications no route

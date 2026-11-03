@@ -93,9 +93,11 @@ var (
 	ErrMaxConnections       = engine.ErrMaxConnections
 	ErrTakeoverRateExceeded = engine.ErrTakeoverRateExceeded
 	ErrClientIDRequired     = engine.ErrClientIDRequired
-	ErrNamespaceMismatch    = engine.ErrNamespaceMismatch
-	ErrClusterUnavailable   = engine.ErrClusterUnavailable
-	ErrNodeIDInUse          = engine.ErrNodeIDInUse
+	// ErrBadTopic reports a topic name that is empty or contains a wildcard.
+	ErrBadTopic           = engine.ErrBadTopic
+	ErrNamespaceMismatch  = engine.ErrNamespaceMismatch
+	ErrClusterUnavailable = engine.ErrClusterUnavailable
+	ErrNodeIDInUse        = engine.ErrNodeIDInUse
 )
 
 // The extension contracts live in ./hook; the engine that implements the host side

@@ -36,12 +36,17 @@ go run ./examples/broker-demo -addr 127.0.0.1:1883 -qos 0 -version 4
 
 ```
 [1/5] broker listening on 127.0.0.1:60653
-[2/5] publisher "broker-demo-pub" connected (MQTT level 5)
-[3/5] published retained "hello from the gmqx broker demo" to demo/retained (QoS 1)
-[4/5] subscriber "broker-demo-sub" subscribed to demo/retained (granted [1])
-[5/5] replayed demo/retained to a subscriber that connected later (QoS 1, retain true): hello from the gmqx broker demo
+[2/6] publisher "broker-demo-pub" connected (MQTT level 5)
+[3/6] published retained "hello from the gmqx broker demo" to demo/retained (QoS 1)
+[4/6] subscriber "broker-demo-sub" subscribed to demo/retained and demo/retained_reply (granted [1 0])
+[5/6] replayed demo/retained to a subscriber that connected later (QoS 1, retain true): hello from the gmqx broker demo
+[6/6] the broker's own publish reached demo/retained_reply: hi!
 [done] retained message replayed to a later subscriber; broker stopped
 ```
+
+第 2、4 步还演示了另一半：broker 有个 `EventSink`，看到每个被接受的连接就回一条自己的问候——
+`<topic>_reply` 上一条 **retained** 的 `hi!`，通过 `Broker.PublishMessage` 注入，再由 `Dispatcher`
+像普通发布一样路由。之所以 retained：`OnConnect` 触发时客户端还没订阅任何东西，普通发布无人可送。
 
 `-addr` 默认 `127.0.0.1:0`，端口由系统分配，所以不会撞上你本机已有的 broker。客户端本身的
 细节（QoS 2、重连、MQTT 3.1.1 与 5 的区别）属于 `client-demo` 的话题。

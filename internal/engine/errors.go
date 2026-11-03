@@ -35,6 +35,9 @@ var (
 	// ErrClientIDRequired reports that Broker.PublishToClient was called without a
 	// client id: a directed publish has no other way to name its target.
 	ErrClientIDRequired = errors.New("gmqx: client id is required")
+	// ErrBadTopic reports a topic that is empty or contains a wildcard, which is
+	// not a topic name a publication can carry.
+	ErrBadTopic = errors.New("gmqx: invalid topic name")
 	// ErrNamespaceMismatch reports that Broker.PublishToClient was handed a
 	// publication stamped with a namespace other than the broker's. A client id is
 	// only unique inside its namespace, so such a publication is refused instead of

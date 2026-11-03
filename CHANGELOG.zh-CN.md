@@ -8,6 +8,12 @@
 
 ### 新增
 
+- **`Broker.PublishMessage`：宿主自己注入一条发布。** 嵌入方原先没有办法发一条"不是客户端发来的"
+  消息——连接问候、告警、来自其它子系统的命令。它走正常的接受路径：retained 发布在路由前先入库
+  （并写透持久化），`Config.Dispatcher` 决定活副本去哪，因此集群会像对待任何发布一样扩散它。它不跑
+  `Interceptor` 也不跑 `EventSink.OnPublish`——那两条属于入站连接。`broker-demo` 用它演示：
+  `EventSink` 对每个被接受的连接回一条 `<topic>_reply` 上的 retained `hi!`。
+
 - **handler 绑在 filter 上，与 paho 一致。** `client.Subscription` 新增 `Handler`，
   `Client.AddRoute(filter, handler)` 可以只注册路由不订阅，`Config.OnMessage` 降为"没有路由认领时"
   的兜底（即 paho 的 `DefaultPublishHandler`）。一条发布命中的每条路由都会跑，按注册顺序，在投递
