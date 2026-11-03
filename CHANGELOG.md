@@ -15,8 +15,10 @@
   ordinary accepted path: a retained publication is stored (and persisted) before
   routing, and `Config.Dispatcher` decides where the live copy goes, so a cluster
   spreads it like any other. It runs no `Interceptor` and no `EventSink.OnPublish`,
-  which belong to an inbound connection. `broker-demo` uses it: its `EventSink`
-  answers every accepted connection with a retained `hi!` on `<topic>_reply`.
+  which belong to an inbound connection. `broker-demo` uses it (`EventSink` answers
+  every accepted connection with a retained `hi!` on `<topic>_reply`), and
+  `cluster-node` uses it to make the cluster observable: the greeting is replicated
+  to the peers, so a client subscribing on another node still finds it.
 
 - **Handlers are bound to filters, the way paho binds them.** `client.Subscription`
   gained `Handler`, `Client.AddRoute(filter, handler)` registers a route without a

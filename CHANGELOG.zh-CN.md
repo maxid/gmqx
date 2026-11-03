@@ -12,7 +12,8 @@
   消息——连接问候、告警、来自其它子系统的命令。它走正常的接受路径：retained 发布在路由前先入库
   （并写透持久化），`Config.Dispatcher` 决定活副本去哪，因此集群会像对待任何发布一样扩散它。它不跑
   `Interceptor` 也不跑 `EventSink.OnPublish`——那两条属于入站连接。`broker-demo` 用它演示：
-  `EventSink` 对每个被接受的连接回一条 `<topic>_reply` 上的 retained `hi!`。
+  `EventSink` 对每个被接受的连接回一条 `<topic>_reply` 上的 retained `hi!`；`cluster-node` 用它让
+  集群变得可见：问候会被复制到 peer，因此在另一个节点订阅仍能拿到。
 
 - **handler 绑在 filter 上，与 paho 一致。** `client.Subscription` 新增 `Handler`，
   `Client.AddRoute(filter, handler)` 可以只注册路由不订阅，`Config.OnMessage` 降为"没有路由认领时"

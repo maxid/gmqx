@@ -115,6 +115,18 @@ symmetric seed list yields exactly one connection per pair. Authentication is
 allow-all: this is a local verification harness, never a production deployment. Stop
 a node with Ctrl-C; it drains and exits 0. Add `-v` to see the broker's debug log.
 
+Every accepted connection makes the node publish a retained `hi!` on
+`<greet>_reply` (`-greet`, default `cluster/hello`; `-greet ""` turns it off), and the
+cluster replicates it like any retained publication. So a client that subscribes on
+**another** node still finds it — the shortest way to see the cluster work with one
+MQTT client and no second connection:
+
+```sh
+# terminal 1 and 2: the two nodes above, unchanged
+# then, against node b (the greeting came from node a):
+go run ./examples/client-demo -addr 127.0.0.1:1884 -topic cluster/hello_reply
+```
+
 ## plugin-codec
 
 **Answers:** how an application-side plugin extends the broker. The broker has no idea

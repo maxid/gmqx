@@ -103,6 +103,16 @@ node a
 allow-all：这是本机验证用的夹具，永远不要当生产部署。Ctrl-C 停止，它会排空后以 0 退出；
 加 `-v` 看 broker 的调试日志。
 
+每个被接受的连接都会让该节点在 `<greet>_reply` 上发一条 retained 的 `hi!`
+（`-greet`，默认 `cluster/hello`；`-greet ""` 关掉），集群会像复制其它保留消息一样复制它。
+所以**在另一个节点**订阅也能拿到——用一个 MQTT 客户端、一条连接就能看见集群在工作的最短路径：
+
+```sh
+# 终端 1、2：就是上面两个节点，不用改
+# 然后对着节点 b（问候来自节点 a）：
+go run ./examples/client-demo -addr 127.0.0.1:1884 -topic cluster/hello_reply
+```
+
 ## plugin-codec
 
 **回答：** 应用侧插件怎么扩展 broker。broker 本身不知道 JSON、CSV 或二进制帧是什么；插件注册

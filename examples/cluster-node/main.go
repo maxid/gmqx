@@ -3,7 +3,9 @@
 // client can verify that a publish on one node reaches a subscriber on another.
 //
 // Start two nodes with the same seed list, then connect a client to each; -h prints
-// the two commands. Nodes dial only the seeds whose address sorts after their own
+// the two commands. Every accepted connection makes this node publish a retained
+// greeting on "<greet>_reply", which the cluster replicates to the peers — so a
+// client that subscribes on another node still sees it. Nodes dial only the seeds whose address sorts after their own
 // cluster address, so a symmetric seed list yields exactly one connection per pair.
 // Authentication is allow-all on purpose: this is a local verification harness,
 // never a production deployment.
@@ -18,10 +20,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/maxid/gmqx"
+	"github.com/maxid/gmqx/hook"
 )
 
 func main() {
@@ -31,6 +35,7 @@ func main() {
 	seeds := flag.String("seeds", "", "comma-separated cluster addresses of all nodes, including this one")
 	reconnect := flag.Duration("reconnect", time.Second, "cluster reconnect interval")
 	verbose := flag.Bool("v", false, "log at debug level")
+	greetBase := flag.String("greet", "cluster/hello", `base topic of the greeting this node publishes on every accepted connection; the greeting goes to "<greet>_reply", empty disables it`)
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `cluster-node runs one broker node with the TCP cluster enabled. Start two
@@ -55,6 +60,7 @@ Flags:
 		level = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	greet := &greeter{topic: *greetBase + "_reply"}
 
 	var seedsList []string
 	for _, s := range strings.Split(*seeds, ",") {
@@ -78,6 +84,7 @@ Flags:
 			ReconnectInterval: *reconnect,
 			Logger:            logger,
 		}),
+		Sink:   greet,
 		Logger: logger,
 	}
 
@@ -91,7 +98,11 @@ Flags:
 	if err := broker.Start(ctx); err != nil {
 		log.Fatalf("cluster-node: start broker: %v", err)
 	}
+	greet.bind(broker)
 	fmt.Printf("node %s\n  mqtt    %s\n  cluster %s\n  seeds   %v\n", *node, broker.Addr(), *clusterAddr, seedsList)
+	if *greetBase != "" {
+		fmt.Printf("  greeting %s on every connect (retained, replicated to peers)\n", greet.topic)
+	}
 
 	<-ctx.Done()
 	// Stop takes the cancelled ctx off the table: draining needs a live deadline.
@@ -101,4 +112,49 @@ Flags:
 		log.Fatalf("cluster-node: stop broker: %v", err)
 	}
 	fmt.Printf("[stop] node %s stopped\n", *node)
+}
+
+// greeter is the node's EventSink: every accepted connection makes this node publish
+// a greeting of its own, and the cluster spreads it like any client publication.
+//
+// The greeting is retained, for two reasons: OnConnect runs before the client has
+// subscribed to anything, so a plain publish would reach nobody, and a retained one
+// is replicated to the peers — a client that subscribes on another node still finds
+// it, which is what makes the cluster visible without a second client.
+type greeter struct {
+	mu     sync.Mutex
+	broker *gmqx.Broker
+	topic  string
+}
+
+func (g *greeter) bind(b *gmqx.Broker) {
+	if g.topic == "" {
+		return
+	}
+	g.mu.Lock()
+	g.broker = b
+	g.mu.Unlock()
+}
+
+func (g *greeter) OnConnect(ctx context.Context, info hook.ConnectInfo) {
+	g.mu.Lock()
+	b := g.broker
+	g.mu.Unlock()
+	if b == nil {
+		return
+	}
+	if err := b.PublishMessage(ctx, gmqx.Publication{
+		Topic:   g.topic,
+		Payload: []byte("hi!"),
+		Retain:  true,
+	}); err != nil {
+		slog.Warn("greeting failed", "client", info.ClientID, "err", err)
+	}
+}
+
+func (*greeter) OnDisconnect(context.Context, string, error)     {}
+func (*greeter) OnConnectionLost(context.Context, string, error) {}
+func (*greeter) OnPing(context.Context, string)                  {}
+func (*greeter) OnPublish(context.Context, hook.PublishEvent) hook.PublishResult {
+	return hook.PublishResult{Disposition: hook.PublishAccepted}
 }
