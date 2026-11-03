@@ -403,6 +403,14 @@ type listenerSpec struct {
 	subprotocol    string
 	allowAnyOrigin bool
 	tls            gnety.TLSConfig
+	// maxFrameSize is the largest inbound WebSocket message this listener
+	// accepts. gnety caps a reassembled message at 4 MiB when it is left at zero,
+	// which would make Config.MaxPacketSize above 4 MiB unreachable over ws/wss:
+	// that 4 MiB is a library default, not a protocol limit (RFC 6455 has none,
+	// and the MQTT spec lets one frame carry several or partial packets), so the
+	// listener carries the broker's own packet limit instead. It stays zero for
+	// the TCP and TLS listeners, which have no message framing of their own.
+	maxFrameSize int
 }
 
 func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
@@ -433,6 +441,7 @@ func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
 			path:           b.cfg.WebsocketPath,
 			subprotocol:    "mqtt",
 			allowAnyOrigin: true, // device gateways are not browser clients; Origin is not a security boundary
+			maxFrameSize:   b.cfg.MaxPacketSize,
 		})
 	}
 	if addr := addrOrPort(b.cfg.WebsocketSecureAddr, b.cfg.WebsocketSecurePort); addr != "" {
@@ -447,6 +456,7 @@ func (b *Broker) listenerSpecs() ([]listenerSpec, error) {
 			subprotocol:    "mqtt",
 			allowAnyOrigin: true, // device gateways are not browser clients; Origin is not a security boundary
 			tls:            b.gnetyTLS(),
+			maxFrameSize:   b.cfg.MaxPacketSize,
 		})
 	}
 	return specs, nil
@@ -479,6 +489,7 @@ func (b *Broker) bindListener(ctx context.Context, spec listenerSpec) (*gnety.Se
 			Subprotocol:    spec.subprotocol,
 			AllowAnyOrigin: spec.allowAnyOrigin,
 			TLS:            spec.tls,
+			MaxFrameSize:   spec.maxFrameSize,
 			RawHandler:     b.handleRaw,
 		})
 		if err == nil {

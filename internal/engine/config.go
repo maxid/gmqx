@@ -88,7 +88,10 @@ type Config struct {
 	WebsocketSecurePort int    // WSS port when WebsocketSecureAddr is empty
 	WebsocketPath       string // WebSocket path, default /mqtt
 	TLS                 TLSConfig
-	MaxPacketSize       int
+	// MaxPacketSize is the largest MQTT control packet the broker accepts, and the
+	// same number bounds one inbound WebSocket message on the WS/WSS listeners:
+	// no listener carries a transport-level limit of its own. Zero selects 4 MiB.
+	MaxPacketSize int
 	// PortFallback is how many addresses above the configured port a listener
 	// may try when the port it was given is already in use (default 16; a
 	// negative value disables the fallback, so a busy port fails Start). Each

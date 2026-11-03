@@ -21,6 +21,11 @@ import (
 	"github.com/maxid/gnety/codec/http/websocket"
 )
 
+// testWebSocketReadLimit is the inbound message limit of the test client itself.
+// A WebSocket peer sets its own limit and gnety defaults it to 4 MiB; the limits
+// under test are the broker's, so the client opts into a larger one.
+const testWebSocketReadLimit = 16 << 20
+
 // dialTestWebSocket completes a WebSocket handshake over a fresh (TLS for "wss")
 // connection and hands back the stream, so the raw MQTT helpers can drive it.
 func dialTestWebSocket(t *testing.T, network, addr, path string, tlsCfg *tls.Config) net.Conn {
@@ -41,7 +46,10 @@ func dialTestWebSocket(t *testing.T, network, addr, path string, tlsCfg *tls.Con
 		t.Fatalf("%s dial %s: %v", network, addr, err)
 	}
 	location := &url.URL{Scheme: network, Host: addr, Path: path}
-	conn, err := websocket.ClientHandshake(raw, location, "http://"+addr, websocket.Options{Subprotocol: "mqtt"})
+	conn, err := websocket.ClientHandshake(raw, location, "http://"+addr, websocket.Options{
+		Subprotocol:    "mqtt",
+		MaxMessageSize: testWebSocketReadLimit,
+	})
 	if err != nil {
 		_ = raw.Close()
 		t.Fatalf("%s handshake over %s: %v", network, addr, err)
