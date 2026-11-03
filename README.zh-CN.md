@@ -200,24 +200,18 @@ broker, _ := gmqx.New(gmqx.Config{
 
 ## 示例
 
-[`examples/broker-demo`](examples/broker-demo/main.go) 在回环地址的临时端口上启动 broker，
-借助 gnety 的 MQTT 编解码器（broker 自身使用的线格式层）连接一个客户端并完成一次
-发布/订阅往返，打印 broker 回送的 PUBLISH：
+[`examples/`](examples/README.zh-CN.md) 下是四个可直接运行的程序，每个都是自包含
+的 `main` 包，各自回答一个问题：
 
 ```sh
-go run ./examples/broker-demo
-go run ./examples/broker-demo -addr 127.0.0.1:1883 -topic demo/hello
+ go run ./examples/broker-demo    # 嵌入 broker，看到保留消息被重放
+ go run ./examples/client-demo    # 用这个 client 跑一次发布/订阅往返
+ go run ./examples/plugin-codec   # 应用侧插件注册 codec 并转码
+ go run ./examples/cluster-node -h  # 加入集群的节点（长期运行）
 ```
 
-[`examples/client-demo`](examples/client-demo/main.go) 通过客户端库完成同样的往返：
-未指定 `-addr` 时自行启动进程内 broker，随后连接、订阅、发布、打印投递并关闭：
-
-```sh
-go run ./examples/client-demo
-go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello -qos 2 -version 5
-```
-
-两个示例都把 broker 与客户端放在同一进程内，无需第三方 MQTT 客户端。
+每个都支持 `-h`（给出可复制的命令）、都能用 Ctrl-C 停止，每步打印一行 `[n/N]`。
+[示例 README](examples/README.zh-CN.md) 逐个说明回答什么问题、怎么跑、应该看到什么。
 
 ## 配置（部分）
 

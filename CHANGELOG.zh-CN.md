@@ -29,6 +29,13 @@
   `RedisSessionStore` 的部署改用 `gcache/redis` 的 store 作为 `Config.Store`、其 locker 作为
   `Config.Locker`；配置共享后端后保留消息即可跨重启。
 
+- **示例统一成一套程序、一种输出。** `examples/broker-demo` 不再用 `net.Dial` 手写 MQTT 3.1.1
+  帧：它嵌入 broker、用 `gmqx/client` 驱动，先发一条保留消息，再让第二个 client 后连上来订阅，
+  于是演示变成了"保留消息重放"，而不是把客户端库已经做的事再写一遍。四个示例都按
+  `[n/N] 动作 … 结果` 每步一行、结尾 `[done] …` 一行，都能用 Ctrl-C 停止（打印
+  `[stop] interrupted` 并以 0 退出），都支持 `-h` 给出可直接复制的命令；新增的
+  `examples/README.md` 与中文版逐个说明回答什么问题、怎么跑、应该看到什么。
+
 ### 修复
 
 - **多监听器 `Start` 失败后不再报告已停掉监听器的地址。** 第二个监听器绑定失败时，`Addrs()` 仍留着已被停掉的那个地址，监管方可能读到一个没有任何进程监听的端口；回滚现在会清空 servers 与地址，与单监听器路径上"失败的 Start 不留残余"的含义一致。

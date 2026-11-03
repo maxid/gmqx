@@ -47,6 +47,16 @@
   store as `Config.Store` and its locker as `Config.Locker`; retained messages now
   survive a restart when a shared backend is configured.
 
+- **The examples are one set of programs with one output shape.** `examples/broker-demo`
+  no longer hand-encodes MQTT 3.1.1 frames over `net.Dial`: it embeds the broker and
+  drives it with `gmqx/client`, publishing one retained message and letting a second
+  client subscribe afterwards, so the demo now shows the retained replay instead of
+  repeating what the client library already does. All four examples print one
+  `[n/N] action … result` line per step and a closing `[done] …`, stop on Ctrl-C with
+  `[stop] interrupted` and exit 0, and take `-h` with commands that can be copied
+  verbatim. `examples/README.md` and its Chinese version say, per demo, what it
+  answers, how to run it and what it prints.
+
 ### Fixed
 
 - **A failed multi-listener `Start` no longer reports addresses of listeners it

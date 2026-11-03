@@ -288,27 +288,19 @@ broker, _ := gmqx.New(gmqx.Config{
 
 ## Examples
 
-[`examples/broker-demo`](examples/broker-demo/main.go) starts a broker on an
-ephemeral loopback port, connects one client through the gnety MQTT codec (the
-wire layer the broker itself uses) and completes a publish/subscribe round trip,
-printing the PUBLISH the broker delivers back:
+[`examples/`](examples/README.md) holds four runnable programs, each a
+self-contained `main` package that answers one question:
 
 ```sh
-go run ./examples/broker-demo
-go run ./examples/broker-demo -addr 127.0.0.1:1883 -topic demo/hello
+ go run ./examples/broker-demo    # embed a broker; a retained message is replayed
+ go run ./examples/client-demo    # one publish/subscribe round trip with this client
+ go run ./examples/plugin-codec   # an application-side plugin registers codecs
+ go run ./examples/cluster-node -h  # a node that joins a cluster (long-running)
 ```
 
-[`examples/client-demo`](examples/client-demo/main.go) runs the same round trip
-through the client library: it starts an in-process broker unless `-addr` names an
-external one, subscribes, publishes, prints the delivery and closes:
-
-```sh
-go run ./examples/client-demo
-go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello -qos 2 -version 5
-```
-
-Both demos keep broker and client in one process, so no third-party MQTT client is
-needed.
+Each takes `-h` with commands you can copy, stops on Ctrl-C, and prints one
+`[n/N]` line per step. The [examples README](examples/README.md) lists, for every
+demo, what it answers, how to run it and what it should print.
 
 ## Configuration (selected)
 
