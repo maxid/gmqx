@@ -13,7 +13,8 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - MQTT 3.1, 3.1.1 and basic MQTT 5 over TCP, TLS, WebSocket and WSS
 - A benchmark and soak harness (`go test -bench . ./...`, `GMQX_SOAK=1 go test -timeout 15m -run TestSoak ./internal/engine`)
   with a recorded baseline, and an interoperability matrix in `interop/` that runs a
-  third-party client against this broker and this client against a reference broker
+  third-party client against this broker (TCP, TLS, WS, WSS and mutual TLS) and this
+  client against a reference broker (plaintext and TLS)
 - CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH, PING, DISCONNECT
 - Persistent sessions (Clean Session / Clean Start, Session Present); the
   subscriptions of a persistent session survive a disconnect and a clean
@@ -96,7 +97,7 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   Redis backend routes it through a TTL'd client-id presence view, the TCP mesh
   broadcasts it and each peer applies it only if it holds the id
 - Connection-scoped context for every hook: `ConnInfo` (client id, connection
-  id, namespace, remote address, protocol level) through
+  id, namespace, remote address, protocol level, listener transport) through
   `ContextWithConn`/`ConnFromContext`, enriched once at CONNECT by
   `Config.ConnContext` and cancelled when the connection ends
 - Namespace isolation: `Config.Namespace` scopes the session table, subscription
@@ -371,7 +372,7 @@ disabled by a negative value.
 | `CleanStart` | false | Clean Session (3.1.1) / Clean Start (5) of every CONNECT; a clean connection resubscribes after a reconnect |
 | `SessionExpiry` | 0 | MQTT 5 Session Expiry Interval in seconds |
 | `Version` | `mqtt.Version311` | `mqtt.Version311` or `mqtt.Version5` |
-| `TLS` | nil | wrap the connection in TLS after the dialer returns |
+| `TLS` | nil | wrap the connection in TLS after the dialer returns; an empty `ServerName` is taken from `Addr`, as `tls.Dial` does |
 | `Dialer` | `net.Dialer` | transport hook for the initial connection and every reconnect |
 | `ConnectTimeout` | 10 s | dial + TLS + CONNECT/CONNACK deadline |
 | `WriteTimeout` | 10 s | write deadline of one packet |
@@ -479,7 +480,11 @@ func (d *myDispatcher) Dispatch(ctx context.Context, pub gmqx.Publication) error
 
 Every hook receives a connection-scoped context. Go has no thread-local state,
 so the connection identity travels as a context value: `gmqx.ConnFromContext`
-returns the `gmqx.ConnInfo` of the connection a hook runs for. The context is
+returns the `gmqx.ConnInfo` of the connection a hook runs for. It carries the
+client id, the connection id, the namespace, the peer address, the protocol level
+and `Transport` — the listener that accepted the connection (`tcp`, `tls`, `ws` or
+`wss`, the names `Addrs()` reports), so an audit trail or an ACL can tell the
+ports apart. The context is
 created when the connection is accepted, enriched once at CONNECT by
 `Config.ConnContext` (values and deadlines put there reach every hook of that
 connection), reused for the whole exchange, and cancelled when the connection

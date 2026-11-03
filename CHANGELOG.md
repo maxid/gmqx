@@ -995,7 +995,35 @@
 - Cluster interface (`Cluster`/`ClusterMessage`) and broker hooks for cross-node
   publish and kick; in-memory two-node test.
 
+### Added
+
+- **A hook can see which listener accepted a connection.** `hook.ConnInfo` gained
+  `Transport` — `"tcp"`, `"tls"`, `"ws"` or `"wss"`, the same names `Addrs()` reports
+  — so an audit trail, a metrics sink or an ACL can tell a device on the TLS port
+  from one on the WebSocket port without keeping a second copy of the broker's
+  configuration. The listener name travels from the listener spec through
+  `conn.Client` (`SetTransport`, called before the handshake); an embedder that hands
+  a connection over itself reports an empty transport.
+
+- **`ClientConfig.TLS` derives the server name from `Addr`.** A configuration with a
+  root pool and no `ServerName` used to fail with "either ServerName or
+  InsecureSkipVerify must be specified", a requirement the field's documentation did
+  not state; the client now fills it from `Addr` the way `tls.Dial` does. An explicit
+  `ServerName` is used as given, and the caller's `tls.Config` is never mutated.
+
+- **The interoperability matrix covers the secure and WebSocket listeners.** paho
+  runs the same publish/subscribe exchange over TLS, WS, WSS and mutual TLS against
+  this broker, and the reference-broker direction gained a TLS listener (with the
+  negative case: a client that does not trust the CA must fail).
+
 ### Fixed
+
+- **A failed multi-listener `Start` no longer reports addresses of listeners it
+  already stopped.** When the second listener failed to bind, `Addrs()` kept the
+  address of the first one, which had been stopped: a supervisor could read a port
+  that nothing was listening on. The rollback now clears the servers and addresses,
+  which is what "a failed Start leaves nothing behind" already meant for the
+  single-listener path.
 
 - **`MaxPacketSize` reaches the WebSocket listeners.** The WS and WSS listeners
   passed no message limit to gnety, so they silently kept gnety's 4 MiB default: a
