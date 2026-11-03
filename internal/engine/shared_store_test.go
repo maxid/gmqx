@@ -183,8 +183,16 @@ func persistKey(key string) string { return "gmqx:session:" + key }
 // sessionNode starts a broker of nodeID that keeps its state in store.
 func sessionNode(t *testing.T, nodeID string, store *sharedStore) *Broker {
 	t.Helper()
+	return sessionNodeWithLocker(t, nodeID, store, newSharedLocker())
+}
+
+// sessionNodeWithLocker is sessionNode with the locker supplied: a take can only be
+// atomic when the nodes contend on the same lock, so the case that proves it has to
+// hand several nodes one locker instead of giving each its own.
+func sessionNodeWithLocker(t *testing.T, nodeID string, store *sharedStore, locker *sharedLocker) *Broker {
+	t.Helper()
 	return startBroker(t, Config{
-		NodeID: nodeID, Store: store, Locker: newSharedLocker(), Logger: discardLogger(),
+		NodeID: nodeID, Store: store, Locker: locker, Logger: discardLogger(),
 	})
 }
 
@@ -305,7 +313,8 @@ func TestSharedSessionCleanConnectDiscards(t *testing.T) {
 // one session owner, and the take removed the stored copy.
 func TestSharedSessionTakeIsAtomic(t *testing.T) {
 	store := newSharedStore()
-	a, b := sessionNode(t, "a", store), sessionNode(t, "b", store)
+	locker := newSharedLocker()
+	a, b := sessionNodeWithLocker(t, "a", store, locker), sessionNodeWithLocker(t, "b", store, locker)
 	if !a.persist.SaveSession("racing", &session.State{
 		ClientID: "racing",
 		Subs:     map[string]session.Subscription{"racing/#": {QoS: 1}},
