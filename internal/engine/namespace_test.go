@@ -16,6 +16,7 @@ import (
 	"github.com/maxid/gns"
 
 	retainedstore "github.com/maxid/gmqx/retained"
+	"github.com/maxid/gmqx/session"
 )
 
 // nsValue is the test shorthand for a namespace value: the broker takes the gns type, and
@@ -228,13 +229,13 @@ func TestRemoteEventsOfAnotherNamespaceAreDropped(t *testing.T) {
 // its broker's namespace.
 func TestNamespaceSessionTableIsPartitioned(t *testing.T) {
 	b := startBroker(t, Config{Namespace: nsValue("tenant-a")})
-	b.store.Save(namespaceKey("tenant-a", "resumed"), SessionState{
-		ClientID:      "resumed",
-		Subscriptions: map[string]SessionSubscription{"ns/#": {QoS: 0}},
+	b.persist.SaveSession(namespaceKey("tenant-a", "resumed"), &session.State{
+		ClientID: "resumed",
+		Subs:     map[string]session.Subscription{"ns/#": {QoS: 0}},
 	})
-	b.store.Save(namespaceKey("tenant-b", "foreign"), SessionState{
-		ClientID:      "foreign",
-		Subscriptions: map[string]SessionSubscription{"foreign/#": {QoS: 0}},
+	b.persist.SaveSession(namespaceKey("tenant-b", "foreign"), &session.State{
+		ClientID: "foreign",
+		Subs:     map[string]session.Subscription{"foreign/#": {QoS: 0}},
 	})
 
 	resumed, sessionPresent := dialPersistentTestClient(t, b.Addr(), "resumed")

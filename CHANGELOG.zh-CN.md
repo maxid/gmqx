@@ -6,6 +6,25 @@
 
 ## 2026-11-03
 
+### 变更
+
+- **会话与保留消息共用一个持久化接缝。** `Config.Store` 是一个
+  [`gcache.RemoteStore`](https://github.com/maxid/gcache)，`Config.Locker` 让它成为多节点共享
+  的 store；broker 用同一套键方案与带版本的 JSON 编码写入持久会话（订阅、离线队列、QoS 2 状态、
+  过期截止时间）与保留消息（载荷、QoS、属性、Message Expiry），每条记录以自己的截止时间作 TTL。
+  实现了 `gcache.Scanner` 的 store 会在启动时被载入（会话索引进路由表，保留消息填进内存热表）；
+  过期清扫走路由索引，因此不依赖枚举。默认是 gcache 的进程内内存实现，即原来的内存行为。
+  **破坏性变更**：`SessionStore` SPI、`MemorySessionStore`、`RedisSessionStore`、
+  `RedisSessionStoreConfig`、`SessionState`/`SessionInflight`/`SessionSubscription`/
+  `QueuedMessage`/`InflightStage`、`retained.Store`/`NewStore` 与 `Config.SessionStore` 均删除；
+  `contrib/sessionstore-gcache` 模块删除（逻辑进入 `internal/persist`）。原先用
+  `RedisSessionStore` 的部署改用 `gcache/redis` 的 store 作为 `Config.Store`、其 locker 作为
+  `Config.Locker`；配置共享后端后保留消息即可跨重启。
+
+### 新增
+
+
+
 ### 新增
 
 - **hook 现在能看到连接是由哪个监听器接受的。** `hook.ConnInfo` 增加 `Transport`（`"tcp"/"tls"/"ws"/"wss"`，与 `Addrs()` 同名），审计、指标或 ACL 不必再自己保存一份 broker 配置就能区分 TLS 端口与 WebSocket 端口上的设备。监听器名字从 listener spec 穿过 `conn.Client`（`SetTransport`，握手前调用）；自己把连接交给 broker 的嵌入方报告空值。
@@ -72,8 +91,6 @@
 - **引擎变为 `internal/engine`，根包只剩一个 `facade.go`。** 装配 broker 的东西——`conn.Host` 实现、会话簿记、待发 will 表与定时器、插件宿主、hook 别名、会话 store 门面与 auth exchange 工厂——放在一个外部不可 import 的包里；根包只剩一个 `facade.go`（外加 `version.go`），把每个名字以别名重新导出，因此 `gmqx.Broker` == `engine.Broker`，消费方零改动。`gmqx/server`（一个文件名与根门面重名的中间公开包）已删除。公开 API 不变：与上一提交用 `go doc -all` 对比（标识符集合差异 0），并用一个模块外的消费者验证过（实现 `gmqx.Dispatcher`/`gmqx.EventSink`、嵌入 `gmqx.NoopMetrics`、创建 broker）。
 
 ## 2026-11-01
-
-### 新增
 
 - **入站 PUBLISH 不再每包分配报文体、主题字符串与载荷**：读循环用 `codec/mqtt` 的 `ReadPublishInto` 解码进每连接一份、只增长的缓冲区（`client.readBuf`，受 broker `MaxPacketSize` 限制），其余报文（PUBACK、SUBSCRIBE、PINGREQ、读错误）仍走原来的类型化解码器。缓冲区会被下一个包复用，因此发布持有载荷的一份复制：`client.handlePublish` 在调用 `Broker.publish` 之前复制一次，这是热路径上唯一的复制位置（retained 存储、offline 队列与集群广播保持各自的复制）。语义不变：相同的校验与 DISCONNECT reason code（超限报文仍为 0x95，因为大小检查仍在读取任何字节之前）、相同的 topic alias 处理、相同的 inflight 与排队行为、sink 看到的 `PublishEvent` 相同且其载荷活过调用。顺序基准实测：`BenchmarkPublishQoS0` 928 B/op、9 allocs/op → 528 B/op、6 allocs/op，`BenchmarkPublishQoS1` 1,667/13 → 1,264/9，`BenchmarkClientPublishQoS1` 3,121/22 → 2,721/18；`ns/op` 与 200 连接的投递速率都落在运行间噪声带内，因为该负载下瓶颈是系统调用而不是解码（见 `docs/PERFORMANCE.md`）。
 

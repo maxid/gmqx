@@ -34,8 +34,8 @@ package hook
 // connection is disconnected), "offline_queue_full" (the per-session cap dropped
 // the oldest message), "offline_queue_total" (the global cap rejected the newest
 // one), "offline_queue_corrupt", "offline_session_missing", "session_expired",
-// "session_store_corrupt" (a stored session in a SessionStore did not decode, so
-// it was dropped), "session_store_error" (a SessionStore command failed, so the
+// "session_store_corrupt" (a stored session did not decode, so
+// it was dropped), "session_store_error" (a store command failed, so the
 // operation degraded to "no session"), "cluster_kick_stale" (a peer's kick is not
 // newer than the connection it would close, so it was refused and the connection
 // kept), "cluster_kick_rate_limit" (a peer's kick arrived inside the

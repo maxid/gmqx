@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 func TestInboundQoS2StateSurvivesReconnect(t *testing.T) {
@@ -46,7 +48,7 @@ func TestInboundQoS2StateSurvivesReconnect(t *testing.T) {
 	// The connection drops without the PUBREL: the exchange is unfinished.
 	_ = pub.conn.Close()
 	waitDisconnected(t, b, "in-q2-resume-pub")
-	stored, ok := b.store.Load("in-q2-resume-pub")
+	stored, ok := b.persist.LoadSession("in-q2-resume-pub")
 	if !ok || len(stored.InboundQoS2) != 1 || stored.InboundQoS2[0] != 7 {
 		t.Fatalf("stored inbound QoS 2 state = %+v (ok=%v), want [7]", stored.InboundQoS2, ok)
 	}
@@ -71,7 +73,7 @@ func TestInboundQoS2StateSurvivesReconnect(t *testing.T) {
 	expectPubcomp(t, again, 7)
 	again.disconnect()
 	waitDisconnected(t, b, "in-q2-resume-pub")
-	stored, ok = b.store.Load("in-q2-resume-pub")
+	stored, ok = b.persist.LoadSession("in-q2-resume-pub")
 	if !ok {
 		t.Fatal("the session was not stored after the exchange completed")
 	}
@@ -117,13 +119,13 @@ func TestOutboundQoS1ResumesAfterReconnect(t *testing.T) {
 	// The subscriber drops without acknowledging either delivery.
 	_ = sub.conn.Close()
 	waitDisconnected(t, b, "out-q1-resume")
-	stored, ok := b.store.Load("out-q1-resume")
+	stored, ok := b.persist.LoadSession("out-q1-resume")
 	if !ok || len(stored.Inflight) != 2 {
 		t.Fatalf("stored outbound exchanges = %+v (ok=%v), want 2", stored.Inflight, ok)
 	}
 	for _, m := range stored.Inflight {
-		if m.Stage != InflightAwaitPuback {
-			t.Fatalf("stored stage of packet %d = %d, want %d", m.PacketID, m.Stage, InflightAwaitPuback)
+		if m.Stage != sessionstate.AwaitPuback {
+			t.Fatalf("stored stage of packet %d = %d, want %d", m.PacketID, m.Stage, sessionstate.AwaitPuback)
 		}
 	}
 
@@ -171,8 +173,8 @@ func TestOutboundQoS2PubrelResumesAfterReconnect(t *testing.T) {
 	}
 	_ = sub.conn.Close()
 	waitDisconnected(t, b, "out-q2-resume")
-	stored, ok := b.store.Load("out-q2-resume")
-	if !ok || len(stored.Inflight) != 1 || stored.Inflight[0].Stage != InflightAwaitPubcomp {
+	stored, ok := b.persist.LoadSession("out-q2-resume")
+	if !ok || len(stored.Inflight) != 1 || stored.Inflight[0].Stage != sessionstate.AwaitPubcomp {
 		t.Fatalf("stored outbound exchanges = %+v (ok=%v), want one awaiting PUBCOMP", stored.Inflight, ok)
 	}
 
@@ -189,32 +191,4 @@ func TestOutboundQoS2PubrelResumesAfterReconnect(t *testing.T) {
 	again.write(&mqtt.Pubcomp{MessageHeader: mqtt.MessageHeader{Level: mqtt.Version311}, PacketID: rel.PacketID})
 	waitInflightEmpty(t, b, "out-q2-resume")
 	expectNoMessage(t, again, 150*time.Millisecond)
-}
-
-// TestSessionStateCopiesQoS2State pins the store contract for the new fields: a
-// SessionStore never hands out a slice the caller can mutate behind its back, and
-// the QoS 2 state is copied with the rest of the state.
-func TestSessionStateCopiesQoS2State(t *testing.T) {
-	store := NewMemorySessionStore()
-	in := SessionState{
-		ClientID:    "copy-qos2",
-		InboundQoS2: []uint16{7},
-		Inflight: []SessionInflight{
-			{PacketID: 9, Topic: "copy/x", Payload: []byte("p"), QoS: 2, Stage: InflightAwaitPubrec},
-		},
-	}
-	store.Save("copy-qos2", in)
-	in.InboundQoS2[0] = 99
-	in.Inflight[0].PacketID = 100
-
-	got, ok := store.Load("copy-qos2")
-	if !ok {
-		t.Fatal("Load reported no session after Save")
-	}
-	if len(got.InboundQoS2) != 1 || got.InboundQoS2[0] != 7 {
-		t.Fatalf("stored inbound state = %v, want [7]", got.InboundQoS2)
-	}
-	if len(got.Inflight) != 1 || got.Inflight[0].PacketID != 9 || got.Inflight[0].Stage != InflightAwaitPubrec {
-		t.Fatalf("stored inflight state = %+v, want packet 9 awaiting PUBREC", got.Inflight)
-	}
 }

@@ -919,7 +919,7 @@ func test311PublishQoS2(t *testing.T) {
 		// session is what keeps it.
 		_ = pub.conn.Close()
 		waitDisconnected(t, rb, "q2-reconnect-pub")
-		stored, ok := rb.store.Load("q2-reconnect-pub")
+		stored, ok := rb.persist.LoadSession("q2-reconnect-pub")
 		if !ok || len(stored.InboundQoS2) != 1 || stored.InboundQoS2[0] != 21 {
 			t.Fatalf("stored inbound QoS 2 state = %+v (ok=%v), want packet id 21", stored.InboundQoS2, ok)
 		}
@@ -958,7 +958,7 @@ func test311PublishQoS2(t *testing.T) {
 		}
 		clean.disconnect()
 		waitDisconnected(t, rb, "q2-reconnect-pub")
-		if stored, ok := rb.store.Load("q2-reconnect-pub"); ok {
+		if stored, ok := rb.persist.LoadSession("q2-reconnect-pub"); ok {
 			t.Fatalf("a session that ended left state behind: %+v", stored)
 		}
 		fresh, _ := mustConnect(t, rb.Addr(), confConnect{clientID: "q2-reconnect-pub", clean: true})

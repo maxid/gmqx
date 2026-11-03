@@ -18,12 +18,13 @@ gmqx 只有一个 import 路径和一个引擎。`github.com/maxid/gmqx` 是**�
 |---|---|---|
 | `gmqx`（根） | **只有门面**：`facade.go` 是包文档与全部别名/转发，`version.go` 是版本。两个非测试文件，无逻辑。 | `Broker`、`Config`、`Publication`、`LocalTarget`、`Dispatcher`、错误值、hook 别名 |
 | `internal/engine` | **装配**：broker 生命周期（`New`/`Start`/`Stop`）、clientId 表与接管规则、会话簿记（store 的 take/save/sweep、离线队列与上限）、待发 will 调度、插件宿主，以及 `conn.Host` 的实现。 | `Broker`、`Config`、错误值、`conn.Host` 方法 |
+| `internal/persist` | **持久化接缝**：一个 gcache store 同时保存两类记录（持久会话、保留消息），负责键方案、TTL 规则、带版本的编码与原子取走。 | `Store`、`New`、`SaveSession`/`TakeSession`、`SaveRetained`/`Retained` |
 | `conn` | **一条物理连接**：CONNECT/AUTH 握手、读循环、写队列与 writer 协程、出站 QoS 1/2 窗口与单一重传定时器、will 判定、字节速率整形。只通过 `conn.Host` 与 broker 对话。 | `Client`、`Host`、`Limits`、`Origin`、`Handoff`、`Shaping` |
 | `routing` | **路由表与共享订阅的节点选举**：精确/通配桶、每 filter 活跃计数、带轮转游标的共享组、离线会话条目，以及“哪个节点投递这条共享发布”的集群选择。持有 `routing.Endpoint`，从不持有连接类型。 | `Index`、`Target`、`Endpoint`、`Election` |
-| `session` | **会话状态与其持久化接缝**：在线形态（`State`/`Pending`/`Subscription`/`Inflight`）与存储形态（`SessionState`）及两者之间的投影，`SessionStore` SPI 与内存/Redis 两个实现。 | `State`、`SessionState`、`SessionStore`、`MemorySessionStore`、`RedisSessionStore` |
+| `session` | **在线会话状态**：连接交给 host 的订阅、队列与 QoS 2 状态。存储形态在 `internal/persist`。 | `State`、`Pending`、`Subscription`、`Inflight` |
 | `cluster` | **集群后端**：契约与事件类型、gossip（默认）/ TCP mesh / Redis 三个后端，以及可观测视图（`StatsView`、`LinkView`、`PresenceView`、`RoutingView`）。 | `Cluster`、`ClusterMessage`、`NewGossipCluster`、`NewTCPCluster`、`NewRedisCluster` |
 | `hook` | **扩展点契约**：认证、ACL、事件 sink、指标、拦截器、连接信息、载荷 codec 与插件宿主槽位。 | `AuthManager`、`AclManager`、`EventSink`、`MetricsManager`、`Interceptor`、`Codec`、`Host` |
-| `retained` | **保留消息表**（含过期）；使用它的策略在 broker 里。 | `Store` |
+| `retained` | **保留消息热表**：SUBSCRIBE 扫描的内存副本，带 Message Expiry 截止时间；持久副本在 `internal/persist`。 | `Table`、`Message` |
 | `client` | **MQTT 客户端库**（主动连出的一侧），与 broker 无关：不 import 本仓任何其他包。 | `Client`、`Config` |
 | `internal/{namespace,topic,mqtt5,clusterkit}` | 共享规则而不是角色：键的命名空间、主题过滤器、MQTT 5 属性与订阅标识规则、集群去重与摘要。 | — |
 
@@ -35,12 +36,13 @@ flowchart TD
   engine["internal/engine<br/>装配 · conn.Host · 会话簿记"]
   conn["conn<br/>连接状态机"]
   routing["routing<br/>Index · Target · Election"]
-  session["session<br/>State · SessionStore"]
+  session["session<br/>在线会话状态"]
   cluster["cluster<br/>gossip · TCP · Redis"]
   hook["hook<br/>扩展点契约"]
   retained["retained"]
   client["client<br/>MQTT 客户端库<br/>（不 import 本仓其他包）"]
   internal["internal/{namespace,topic,mqtt5,clusterkit}"]
+  persist["internal/persist<br/>会话 + 保留消息，一个 store"]
 
   root --> engine
   root --> cluster
@@ -53,7 +55,10 @@ flowchart TD
   engine --> cluster
   engine --> hook
   engine --> retained
+  engine --> persist
   engine --> internal
+  persist --> session
+  persist --> retained
 
   conn --> routing
   conn --> session
@@ -88,7 +93,7 @@ sequenceDiagram
   participant B as engine.Broker
   participant C as conn.Client
   participant R as routing.Index
-  participant S as SessionStore
+  participant S as internal/persist
   participant K as Cluster
 
   B->>C: conn.New(broker, shapedConn) + Handshake()
@@ -144,8 +149,9 @@ store 与在线表从不同时持有同一个键，这正是“一条发布恰�
 | 出站 QoS 1/2 窗口、重传、packet id 分配 | `conn` |
 | 主题匹配到哪些会话、共享组成员轮转 | `routing` |
 | “哪个节点投递这条共享发布”的集群选择 | `routing`（`Election`） |
-| 会话在重连之间保留什么、存储编码 | `session` |
-| `SessionStore` 契约或自带的两个 store | `session` |
+| 会话在重连之间保留什么 | `session` |
+| 写进 store 的内容、键、TTL、编码、原子取走 | `internal/persist` |
+| 用哪个后端、怎么配置 | `Config.Store` / `Config.Locker`（`gcache.RemoteStore`） |
 | broker 生命周期、connect mode、接管、限额、偏移 | `internal/engine` |
 | 会话簿记、离线队列上限、过期清扫 | `internal/engine` |
 | 延迟 will、插件宿主、cluster 适配器 | `internal/engine` |
@@ -165,7 +171,8 @@ gmqx/
   internal/engine/          装配：Broker、conn.Host、会话簿记、will、插件
   conn/                     一条物理连接及其状态机
   routing/                  路由表与共享订阅的节点选举
-  session/                  会话状态与 SessionStore 接缝
+  session/                  在线会话状态
+  internal/persist/         会话 + 保留消息，一个 gcache store
   cluster/                  gossip / TCP mesh / Redis 三个后端
   hook/                     扩展点契约
   retained/                 保留消息表

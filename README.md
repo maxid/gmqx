@@ -22,16 +22,16 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
 - MQTT 5: CONNACK capability properties, Topic Alias, User Property forwarding,
   subscription options (no-local / retain-as-published / retain-handling), reason
   codes and DISCONNECT on protocol errors
-- Persistent-session storage with a bounded offline queue and MQTT 5 Session
-  Expiry Interval: a session with no live connection keeps what its subscriptions
-  match (FIFO, caps per session and globally), drains it right after the next
-  CONNACK, and is deleted by a bounded sweeper when its expiry interval elapses.
-  The state lives behind the `SessionStore` seam (`Load`/`Save`/`Delete`/`Keys`),
-  whose default is the in-memory store of earlier versions.
-- A persistence and availability blueprint (`docs/PERSISTENCE.md`): what has to
-  survive a restart and what may not, the contract a `SessionStore`
-  implementation must satisfy, the shipped Redis blueprint, a SQL sketch and a
-  sizing worksheet for the offline queues
+- Persistent-session storage and retained-message persistence through **one seam**:
+  `Config.Store` is a [`gcache.RemoteStore`](https://github.com/maxid/gcache) (the
+  default is gcache's in-process memory store), and `Config.Locker` makes it a
+  shared store. Sessions keep their subscriptions, offline queue, QoS 2 state and
+  expiry deadline; retained messages keep their payload, QoS, properties and
+  Message Expiry — all written through with the state's own deadline as the TTL.
+- A persistence and availability guide (`docs/PERSISTENCE.md`): what has to
+  survive a restart and what may not, the key scheme and the atomic take, how the
+  shipped backends differ (`memory`, `redis`, `olric`) and a sizing worksheet for
+  the offline queues
 - QoS 0/1/2 flows with per-subscription QoS capping, broker-side outbound QoS 1/2
   retransmission (DUP on PUBLISH retries, PUBREL retries until PUBCOMP, one timer
   per connection, capped exponential backoff) and inflight windows backed by a
@@ -89,8 +89,8 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   dispatcher never re-implements topic matching
 - Subscription index for routing: local matching is one map lookup for a literal
   filter plus one match per distinct wildcard filter, so a publish no longer
-  enumerates the connections or the stored sessions and never calls
-  `SessionStore` on the publish path
+  enumerates the connections or the stored sessions and never calls the
+  persistence store on the publish path
 - Directed publish: `Broker.PublishToClient(ctx, clientID, Publication)` delivers
   to one client id — the live local connection, the local persistent session
   (queued, drained on its next CONNECT) or the cluster node that holds it; the
@@ -109,9 +109,10 @@ A lightweight, embeddable **MQTT 3.1.1 broker** written in Go.
   the peer side, and a connect-time kick that carries the connect time of the
   connection that produced it, so a duplicate connection on another node is closed
   while a delayed kick cannot close a newer one)
-- Shared persistent sessions across the nodes of a cluster: the opt-in
-  `RedisSessionStore` keeps subscriptions and the offline queue in the same Redis the
-  cluster backend uses, so a client that reconnects to another node resumes them
+- Shared sessions and retained messages across the nodes of a cluster: point
+  `Config.Store` at a shared backend (`gcache/redis`, `gcache/olric`) and set
+  `Config.Locker`, and a client that reconnects to another node resumes its
+  session while a retained message published anywhere replays everywhere
 - Shared subscriptions (MQTT 5 §4.8.2): `$share/{ShareName}/{filter}` is validated
   per the ShareName rules (a malformed one is refused with SUBACK 0x8F, a filter
   that merely starts with `$share` stays a literal filter, and No Local on a shared
@@ -157,10 +158,11 @@ flowchart TD
   engine["internal/engine<br/>assembly · conn.Host · session bookkeeping"]
   conn["conn<br/>connection state machine"]
   routing["routing<br/>Index · Target · Election"]
-  session["session<br/>State · SessionStore"]
+  session["session<br/>live session state"]
   cluster["cluster<br/>gossip · TCP · Redis"]
   hook["hook<br/>extension contracts"]
-  retained["retained"]
+  retained["retained<br/>hot table"]
+  persist["internal/persist<br/>sessions + retained in one gcache store"]
   client["client<br/>MQTT client library"]
 
   root --> engine
@@ -173,6 +175,8 @@ flowchart TD
   engine --> cluster
   engine --> hook
   engine --> retained
+  engine --> persist
+  persist --> session
   conn --> routing
   conn --> session
   conn --> hook
@@ -340,7 +344,9 @@ needed.
 | `MaxOfflineQueueSize` | 1000 | messages queued per offline session; the oldest is dropped |
 | `MaxTotalOfflineMessages` | 100000 | messages queued for all offline sessions; new ones are rejected |
 | `SessionSweepInterval` | 30 s | how often expired sessions are deleted (negative: never) |
-| `SessionStore` | `MemorySessionStore` | persistence seam for offline session state; `NewRedisSessionStore` shares it across the nodes of a Redis cluster |
+| `Store` | `gcache/memory` | persistence backend for sessions and retained messages (`gcache.RemoteStore`); `gcache/redis` or `gcache/olric` shares it across nodes |
+| `Locker` | nil | distributed lock (`gcache.Locker`) that makes session takes atomic and marks the store as shared |
+| `KeyPrefix` | `gmqx:` | key namespace of the two records |
 | `Auth` / `ACL` / `Sink` / `Metrics` | allow-all / no-op | pluggable SPI |
 | `Authenticator` / `AuthMethods` | nil / empty | MQTT 5 enhanced authentication: the `AuthExchange` factory per method and the methods the broker supports (a CONNECT naming another method is refused with 0x8C) |
 | `Namespace` | `""` (default) | isolation scope for sessions, retained state and cluster traffic |
@@ -612,9 +618,9 @@ Consequences, deliberately chosen:
 
 A SUBSCRIBE may carry a Subscription Identifier (property `0x0B`, value
 1..268435455). The identifier is state of the **subscription**, not of the
-connection: it is stored with the filter, written to the `SessionStore` with it
-(`SessionSubscription.SubscriptionIdentifiers`), restored on a resume, and copied
-into every PUBLISH that subscription causes:
+connection: it is stored with the filter, written to the persistence record with
+it (`SessionSubscription.SubscriptionIdentifiers`), restored on a resume, and
+copied into every PUBLISH that subscription causes:
 
 - a live delivery, including one that matched several subscriptions of the session
   — one PUBLISH carrying all of their identifiers, deduplicated (§3.3.2.3.8);
@@ -753,88 +759,58 @@ Behaviour changes for existing deployments:
 A persistent session (Clean Session cleared; on MQTT 5, Clean Start cleared and a
 non-zero Session Expiry Interval) keeps state while it has no live connection:
 its subscriptions, the messages published to those subscriptions, and the
-deadline after which the state ends. All of it lives behind `SessionStore`, and
+deadline after which the state ends. All of it lives behind the persistence seam, and
 the state of a session with no owner is what the store holds — a live connection
 owns its session, so a publication reaches a session exactly once.
 
-`SessionStore` (`Load`, `Save`, `Delete`, `Keys`) exists so a deployment can move
-session state out of process. `New` installs `MemorySessionStore` when
-`Config.SessionStore` is nil, which is exactly the in-memory behavior of earlier
-versions and stays the default; `NewRedisSessionStore` is the other implementation
-this package ships (see **Shared sessions** below). The broker calls the
-store with its own session lock held, so an implementation must not call back
-into the broker. Routing does not read the store at all: the broker indexes a
-session's subscriptions when it saves it and removes them when it takes it over or
-expires it. `Keys` is still required — `New` uses it once to index sessions a
-deployment restored before the broker was created, and the expiry sweeper uses it
-to find the deadlines to enforce. A store written behind a running broker's back
-is not re-read.
-
-**Shared sessions.** By default a session lives on the node that holds it, so a
-client that reconnects to another node starts from nothing.
-`NewRedisSessionStore` moves that state into Redis, and
-`NewRedisClusterWithSessionStore(cfg)` builds the Redis cluster backend and the
-store from one `RedisClusterConfig`, so both use the same address, database and
-`ChannelPrefix`:
-
-```go
-redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(gmqx.RedisClusterConfig{
-    Addr: "redis:6379",
-})
-if err != nil {
-    return err
-}
-defer sessions.Close()
-broker, _ := gmqx.New(gmqx.Config{
-    NodeID:         "n1",
-    ClusterBackend: redisCluster,
-    SessionStore:   sessions,
-})
-```
-
-The store keeps one key per stored session under the cluster prefix:
+`Config.Store` is a `gcache.RemoteStore`; `New` installs gcache's in-process memory
+store when it is nil, which is the in-memory behavior of earlier versions and
+stays the default. Every write goes through one encoding, versioned and keyed by
+kind:
 
 | Key | Contents | TTL |
 |---|---|---|
-| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON `{v, client, expires, subs, queue}`: the session's subscriptions with their options, its queued messages with payload, QoS, retain flag and property block, and its deadline | the session's own deadline |
+| `<KeyPrefix>session:<namespaceKey(ns, clientID)>` | JSON record v1: subscriptions with their options and identifiers, the queued messages with payload/QoS/retain/property block, the inbound QoS 2 ids, the outbound exchanges with their packet id and stage, and the deadline | the session's own deadline |
+| `<KeyPrefix>retained:<namespaceKey(ns, topic)>` | JSON record v1: namespace, topic, payload, QoS, property block and deadline | the retained message's Message Expiry |
 
-The key is the one the broker asks for — already namespace-qualified — so two
-namespaces sharing one Redis never collide, and the segment `session` shares
-nothing with the cluster's own `node`, `owner`, `member`, `subs` and `client`
-keys. The TTL is the session, not a cache lifetime: a session with a Session Expiry
-Interval expires from Redis at its deadline even if no sweeper runs, a session
-without one (MQTT 3.1.1) is written without a TTL, and a state whose deadline
-already passed is deleted instead of written. A value that does not decode is
-removed and counted (`RecordDroppedMessage("session_store_corrupt")`) so one
-broken record cannot fail a CONNECT, and a failed Redis command is counted as
-`"session_store_error"` and degrades to "no session" (at-most-once, like the
-cluster transport).
+Routing never reads the store: the broker indexes a session's subscriptions when
+it saves it and removes them when it takes it over or expires it, and the retained
+replay scans the broker's hot table. The store is read on a CONNECT (take or
+load), at start-up (to index what a previous process stored, when the backend can
+enumerate through `gcache.Scanner`) and never on the publish path.
 
-Two rules keep one session from being served by two nodes:
+**Shared state.** By default the state lives on the node that holds it, so a
+client that reconnects to another node starts from nothing. Point `Config.Store`
+at a shared backend and set `Config.Locker`:
 
-- Taking a session is atomic (`Take`, one Redis round trip that reads and deletes),
-  so two nodes reconnecting the same client id at the same time cannot both resume
-  it. The store also satisfies the optional `SharedSessionStore` interface, which
-  the broker uses when a peer's kick displaces a connection: the displaced node
-  neither saves its own copy back (which would resurrect a session the peer is
-  already serving) nor deletes the key (which would erase the state the peer saved).
-  With the default in-memory store the previous behavior is unchanged — the state of
-  a kicked session stays where it is, because only that node can reach it.
-- A clean CONNECT discards the shared session wherever it is received, and the
-  sweeper of each node only expires the keys of its own namespace.
+```go
+import (
+    "github.com/maxid/gcache/redis"
+    "github.com/redis/go-redis/v9"
+)
 
-The store carries state, not routing: a publication is queued for a stored session
-by a node that has it in its routing index (the node that stored it, or one that
-started with it present). As with the node-local store, a publication another node
-receives does not queue for an offline session here unless the cluster routes it
-there (see the limitations below). `Save` replaces the whole record, and the
-broker's session lock only serialises the writers of one node, so two nodes
-queueing for the same stored session at the same instant can lose one of them —
-the queue of an offline session is effectively owned by the node that stored it.
+client := goredis.NewClient(&goredis.Options{Addr: "redis:6379"})
+store, _ := redis.NewStore(client)                       // gcache.RemoteStore
+locker, _ := redis.NewLocker(client, "gmqx:fencing")     // gcache.Locker
+broker, _ := gmqx.New(gmqx.Config{
+    NodeID:  "n1",
+    Store:   store,
+    Locker:  locker,
+    // ClusterBackend: ... (routing still travels through the cluster)
+})
+```
 
-The full blueprint — what has to survive a restart, what a backing store must
-guarantee, the Redis deployment rules, a SQL sketch and a sizing worksheet — is
-[`docs/PERSISTENCE.md`](docs/PERSISTENCE.md).
+A `Locker` is also the signal that the store is multi-node: with one, taking a
+session is a per-key `TryAcquire` + get + delete, so two nodes reconnecting the
+same client id cannot both resume it, and a connection displaced by a peer's kick
+neither writes its copy back nor deletes the key. Without one, the take is
+load-then-delete and the store is single-writer, which is what the default
+in-process store is.
+
+The key scheme and the encoding are documented in full in
+[`docs/PERSISTENCE.md`](docs/PERSISTENCE.md), together with the backend matrix
+(`memory` / `redis` / `olric`, the last one currently without enumeration) and the
+sizing worksheet.
 
 **Expiry.** MQTT 5's Session Expiry Interval is a deadline:
 `ConnectInfo.SessionExpiry` is stamped on disconnect as `now + interval`, and a
@@ -1361,21 +1337,21 @@ redisCluster := gmqx.NewRedisCluster(gmqx.RedisClusterConfig{
 broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 ```
 
-The same Redis can also hold the sessions of the cluster, so a client that
-reconnects to another node resumes its subscriptions and its queue instead of
-starting from nothing. That is opt-in and built from the same configuration:
+The same Redis can also hold the sessions and retained messages of the cluster, so
+a client that reconnects to another node resumes its subscriptions and its queue
+instead of starting from nothing. That is a separate seam: build a gcache store
+over the same Redis and pass it as `Config.Store` (see **Shared state** in the
+persistent-session section):
 
 ```go
-redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(cfg) // cfg: RedisClusterConfig
-if err != nil {
-    return err
-}
-defer sessions.Close()
-broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, SessionStore: sessions})
+redisCluster, _ := gmqx.NewRedisCluster(gmqx.RedisClusterConfig{Addr: "redis:6379"})
+store, _ := gredis.NewStore(client)                    // gcache/redis
+locker, _ := gredis.NewLocker(client, "gmqx:fencing")  // gcache.Locker
+broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, Store: store, Locker: locker})
 ```
 
-See **Shared sessions** in the persistent-session section for the key layout, the
-TTL rule and what a takeover does to a shared session.
+The persistence keys live under `Config.KeyPrefix` (`gmqx:` by default), not under
+the cluster's `ChannelPrefix`, so the two kinds of key never collide.
 
 ### Keys and channels
 
@@ -1389,7 +1365,6 @@ Every key and channel sits under one prefix (`ChannelPrefix`, default
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`: liveness and identity | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, shared, updated}`: subscription summary, `shared` being the node's shared subscription groups | `SummaryTTL` |
 | `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`: which node holds the client id | `PresenceTTL` |
-| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON session record, written by `RedisSessionStore` when it is configured (see [Shared sessions](#persistent-sessions-the-offline-queue-and-qos-12-retransmission)) | the session's deadline |
 
 A node subscribes to its own channel and to nothing else. A publish is one
 `PUBLISH` per interested node, so N nodes cost O(N) Redis operations rather than

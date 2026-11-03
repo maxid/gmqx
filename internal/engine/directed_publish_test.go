@@ -435,7 +435,7 @@ func TestRedisClusterForgetsExpiredSessionPresence(t *testing.T) {
 	key := redisTestPresenceKey(cfg, "", "expiring-presence")
 	waitFor(t, "the presence record of the offline session", func() bool { return mr.Exists(key) })
 	waitFor(t, "the stored session to expire", func() bool {
-		_, ok := b.store.Load("expiring-presence")
+		_, ok := b.persist.LoadSession("expiring-presence")
 		return !ok
 	})
 	waitFor(t, "the presence record of the expired session to be removed", func() bool {

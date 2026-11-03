@@ -132,9 +132,9 @@ func TestIndexMatchesFilters(t *testing.T) {
 // behind.
 func TestIndexTransitions(t *testing.T) {
 	idx := NewIndex()
-	idx.SetStored("a", "a", map[string]session.SessionSubscription{
+	idx.SetStored("a", "a", map[string]session.Subscription{
 		"stored/x": {QoS: 1},
-	}, time.Time{})
+	}, time.Time{}, 0)
 	if got := len(idx.Targets("stored/x", "", 1, false)); got != 1 {
 		t.Fatalf("stored session targets = %d, want 1", got)
 	}
@@ -208,7 +208,7 @@ func TestIndexTarget(t *testing.T) {
 	idx := NewIndex()
 	e := &fakeEndpoint{id: "live", connID: "conn/live"}
 	idx.SetLive("live", e, map[string]session.Subscription{"t": {QoS: 1}})
-	idx.SetStored("stored", "stored", map[string]session.SessionSubscription{"t": {QoS: 1}}, time.Now().Add(-time.Hour))
+	idx.SetStored("stored", "stored", map[string]session.Subscription{"t": {QoS: 1}}, time.Now().Add(-time.Hour), 0)
 
 	live, ok := idx.Target("live", 2, true)
 	if !ok || live.Offline() || live.Endpoint() != e || live.ConnectionID != "conn/live" || live.QoS != 2 || !live.Retain {
@@ -228,7 +228,7 @@ func TestIndexTarget(t *testing.T) {
 // its directed target still exists — the queue path is what counts that drop.
 func TestIndexStoredExpiry(t *testing.T) {
 	idx := NewIndex()
-	idx.SetStored("gone", "gone", map[string]session.SessionSubscription{"e/x": {QoS: 1}}, time.Now().Add(-time.Second))
+	idx.SetStored("gone", "gone", map[string]session.Subscription{"e/x": {QoS: 1}}, time.Now().Add(-time.Second), 0)
 	if got := len(idx.Targets("e/x", "", 1, false)); got != 0 {
 		t.Fatalf("expired session targets = %d, want 0", got)
 	}
@@ -243,7 +243,7 @@ func TestIndexStoredExpiry(t *testing.T) {
 func TestIndexSharedGroups(t *testing.T) {
 	const group = "$share/workers/jobs/+"
 	idx := NewIndex()
-	idx.SetStored("offline", "offline", map[string]session.SessionSubscription{group: {QoS: 1}}, time.Time{})
+	idx.SetStored("offline", "offline", map[string]session.Subscription{group: {QoS: 1}}, time.Time{}, 0)
 	if idx.SharedGroupCount() != 0 || len(idx.LiveSharedGroups()) != 0 {
 		t.Fatal("a stored session joined a shared group")
 	}
@@ -274,7 +274,7 @@ func TestIndexSharedGroups(t *testing.T) {
 		t.Fatal("an unknown group produced a target")
 	}
 
-	idx.SetStored("a", "a", map[string]session.SessionSubscription{group: {QoS: 1}}, time.Time{})
+	idx.SetStored("a", "a", map[string]session.Subscription{group: {QoS: 1}}, time.Time{}, 0)
 	if got := idx.SharedGroupCount(); got != 1 {
 		t.Fatalf("shared groups after one member went offline = %d, want 1", got)
 	}
@@ -292,7 +292,7 @@ func TestIndexLiveFilters(t *testing.T) {
 	liveSession(idx, "b", "z/x", session.Subscription{QoS: 1})
 	liveSession(idx, "c", "a/+", session.Subscription{QoS: 1})
 	liveSession(idx, "d", "$share/g/z/#", session.Subscription{QoS: 1})
-	idx.SetStored("offline", "offline", map[string]session.SessionSubscription{"stored/x": {QoS: 1}}, time.Time{})
+	idx.SetStored("offline", "offline", map[string]session.Subscription{"stored/x": {QoS: 1}}, time.Time{}, 0)
 
 	if got := idx.LiveFilters(); !reflect.DeepEqual(got, []string{"a/+", "z/x"}) {
 		t.Fatalf("live filters = %v, want [a/+ z/x] (shared and stored excluded)", got)

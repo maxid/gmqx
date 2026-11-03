@@ -23,12 +23,13 @@ contracts change for different reasons. Each has a package; the assembly layer
 |---|---|---|
 | `gmqx` (root) | **Facade only**: `facade.go` holds the package doc and every alias/forward, `version.go` the version. Two non-test files, no logic. | `Broker`, `Config`, `Publication`, `LocalTarget`, `Dispatcher`, the error values, the hook aliases |
 | `internal/engine` | **Assembly**: broker lifecycle (`New`/`Start`/`Stop`), the clientId table and takeover rules, the session bookkeeping (store take/save/sweep, offline queue and caps), the pending-will scheduler, the plugin host, and the `conn.Host` implementation. | `Broker`, `Config`, `Errors`, `conn.Host` methods |
+| `internal/persist` | **The persistence seam**: one gcache store holds both records (a persistent session, a retained message), with the key scheme, the TTL rule, the versioned encoding and the atomic take. | `Store`, `New`, `SaveSession`/`TakeSession`, `SaveRetained`/`Retained` |
 | `conn` | **One physical connection**: CONNECT/AUTH handshake, read loop, write-behind queue and its writer goroutine, outbound QoS 1/2 window with one retransmission timer, the will decision, byte-rate shaping. Talks to the broker only through `conn.Host`. | `Client`, `Host`, `Limits`, `Origin`, `Handoff`, `Shaping` |
 | `routing` | **Routing table and shared-subscription election**: exact/wildcard buckets, per-filter live counts, shared groups with their round-robin cursor, stored-session entries, and the cluster-wide choice of the node that delivers a shared publication. Holds `routing.Endpoint`, never a connection type. | `Index`, `Target`, `Endpoint`, `Election` |
-| `session` | **Session state and its persistence seam**: the live form (`State`, `Pending`, `Subscription`, `Inflight`) and the stored form (`SessionState`) with the projection between them, the `SessionStore` SPI and the in-memory and Redis implementations. | `State`, `SessionState`, `SessionStore`, `MemorySessionStore`, `RedisSessionStore` |
+| `session` | **The live session state**: the subscriptions, the queue and the QoS 2 state a connection hands to its host. The stored form is `internal/persist`'s. | `State`, `Pending`, `Subscription`, `Inflight` |
 | `cluster` | **Cluster backends**: the contract and event types, the gossip (default), TCP-mesh and Redis backends, and the observable views (`StatsView`, `LinkView`, `PresenceView`, `RoutingView`). | `Cluster`, `ClusterMessage`, `NewGossipCluster`, `NewTCPCluster`, `NewRedisCluster` |
 | `hook` | **Extension contracts**: authentication, ACL, event sink, metrics, interceptor, connection info, payload codecs and the plugin host slots. | `AuthManager`, `AclManager`, `EventSink`, `MetricsManager`, `Interceptor`, `Codec`, `Host` |
-| `retained` | **Retained-message store** with expiry; the broker owns the policy that uses it. | `Store` |
+| `retained` | **The retained hot table**: the in-memory copy a SUBSCRIBE scans, with the Message Expiry deadline. The durable copy is `internal/persist`'s. | `Table`, `Message` |
 | `client` | **MQTT client library** (the outbound side). Independent of the broker: imports no other gmqx package. | `Client`, `Config` |
 | `internal/{namespace,topic,mqtt5,clusterkit}` | Shared rules, not a role: key scoping, topic filters, MQTT 5 property and subscription-identifier rules, cluster dedup and summary. | — |
 
@@ -40,12 +41,13 @@ flowchart TD
   engine["internal/engine<br/>assembly · conn.Host · session bookkeeping"]
   conn["conn<br/>connection state machine"]
   routing["routing<br/>Index · Target · Election"]
-  session["session<br/>State · SessionStore"]
+  session["session<br/>live session state"]
   cluster["cluster<br/>gossip · TCP · Redis"]
   hook["hook<br/>extension contracts"]
   retained["retained"]
   client["client<br/>MQTT client library<br/>(imports nothing else here)"]
   internal["internal/{namespace,topic,mqtt5,clusterkit}"]
+  persist["internal/persist<br/>sessions + retained in one store"]
 
   root --> engine
   root --> cluster
@@ -58,7 +60,10 @@ flowchart TD
   engine --> cluster
   engine --> hook
   engine --> retained
+  engine --> persist
   engine --> internal
+  persist --> session
+  persist --> retained
 
   conn --> routing
   conn --> session
@@ -97,7 +102,7 @@ sequenceDiagram
   participant B as engine.Broker
   participant C as conn.Client
   participant R as routing.Index
-  participant S as SessionStore
+  participant S as internal/persist
   participant K as Cluster
 
   B->>C: conn.New(broker, shapedConn) + Handshake()
@@ -162,8 +167,9 @@ unconfirmed exchanges for retransmission under their original packet ids.
 | the outbound QoS 1/2 window, retransmission, packet-id allocation | `conn` |
 | which sessions a topic matches, shared-group member rotation | `routing` |
 | the cluster-wide choice of the node that delivers a shared publication | `routing` (`Election`) |
-| what a session keeps across a reconnect, the stored encoding | `session` |
-| the SessionStore contract or the shipped stores | `session` |
+| what a session keeps across a reconnect | `session` |
+| what is written to the store, its keys, TTL, encoding, atomic take | `internal/persist` |
+| which backend, how it is configured | `Config.Store` / `Config.Locker` (a `gcache.RemoteStore`) |
 | broker lifecycle, connect mode, takeover, limits, offsets | `internal/engine` |
 | session bookkeeping, offline-queue caps, expiry sweep | `internal/engine` |
 | delayed wills, plugin host, cluster adapter | `internal/engine` |
@@ -184,7 +190,8 @@ gmqx/
   internal/engine/           assembly: Broker, conn.Host, session bookkeeping, wills, plugins
   conn/                      one physical connection and its state machine
   routing/                   routing table and shared-subscription election
-  session/                   session state and the SessionStore seam
+  session/                   the live session state
+  internal/persist/          sessions + retained messages in one gcache store
   cluster/                   gossip / TCP mesh / Redis backends
   hook/                      extension contracts
   retained/                  retained-message store

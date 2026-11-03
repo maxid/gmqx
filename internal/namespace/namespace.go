@@ -21,7 +21,7 @@ func Key(namespace, name string) string {
 	return namespace + "\x00" + name
 }
 
-// InNamespace reports whether a session key belongs to namespace. A SessionStore can be
+// InNamespace reports whether a session key belongs to namespace. A shared store can be
 // shared by brokers of different namespaces (a store is not owned by a namespace), so the
 // broker only routes to, and only expires, the keys of its own scope.
 func InNamespace(namespace, key string) bool {

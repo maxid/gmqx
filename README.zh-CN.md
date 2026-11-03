@@ -19,13 +19,12 @@
 - MQTT 5：CONNACK 能力属性、Topic Alias、User Property 转发、
   订阅选项（no-local / retain-as-published / retain-handling）、原因码，
   以及协议错误时的 DISCONNECT
-- 持久会话存储、有界离线队列与 MQTT 5 Session Expiry Interval：没有活动连接的会话
-  保留其订阅匹配到的消息（FIFO，按会话与全局双重上限），在下次 CONNACK 之后立即按序
-  投递，并在过期间隔到达后由有界清扫器删除。状态位于 `SessionStore` 接缝之后
-  （`Load`/`Save`/`Delete`/`Keys`），默认即为早期版本的内存存储。
-- 持久化与可用性蓝皮书（`docs/PERSISTENCE.zh-CN.md`）：哪些状态必须跨重启存活、哪些不必，
-  `SessionStore` 实现必须满足的契约，已交付的 Redis 蓝图，一份 SQL 速写与离线队列的容量
-  估算表
+- 持久会话与保留消息通过**同一个接缝**持久化：`Config.Store` 是一个
+  [`gcache.RemoteStore`](https://github.com/maxid/gcache)（默认是 gcache 的进程内内存实现），
+  `Config.Locker` 让它成为跨节点共享。会话保存订阅、离线队列、QoS 2 状态与过期截止时间；保留
+  消息保存载荷、QoS、属性与 Message Expiry——两者都以自身截止时间作为 TTL 写穿透。
+- 持久化与可用性指南（`docs/PERSISTENCE.zh-CN.md`）：哪些状态必须跨重启存活、键方案与原子
+  取走、自带后端的差异（`memory`/`redis`/`olric`）以及离线队列的容量估算表
 - QoS 0/1/2 流程（按订阅 QoS 降级）、broker 侧出站 QoS 1/2 重传（PUBLISH 重传带 DUP、
   PUBREL 重传到 PUBCOMP、每连接一个定时器、有上限的指数退避）以及由每连接有界队列支撑的
   inflight 窗口：窗口满时按 FIFO 排队、腾出位置后再投递，既不阻塞也不丢弃。入站 QoS 2
@@ -72,8 +71,9 @@
 - 连接模式：`UNIQUE` / `KICK`（client id 接管；MQTT 5 上被顶掉的连接收到 DISCONNECT 0x8E；
   `NotKickSeconds` 防抖窗口在 CONNECT 端与收到 kick 的对端都生效；CONNECT 时 kick 携带产生
   该事件的连接的建立时间，因此它仍会关闭其他节点上的重复连接，而迟到的 kick 无法关闭更新的连接）
-- 集群内共享持久会话：可选的 `RedisSessionStore` 把订阅与离线队列放进集群后端所用的同一个
-  Redis，客户端重连到其他节点时会话得以恢复
+- 集群内共享会话与保留消息：把 `Config.Store` 指向共享后端（`gcache/redis`、`gcache/olric`）
+  并设置 `Config.Locker`，客户端重连到另一个节点即可恢复会话，任一节点发布的保留消息在所有
+  节点重放
 - 共享订阅（MQTT 5 §4.8.2）：`$share/{ShareName}/{filter}` 按 ShareName 规则校验
   （畸形的按过滤器回 SUBACK 0x8F；只以 `$share` 开头的普通过滤器仍是字面量过滤器；
   共享订阅上的 No Local 被拒绝），单节点按 round-robin 只投递给组内一个活成员；
@@ -88,7 +88,7 @@
   每会话与全局离线队列长度、连接速率限制
 - 优雅关闭与 client-id 会话接管
 - 路由索引：本地匹配对字面量过滤器只需一次 map 查找，每个不同的通配过滤器只匹配一次，
-  publish 不再遍历连接或已存储会话，发布路径也不会调用 `SessionStore`
+  publish 不再遍历连接或已存储会话，发布路径也不会调用持久化 store
 - 定向发布：`Broker.PublishToClient(ctx, clientID, Publication)` 投递到指定 client id
   （本地活连接、本地持久会话的离线队列，或持有该 id 的集群节点）；Redis 后端通过带 TTL 的
   client-id presence 路由，TCP 网状后端广播、各节点仅在持有该 id 时应用
@@ -114,10 +114,11 @@ flowchart TD
   engine["internal/engine<br/>装配 · conn.Host · 会话簿记"]
   conn["conn<br/>连接状态机"]
   routing["routing<br/>Index · Target · Election"]
-  session["session<br/>State · SessionStore"]
+  session["session<br/>在线会话状态"]
   cluster["cluster<br/>gossip · TCP · Redis"]
   hook["hook<br/>扩展点契约"]
-  retained["retained"]
+  retained["retained<br/>内存热表"]
+  persist["internal/persist<br/>会话 + 保留消息，一个 gcache store"]
   client["client<br/>MQTT 客户端库"]
 
   root --> engine
@@ -130,6 +131,8 @@ flowchart TD
   engine --> cluster
   engine --> hook
   engine --> retained
+  engine --> persist
+  persist --> session
   conn --> routing
   conn --> session
   conn --> hook
@@ -250,7 +253,9 @@ go run ./examples/client-demo -addr 127.0.0.1:1883 -topic demo/hello -qos 2 -ver
 | `MaxOfflineQueueSize` | 1000 | 每个离线会话的队列上限；满时丢弃最旧的 |
 | `MaxTotalOfflineMessages` | 100000 | 所有离线会话的队列上限；满时拒绝最新的 |
 | `SessionSweepInterval` | 30 s | 过期会话的清理间隔（负值：不清理） |
-| `SessionStore` | `MemorySessionStore` | 离线会话状态的持久化接缝；`NewRedisSessionStore` 使其在 Redis 集群各节点间共享 |
+| `Store` | `gcache/memory` | 会话与保留消息的持久化后端（`gcache.RemoteStore`）；`gcache/redis`/`gcache/olric` 可跨节点共享 |
+| `Locker` | nil | 分布式锁（`gcache.Locker`），让会话取走原子化并标记 store 为共享 |
+| `KeyPrefix` | `gmqx:` | 两类记录的键命名空间 |
 | `Auth` / `ACL` / `Sink` / `Metrics` | 全部放行 / 空实现 | 可插拔 SPI |
 | `Authenticator` / `AuthMethods` | nil / 空 | MQTT 5 增强认证：按方法返回 `AuthExchange` 的工厂，以及 broker 支持的方法集合（CONNECT 命名其它方法时以 0x8C 拒绝） |
 | `Namespace` | `""`（默认） | 会话、保留状态与集群流量的隔离作用域 |
@@ -458,7 +463,7 @@ chosen     = candidates[(fnv64(groupKey) + seat) % len(candidates)]
 ### 订阅标识符
 
 SUBSCRIBE 可以携带 Subscription Identifier（属性 `0x0B`，取值 1..268435455）。它属于**订阅**
-而不是连接：随过滤器一起保存、写入 `SessionStore`（`SessionSubscription.SubscriptionIdentifiers`）、
+而不是连接：随过滤器一起保存、写入持久化记录（`SessionSubscription.SubscriptionIdentifiers`）、
 会话恢复时还原，并附加到该订阅产生的每条 PUBLISH：
 
 - 实时投递；一个会话有多个匹配订阅时，一条 PUBLISH 携带它们全部的标识符并去重（§3.3.2.3.8）；
@@ -565,70 +570,47 @@ context 携带 `AuthTimeout` 截止时间（时限为正时回调可能跑在 br
 
 持久会话（Clean Session 清零；MQTT 5 上为 Clean Start 清零且 Session Expiry Interval
 非零）在没有活动连接时保留状态：订阅、投递给这些订阅的消息，以及状态结束的截止时间。
-这些状态都位于 `SessionStore` 之后，并且存储中保存的正是“没有归属连接”的会话——活动连接
-拥有自己的会话，因此一条 publish 只会到达一个会话一次。
+这些状态都位于持久化接缝之后，并且存储中保存的正是"没有归属连接"的会话——活动连接拥有自己
+的会话，因此一条 publish 只会到达一个会话一次。
 
-`SessionStore`（`Load`、`Save`、`Delete`、`Keys`）存在的目的是让部署可以把会话状态移出
-进程。当 `Config.SessionStore` 为 nil 时 `New` 安装 `MemorySessionStore`，即早期版本的
-内存行为完全不变，且它仍是默认值；本包还提供另一个实现 `NewRedisSessionStore`（见下面的
-**共享会话**）。broker 在持有自身会话锁的情况下调用存储，
-因此实现不得回调 broker。路由完全不读取存储：broker 在保存会话时把其订阅写入路由索引，
-在接管或过期时移除。`Keys` 仍然必需——`New` 用它把部署在 broker 创建之前恢复进存储的会话
-索引一次，过期清扫器用它枚举需要执行的截止时间；运行中的 broker 不会重读被外部进程写入的
-存储。
-
-**共享会话。** 默认情况下会话只存在于持有它的节点上，因此重连到另一个节点的客户端会从零
-开始。`NewRedisSessionStore` 把这份状态放进 Redis，而
-`NewRedisClusterWithSessionStore(cfg)` 用一份 `RedisClusterConfig` 同时构建 Redis 集群后端
-与该存储，两者使用相同的地址、数据库与 `ChannelPrefix`：
-
-```go
-redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(gmqx.RedisClusterConfig{
-    Addr: "redis:6379",
-})
-if err != nil {
-    return err
-}
-defer sessions.Close()
-broker, _ := gmqx.New(gmqx.Config{
-    NodeID:         "n1",
-    ClusterBackend: redisCluster,
-    SessionStore:   sessions,
-})
-```
-
-存储为每个已存储会话保留一个键，位于集群前缀之下：
+`Config.Store` 是一个 `gcache.RemoteStore`；为 nil 时 `New` 安装 gcache 的进程内内存实现，
+即早期版本的内存行为，仍是默认值。每次写入都走同一套带版本的编码，按类别分键：
 
 | 键 | 内容 | TTL |
 |---|---|---|
-| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON `{v, client, expires, subs, queue}`：会话的订阅及其选项、排队消息（payload、QoS、retain 标志与属性块）以及会话截止时间 | 会话自身的截止时间 |
+| `<KeyPrefix>session:<namespaceKey(ns, clientID)>` | JSON 记录 v1：订阅及其选项与标识符、排队消息（payload/QoS/retain/属性块）、入站 QoS 2 id、出站 exchange（packet id 与 stage）以及截止时间 | 会话自身截止时间 |
+| `<KeyPrefix>retained:<namespaceKey(ns, topic)>` | JSON 记录 v1：namespace、topic、payload、QoS、属性块与截止时间 | 保留消息的 Message Expiry |
 
-键正是 broker 请求的那个键（已带命名空间前缀），因此共用同一个 Redis 的两个命名空间不会
-相撞，而 `session` 段与集群自己的 `node`、`owner`、`member`、`subs`、`client` 键没有任何
-重叠。TTL 是会话本身而不是缓存寿命：带 Session Expiry Interval 的会话即使没有清扫器运行也会
-在到期时从 Redis 消失，没有该间隔的会话（MQTT 3.1.1）不设 TTL，而截止时间已过的状态会被
-删除而不是写入。无法解码的值会被删除并计入
-（`RecordDroppedMessage("session_store_corrupt")`），一条坏记录不会让 CONNECT 失败；Redis
-命令失败计入 `"session_store_error"` 并退化为“没有会话”（与集群传输一样是至多一次语义）。
+路由从不读 store：broker 在保存会话时把订阅写入路由索引、在接管或过期时移除，保留消息的重放
+扫描 broker 的内存热表。store 只在 CONNECT（取走或载入）、启动时（后端能通过 `gcache.Scanner`
+枚举时，索引上一个进程写下的状态）被读取，发布路径从不访问。
 
-两条规则避免同一个会话被两个节点同时服务：
+**共享状态。** 默认情况下状态只存在于持有它的节点上，重连到另一个节点的客户端从零开始。把
+`Config.Store` 指向共享后端并设置 `Config.Locker`：
 
-- 取出会话是原子操作（`Take`，一次 Redis 往返完成读取与删除），因此两个节点同时对同一个
-  client id 重连时不会都恢复该会话。该存储还实现了可选的 `SharedSessionStore` 接口，broker
-  在对端 kick 顶掉连接时使用它：被顶掉的节点既不把自己的副本写回（那会让对端正服务的会话
-  复活），也不删除该键（那会抹掉对端刚保存的状态）。使用默认内存存储时行为不变——被 kick
-  的会话状态留在原处，因为只有该节点能访问它。
-- clean CONNECT 无论落在哪个节点都会丢弃共享会话，而且每个节点的清扫器只清理自己命名空间
-  的键。
+```go
+import (
+    "github.com/maxid/gcache/redis"
+    "github.com/redis/go-redis/v9"
+)
 
-存储搬运的是状态而不是路由：为已存储会话排队的，是把它放进自己路由索引的节点（保存它的
-节点，或启动时它就存在的节点）。与节点本地存储一样，另一个节点收到的 publish 不会为这里的
-离线会话排队，除非集群把它路由过来（见下面的已知限制）。`Save` 替换整条记录，而 broker
-的会话锁只串行化单个节点的写入，因此两个节点同时为同一个已存储会话排队时可能丢掉其中一条
-——离线会话的队列实际上由保存它的节点独占。
+client := goredis.NewClient(&goredis.Options{Addr: "redis:6379"})
+store, _ := redis.NewStore(client)                    // gcache.RemoteStore
+locker, _ := redis.NewLocker(client, "gmqx:fencing")  // gcache.Locker
+broker, _ := gmqx.New(gmqx.Config{
+    NodeID: "n1",
+    Store:  store,
+    Locker: locker,
+    // ClusterBackend: ...（实时路由仍由集群承担）
+})
+```
 
-完整蓝皮书——哪些状态必须跨重启存活、后端存储必须保证什么、Redis 部署规则、SQL 速写与
-容量估算表——见 [`docs/PERSISTENCE.zh-CN.md`](docs/PERSISTENCE.zh-CN.md)。
+`Locker` 同时是"该 store 多节点共享"的信号：有它时，取走会话是 per-key 的 `TryAcquire` + get
++ delete，两个节点不会都恢复同一会话，被 peer kick 顶替的连接既不写回副本也不删键；没有它时
+是 load-then-delete，store 为单写者——默认的进程内 store 正是这种。
+
+键方案与编码的完整说明见 [`docs/PERSISTENCE.zh-CN.md`](docs/PERSISTENCE.zh-CN.md)，其中包括后端
+对照表（`memory`/`redis`/`olric`，最后一个当前不支持枚举）与 `docs/PERSISTENCE.zh-CN.md`。
 
 **过期。** MQTT 5 的 Session Expiry Interval 是一个截止时间：断连时把
 `ConnectInfo.SessionExpiry` 记为 `now + interval`，有界清扫器（`SessionSweepInterval`，
@@ -1002,19 +984,19 @@ redisCluster := gmqx.NewRedisCluster(gmqx.RedisClusterConfig{
 broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster})
 ```
 
-同一个 Redis 也可以保存集群的会话，使重连到另一个节点的客户端恢复其订阅与队列而不是从零
-开始。这是可选项，并且由同一份配置构建：
+同一个 Redis 也可以保存集群的会话与保留消息，使重连到另一个节点的客户端恢复其订阅与队列而
+不是从零开始。那是**另一个接缝**：在同一个 Redis 上构建 gcache store，作为 `Config.Store`
+传入（见持久会话一节的 **共享状态**）：
 
 ```go
-redisCluster, sessions, err := gmqx.NewRedisClusterWithSessionStore(cfg) // cfg: RedisClusterConfig
-if err != nil {
-    return err
-}
-defer sessions.Close()
-broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, SessionStore: sessions})
+redisCluster, _ := gmqx.NewRedisCluster(gmqx.RedisClusterConfig{Addr: "redis:6379"})
+store, _ := gredis.NewStore(client)                    // gcache/redis
+locker, _ := gredis.NewLocker(client, "gmqx:fencing")  // gcache.Locker
+broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, Store: store, Locker: locker})
 ```
 
-键布局、TTL 规则以及接管对共享会话的影响见持久会话一节的 **共享会话**。
+持久化键在 `Config.KeyPrefix`（默认 `gmqx:`）之下，与集群的 `ChannelPrefix` 分开，两类键不会
+相撞。
 
 ### 键与通道
 
@@ -1028,7 +1010,6 @@ broker, _ := gmqx.New(gmqx.Config{NodeID: "n1", ClusterBackend: redisCluster, Se
 | `<prefix>:member:<nodeID>` | JSON `{node, inc, since}`：存活性与身份 | `NodeTTL` |
 | `<prefix>:subs:<nodeID>` | JSON `{node, filters, updated}`：订阅摘要 | `SummaryTTL` |
 | `<prefix>:client:<namespaceKey(ns, clientID)>` | `<nodeID>\x00<incarnation>`：client id 由哪个节点持有 | `PresenceTTL` |
-| `<prefix>:session:<namespaceKey(ns, clientID)>` | JSON 会话记录，由配置的 `RedisSessionStore` 写入（见 [共享会话](#持久会话离线队列与-qos-12-重传)） | 会话的截止时间 |
 
 一个节点只订阅自己的通道，不订阅其他任何通道。一次 publish 会为每个
 感兴趣的节点各执行一次 `PUBLISH`，因此 N 个节点的代价是 O(N) 次 Redis 操作

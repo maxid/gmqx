@@ -38,7 +38,7 @@ func TestSessionExpirySweepSessions(t *testing.T) {
 	c.disconnect()
 	waitDisconnected(t, b, "expiring")
 
-	stored, ok := b.store.Load("expiring")
+	stored, ok := b.persist.LoadSession("expiring")
 	if !ok {
 		t.Fatal("the persistent MQTT 5 session was not stored")
 	}
@@ -56,7 +56,7 @@ func TestSessionExpirySweepSessions(t *testing.T) {
 	}
 
 	waitFor(t, "the session to expire", func() bool {
-		_, ok := b.store.Load("expiring")
+		_, ok := b.persist.LoadSession("expiring")
 		return !ok
 	})
 	waitFor(t, "the expiry to be counted", func() bool { return metrics.count("session_expired") > 0 })
@@ -117,7 +117,7 @@ func TestSessionExpiryResumeInsideWindow(t *testing.T) {
 	// The resumed session gets a new deadline when it disconnects again.
 	second.disconnect()
 	waitDisconnected(t, b, "renewing")
-	stored, ok := b.store.Load("renewing")
+	stored, ok := b.persist.LoadSession("renewing")
 	if !ok || stored.ExpiresAt.IsZero() || !stored.ExpiresAt.After(time.Now().Add(50*time.Second)) {
 		t.Fatalf("re-stamped deadline = %v (ok=%v), want about 60 s from now", stored.ExpiresAt, ok)
 	}
@@ -138,7 +138,7 @@ func TestSessionExpiryZeroIntervalNeverExpires(t *testing.T) {
 	c.disconnect()
 	waitDisconnected(t, b, "v311-forever")
 
-	stored, ok := b.store.Load("v311-forever")
+	stored, ok := b.persist.LoadSession("v311-forever")
 	if !ok {
 		t.Fatal("the MQTT 3.1.1 persistent session was not stored")
 	}
@@ -147,7 +147,7 @@ func TestSessionExpiryZeroIntervalNeverExpires(t *testing.T) {
 	}
 	// Many sweeper ticks pass and the session stays.
 	time.Sleep(50 * time.Millisecond)
-	if _, ok := b.store.Load("v311-forever"); !ok {
+	if _, ok := b.persist.LoadSession("v311-forever"); !ok {
 		t.Fatal("a session without an expiry interval was swept")
 	}
 	if n := metrics.count("session_expired"); n != 0 {
@@ -165,7 +165,7 @@ func TestSessionExpiryZeroIntervalNeverExpires(t *testing.T) {
 	subscribe(t, c5, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "zero/#", QoS: 1})
 	c5.disconnect()
 	waitDisconnected(t, b, "v5-zero")
-	if _, ok := b.store.Load("v5-zero"); ok {
+	if _, ok := b.persist.LoadSession("v5-zero"); ok {
 		t.Fatal("an MQTT 5 session with a zero Session Expiry Interval was stored")
 	}
 }
@@ -187,12 +187,12 @@ func TestSessionExpiryCheckedOnResume(t *testing.T) {
 
 	// Move the deadline into the past; the sweeper is effectively disabled, so
 	// only the CONNECT path can reject the session.
-	stored, ok := b.store.Load("stale")
+	stored, ok := b.persist.LoadSession("stale")
 	if !ok {
 		t.Fatal("the session was not stored")
 	}
 	stored.ExpiresAt = time.Now().Add(-time.Second)
-	b.store.Save("stale", stored)
+	b.persist.SaveSession("stale", stored)
 
 	again, ack := mustConnect(t, b.Addr(), confConnect{
 		version:  mqtt.Version5,
@@ -206,7 +206,7 @@ func TestSessionExpiryCheckedOnResume(t *testing.T) {
 	pub, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "stale-pub", clean: true})
 	pub.publish(confPublish{topic: "stale/x", payload: "no", qos: 0})
 	expectNoMessage(t, again, 100*time.Millisecond)
-	if _, ok := b.store.Load("stale"); ok {
+	if _, ok := b.persist.LoadSession("stale"); ok {
 		t.Fatal("the expired session is still stored")
 	}
 }

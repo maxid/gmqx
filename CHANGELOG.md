@@ -7,6 +7,25 @@
 
 ## 2026-11-03
 
+### Changed
+
+- **One persistence seam for sessions and retained messages.** `Config.Store` is a
+  [`gcache.RemoteStore`](https://github.com/maxid/gcache) and `Config.Locker` makes it
+  a store several nodes write; the broker writes a persistent session (subscriptions,
+  offline queue, QoS 2 state, expiry deadline) and a retained message (payload, QoS,
+  properties, Message Expiry) through the same key scheme and versioned JSON encoding,
+  with each record's own deadline as its TTL. A store that implements `gcache.Scanner`
+  is read at start-up (sessions are indexed, retained messages fill the hot table); the
+  expiry sweep walks the routing index, so it does not need enumeration. The default is
+  gcache's in-process memory store, i.e. exactly the previous in-memory behavior.
+  **Breaking:** the `SessionStore` SPI, `MemorySessionStore`, `RedisSessionStore`,
+  `RedisSessionStoreConfig`, `SessionState`/`SessionInflight`/`SessionSubscription`/
+  `QueuedMessage`/`InflightStage`, `retained.Store`/`NewStore` and `Config.SessionStore`
+  are gone; the `contrib/sessionstore-gcache` module is deleted (its logic lives in
+  `internal/persist`). A deployment that used `RedisSessionStore` passes `gcache/redis`'s
+  store as `Config.Store` and its locker as `Config.Locker`; retained messages now
+  survive a restart when a shared backend is configured.
+
 ### Added
 
 - **A hook can see which listener accepted a connection.** `hook.ConnInfo` gained
@@ -173,8 +192,6 @@
 
 - `hook.NoopMetrics` (formerly `NoopMetrics` in the root package): embed it and override
   only the counters that matter.
-
-### Changed
 
 - **The extension contracts moved to `gmqx/hook`.** `ConnectInfo`, `AuthManager`,
   `AuthExchange` (`AuthStatus`/`AuthStep`), `AclManager` (`AclAction`/`SessionInfo`),

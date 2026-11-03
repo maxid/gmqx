@@ -4,7 +4,7 @@ package routing
 //
 // The index is the broker's answer to "which local sessions does this publication
 // match", and it replaces the scan the broker used to run on every publish (every
-// live connection, every stored session, and a SessionStore.Keys + Load round trip
+// live connection, every stored session, and a store Keys + Load round trip
 // for each of them, all under the broker's global lock).
 //
 // Shape:
@@ -128,6 +128,11 @@ type indexedSession struct {
 	// subs is the session's subscription set. It is only read and written while
 	// the index lock is held.
 	subs map[string]sessionstate.Subscription
+	// queued is how many messages the stored session's offline queue holds. The
+	// broker keeps the global offline-queue counter with it: the store may evict an
+	// expired value before the broker deletes it, so the index is the only copy of
+	// that number that is still reliable at sweep time.
+	queued int
 }
 
 // routedSubscription is one (filter, session) entry: the subscription that makes
@@ -183,27 +188,50 @@ func (idx *Index) SetLive(key string, e Endpoint, subs map[string]sessionstate.S
 // whatever the session had before. The session is indexed even when it has no
 // filters, so a directed publish can find it and queue the publication.
 //
-// It takes the stored form of the subscription set: a session restored from a
-// SessionStore is the one caller that has no live form of its own (the state the
-// broker took over goes through SetLive).
-func (idx *Index) SetStored(key, clientID string, subs map[string]sessionstate.SessionSubscription, expiresAt time.Time) {
+// It returns how many queued messages the entry it replaced held, so the caller
+// keeps its global offline-queue counter right when it stores a session twice.
+func (idx *Index) SetStored(key, clientID string, subs map[string]sessionstate.Subscription, expiresAt time.Time, queued int) int {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	prev := 0
+	if old := idx.sessions[key]; old != nil && old.endpoint == nil {
+		prev = old.queued
+	}
 	idx.replaceLocked(&indexedSession{
 		key:       key,
 		clientID:  clientID,
 		expiresAt: expiresAt,
-		subs:      sessionstate.CopySubscriptions(sessionstate.SubscriptionsFromStored(subs)),
+		subs:      sessionstate.CopySubscriptions(subs),
+		queued:    queued,
 	})
+	return prev
 }
 
-// Remove drops every entry of a session. It is the transition of a session that
-// ended: the store entry is deleted (clean connect, expiry) or taken over, so the
-// session is not a local target any more.
-func (idx *Index) Remove(key string) {
+// SetQueued records how many messages the stored session under key now holds. It
+// is what the offline write path updates after it appends to the queue, so the
+// index's copy of the count (and the broker's global counter) stay right even when
+// the store later evicts the value.
+func (idx *Index) SetQueued(key string, queued int) {
 	idx.mu.Lock()
-	idx.removeLocked(key)
+	if s := idx.sessions[key]; s != nil && s.endpoint == nil {
+		s.queued = queued
+	}
 	idx.mu.Unlock()
+}
+
+// Remove drops every entry of a session and returns how many queued messages its
+// stored form held (zero for a live or unknown session). It is the transition of a
+// session that ended: the store entry is deleted (clean connect, expiry) or taken
+// over, so the session is not a local target any more.
+func (idx *Index) Remove(key string) int {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	queued := 0
+	if s := idx.sessions[key]; s != nil && s.endpoint == nil {
+		queued = s.queued
+	}
+	idx.removeLocked(key)
+	return queued
 }
 
 // Add installs one subscription of the session's live connection. A connection the
@@ -516,6 +544,44 @@ func (s *indexedSession) localTarget(now time.Time, pubQoS byte, pubRetain bool,
 		target.sessionKey = s.key
 	}
 	return target, true
+}
+
+// Deadline returns the expiry deadline of the stored session under key, and false
+// when the index does not hold it as a stored session. It is what lets the sweeper
+// re-check one candidate after taking the broker lock.
+func (idx *Index) Deadline(key string) (deadline time.Time, queued int, ok bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	s, ok := idx.sessions[key]
+	if !ok || s.endpoint != nil {
+		return time.Time{}, 0, false
+	}
+	return s.expiresAt, s.queued, true
+}
+
+// ExpiredSession is one stored session whose deadline passed.
+type ExpiredSession struct {
+	// Key is the session key the index holds it under.
+	Key string
+	// ClientID is the MQTT client id of the session, for the presence record the
+	// sweeper has to forget.
+	ClientID string
+}
+
+// Expired returns the stored sessions whose deadline passed by now. It is what the
+// expiry sweeper walks: the index holds every stored session together with its
+// deadline, so the sweep does not depend on the store being enumerable.
+func (idx *Index) Expired(now time.Time) []ExpiredSession {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var out []ExpiredSession
+	for key, s := range idx.sessions {
+		if s.endpoint != nil || s.expiresAt.IsZero() || now.Before(s.expiresAt) {
+			continue
+		}
+		out = append(out, ExpiredSession{Key: key, ClientID: s.clientID})
+	}
+	return out
 }
 
 // LiveFilters returns the filters subscribed by at least one live session, sorted

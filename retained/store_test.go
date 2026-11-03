@@ -6,7 +6,7 @@ import (
 )
 
 func TestStorePutGetDelete(t *testing.T) {
-	s := NewStore()
+	s := NewTable()
 	if _, ok := s.Get("k"); ok {
 		t.Fatal("an empty store returned a message")
 	}
@@ -26,7 +26,7 @@ func TestStorePutGetDelete(t *testing.T) {
 }
 
 func TestStoreCapAcceptsReplacement(t *testing.T) {
-	s := NewStore()
+	s := NewTable()
 	s.Put("a", Message{Topic: "a", Payload: []byte("1")}, 2)
 	s.Put("b", Message{Topic: "b", Payload: []byte("2")}, 2)
 	if s.Put("c", Message{Topic: "c"}, 2) {
@@ -53,7 +53,7 @@ func TestStoreCapAcceptsReplacement(t *testing.T) {
 }
 
 func TestStoreRangeRemovesOnFalse(t *testing.T) {
-	s := NewStore()
+	s := NewTable()
 	now := time.Now()
 	s.Put("live", Message{Topic: "live", ExpiresAt: now.Add(time.Minute)}, 0)
 	s.Put("stale", Message{Topic: "stale", ExpiresAt: now.Add(-time.Minute)}, 0)

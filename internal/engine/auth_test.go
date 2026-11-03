@@ -349,8 +349,8 @@ func assertNoSessions(t *testing.T, b *Broker) {
 	if n != 0 {
 		t.Fatalf("%d sessions registered after a refused connection, want 0", n)
 	}
-	if keys := b.cfg.SessionStore.Keys(); len(keys) != 0 {
-		t.Fatalf("session store keys = %v after a refused connection, want none", keys)
+	if _, stored := b.persist.LoadSession("refused"); stored {
+		t.Fatal("a refused connection stored a session")
 	}
 }
 

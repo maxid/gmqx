@@ -53,7 +53,7 @@ type Handoff struct {
 	ExpiresAt time.Time
 }
 
-// State turns a handoff into the session form a SessionStore persists, with the
+// State turns a handoff into the session form the persistence seam stores, with the
 // pending deliveries appended to the queue in arrival order.
 func (h *Handoff) State() *session.State {
 	queue := h.Queue

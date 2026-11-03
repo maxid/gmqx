@@ -13,16 +13,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/maxid/gcache/memory"
 	"github.com/maxid/gmqx/conn"
 	"github.com/maxid/gmqx/hook"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	ns "github.com/maxid/gmqx/internal/namespace"
+	"github.com/maxid/gmqx/internal/persist"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
 	retainedstore "github.com/maxid/gmqx/retained"
 	"github.com/maxid/gmqx/routing"
-	"github.com/maxid/gmqx/session"
 	sessionstate "github.com/maxid/gmqx/session"
-	sessionstore "github.com/maxid/gmqx/session"
 	"github.com/maxid/gnety"
 	"github.com/maxid/gnety/codec/mqtt"
 	"github.com/maxid/gplugin"
@@ -47,7 +47,9 @@ type Broker struct {
 	nodeID     string
 	namespace  string
 	dispatcher Dispatcher
-	store      SessionStore
+	// persist is the write-through seam of the two states the broker keeps for a
+	// client: persistent sessions and retained messages. It is never nil.
+	persist *persist.Store
 	// index is the routing table: which local session (live or stored) is
 	// subscribed to which filter. It is the only structure a publication is
 	// matched against; gmqx/routing owns its shape and invariants.
@@ -76,7 +78,7 @@ type Broker struct {
 	mu       sync.RWMutex
 	ctx      context.Context // broker lifetime context, set by Start
 	clients  map[string]*conn.Client
-	retained *retainedstore.Store
+	retained *retainedstore.Table
 	servers  []*gnety.Server
 	addrs    map[string]string
 	done     chan struct{}
@@ -209,8 +211,8 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = conn.RandomID()
 	}
-	if cfg.SessionStore == nil {
-		cfg.SessionStore = NewMemorySessionStore()
+	if cfg.Store == nil {
+		cfg.Store = memory.NewStore()
 	}
 	if cfg.MaxOfflineQueueSize == 0 {
 		cfg.MaxOfflineQueueSize = defaultMaxOfflineQueueSize
@@ -275,9 +277,8 @@ func New(cfg Config) (*Broker, error) {
 		log:       logger,
 		namespace: cfg.Namespace.Name,
 		clients:   make(map[string]*conn.Client),
-		store:     cfg.SessionStore,
 		index:     routing.NewIndex(),
-		retained:  retainedstore.NewStore(),
+		retained:  retainedstore.NewTable(),
 		wills:     make(map[string]*pendingWill),
 		addrs:     make(map[string]string),
 		done:      make(chan struct{}),
@@ -293,6 +294,17 @@ func New(cfg Config) (*Broker, error) {
 		metrics:      cfg.Metrics,
 		interceptors: interceptorSlots(cfg.Interceptors),
 	})
+	seam, err := persist.New(persist.Options{
+		Remote:  cfg.Store,
+		Locker:  cfg.Locker,
+		Prefix:  cfg.KeyPrefix,
+		Metrics: b.metrics,
+		Logger:  logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gmqx: persistence: %w", err)
+	}
+	b.persist = seam
 	b.codecs = hook.NewCodecSet()
 	b.plugins = gplugin.NewRegistry[hook.Host](b)
 	// The broker-wide half of the byte-rate shaping: one bucket each for every
@@ -308,6 +320,7 @@ func New(cfg Config) (*Broker, error) {
 	// they were when routing scanned the store on every publish. Sessions the
 	// broker saves later are indexed when they are saved.
 	b.loadStoredSessions()
+	b.loadRetained()
 	if cfg.ConnectionRateLimit > 0 {
 		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
 	}
@@ -1171,6 +1184,7 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 	key := namespaceKey(namespace, topic)
 	if len(payload) == 0 {
 		b.retained.Delete(key)
+		b.persist.DeleteRetained(key)
 		return
 	}
 	m := retainedstore.Message{
@@ -1185,7 +1199,9 @@ func (b *Broker) storeRetained(namespace, topic string, payload []byte, qos byte
 	}
 	if !b.retained.Put(key, m, b.cfg.MaxRetainMessages) {
 		b.metrics().RecordDroppedMessage("max_retain")
+		return
 	}
+	b.persist.SaveRetained(key, m)
 }
 
 // sendRetained replays the retained messages a new subscription matches, in its
@@ -1211,6 +1227,10 @@ func (b *Broker) sendRetained(c *conn.Client, filter string, qos byte, retainAsP
 		props   mqtt.Properties
 	}
 	var msgs []replay
+	// The expired keys are collected and removed after the scan: Table.Range holds
+	// the table's lock while it calls back, so mutating the table inside would
+	// deadlock.
+	var expired []string
 	b.retained.Range(func(key string, m retainedstore.Message) bool {
 		if m.Namespace != c.Namespace() {
 			return true
@@ -1222,14 +1242,19 @@ func (b *Broker) sendRetained(c *conn.Client, filter string, qos byte, retainAsP
 		if !m.ExpiresAt.IsZero() {
 			remaining := m.ExpiresAt.Sub(now)
 			if remaining <= 0 {
-				b.metrics().RecordDroppedMessage("retained_expired")
-				return false
+				expired = append(expired, key)
+				return true
 			}
 			props.MessageExpiryInterval = b.expiryInterval(remaining)
 		}
 		msgs = append(msgs, replay{topic: m.Topic, payload: m.Payload, qos: m.QoS, props: props})
 		return true
 	})
+	for _, key := range expired {
+		b.metrics().RecordDroppedMessage("retained_expired")
+		b.retained.Delete(key)
+		b.persist.DeleteRetained(key)
+	}
 	for _, m := range msgs {
 		props, dropped := mqtt5.WithSubscriptionIDs(m.props, ids)
 		if dropped {
@@ -1458,7 +1483,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, pub Publication) error
 //
 // It answers from the routing index (see gmqx/routing), not by scanning the
 // client table and the store: a literal topic is one map lookup plus one lookup
-// per distinct wildcard filter, and the SessionStore is not consulted at all. The
+// per distinct wildcard filter, and the persistence store is not consulted at all. The
 // broker's own lock is not taken, so a publish never waits for a connection that
 // is registering or leaving.
 //
@@ -2137,7 +2162,7 @@ func (b *Broker) Publish(from conn.Origin, ev hook.PublishEvent, props mqtt.Prop
 }
 
 // Subscribe implements conn.Host.
-func (b *Broker) Subscribe(c *conn.Client, filter string, sub session.Subscription) (byte, bool) {
+func (b *Broker) Subscribe(c *conn.Client, filter string, sub sessionstate.Subscription) (byte, bool) {
 	return b.subscribe(c, filter, sub)
 }
 
@@ -2174,7 +2199,7 @@ func (b *Broker) ScheduleWill(c *conn.Client, delay time.Duration, ev hook.Publi
 // The state itself — the subscriptions to restore, the messages queued while the
 // session was offline, the QoS 2 state of both directions and the expiry deadline —
 // lives in gmqx/session (State, with Stored/StateFromStored as the projection to
-// the SessionStore form). This file is the broker side of it: when the state is
+// the persistence record). This file is the broker side of it: when the state is
 // taken from a store, written back, swept, and how the offline queue and its caps
 // follow it.
 //
@@ -2198,62 +2223,35 @@ func (b *Broker) ScheduleWill(c *conn.Client, delay time.Duration, ev hook.Publi
 // connection.
 //
 // An expired session is never handed over, even when the sweeper has not reached
-// it yet: the Session Expiry Interval is a deadline, not a hint.
+// it yet: the Session Expiry Interval is a deadline, not a hint. The persistence
+// seam deletes an expired value instead of returning it, so the deadline is
+// enforced in both places.
 //
-// The removal is atomic when the store provides Take (a shared store must: see
-// sessionTaker), so two nodes that reconnect the same client id cannot both be
-// handed the session. A node-local store is taken with Load followed by Delete,
-// which its own broker lock already serialises.
+// The removal is atomic when the store has a Locker configured (persist.TakeSession
+// locks the key), so two nodes that reconnect the same client id cannot both be
+// handed the session. Without one the seam loads and deletes, and the broker lock
+// already serialises this node's writers.
 func (b *Broker) takeStoredSession(key string) (*sessionstate.State, bool) {
-	state, ok := b.takeSessionState(key)
+	st, ok := b.persist.TakeSession(key)
 	if !ok {
 		return nil, false
 	}
-	b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
-	if !state.ExpiresAt.IsZero() && !time.Now().Before(state.ExpiresAt) {
-		b.metrics().RecordDroppedMessage("session_expired")
-		return nil, false
-	}
-	s, dropped := sessionstate.StateFromStored(state)
-	if dropped > 0 {
-		b.log.Warn("gmqx dropped queued messages with an undecodable property block",
-			"client", s.ClientID, "count", dropped)
-		b.metrics().RecordDroppedMessage("offline_queue_corrupt")
-	}
-	return s, true
+	b.offlineQueued = max(0, b.offlineQueued-len(st.Queue))
+	return st, true
 }
 
-// takeSessionState removes the state stored under key and returns it: one atomic
-// operation for a store that implements Take, Load and Delete otherwise.
-func (b *Broker) takeSessionState(key string) (SessionState, bool) {
-	if taker, ok := b.store.(sessionTaker); ok {
-		return taker.Take(key)
-	}
-	state, ok := b.store.Load(key)
-	if !ok {
-		return SessionState{}, false
-	}
-	b.store.Delete(key)
-	return state, true
-}
-
-// sharedStore reports whether Config.SessionStore is read and written by several
-// broker nodes, which is what decides whether a connection displaced by a peer's
-// kick may still write to it (see unregister).
-func (b *Broker) sharedStore() bool {
-	shared, ok := b.store.(SharedSessionStore)
-	return ok && shared.SharedAcrossNodes()
-}
+// sharedStore reports whether Config.Store is read and written by several broker
+// nodes, which is what decides whether a connection displaced by a peer's kick may
+// still write to it (see unregister). A configured Locker is the signal: it is
+// what makes an atomic take possible, and only a shared store needs one.
+func (b *Broker) sharedStore() bool { return b.persist.Shared() }
 
 // deleteStoredSession removes key and forgets its queued messages. The caller
 // holds b.mu. The session leaves the routing index with it: an expired or
 // discarded session must not be a target any more.
 func (b *Broker) deleteStoredSession(key string) {
-	if state, ok := b.store.Load(key); ok {
-		b.offlineQueued = max(0, b.offlineQueued-len(state.Queue))
-	}
-	b.store.Delete(key)
-	b.index.Remove(key)
+	b.offlineQueued = max(0, b.offlineQueued-b.index.Remove(key))
+	b.persist.DeleteSession(key)
 }
 
 // saveStoredSession writes the state the connection c handed over: its
@@ -2266,27 +2264,24 @@ func (b *Broker) deleteStoredSession(key string) {
 // this point a matching publication is queued for it instead of written to a
 // connection, and no store call is needed to find out that it is a target.
 func (b *Broker) saveStoredSession(key string, h *conn.Handoff) {
-	if stale, ok := b.store.Load(key); ok {
-		// Defensive: a stored session of a live connection should not exist, but
-		// the counter must follow what the store actually holds.
-		b.offlineQueued = max(0, b.offlineQueued-len(stale.Queue))
-	}
 	// One deadline for both halves: the store the sweeper enforces and the index
 	// that decides whether a publication still finds a target.
 	queue := b.adoptQueue(h)
-	state := (&sessionstate.State{
+	state := &sessionstate.State{
 		ClientID:    h.ClientID,
 		Subs:        h.Subs,
 		Queue:       queue,
 		ExpiresAt:   h.ExpiresAt,
 		InboundQoS2: h.InboundQoS2,
 		Inflight:    h.Inflight,
-	}).Stored()
-	b.store.Save(key, state)
-	b.offlineQueued += len(queue)
+	}
+	b.persist.SaveSession(key, state)
 	// The index is fed the same subscription set the store just got, so a publish
-	// that matches the session is routed exactly like a restored one.
-	b.index.SetStored(key, state.ClientID, state.Subscriptions, h.ExpiresAt)
+	// that matches the session is routed exactly like a restored one. It also
+	// carries the queue length: the global counter has to stay right even after
+	// the backend evicts an expired value before the broker deletes it.
+	previous := b.index.SetStored(key, state.ClientID, state.Subs, h.ExpiresAt, len(queue))
+	b.offlineQueued = max(0, b.offlineQueued-previous) + len(queue)
 }
 
 // adoptQueue merges the deliveries a connection still owed its inflight window
@@ -2333,19 +2328,47 @@ func (b *Broker) adoptQueue(h *conn.Handoff) []sessionstate.Pending {
 // re-read: the broker indexes what it saves, hands over and expires.
 func (b *Broker) loadStoredSessions() {
 	now := time.Now()
-	for _, key := range b.store.Keys() {
+	for _, key := range b.persist.SessionKeys() {
 		if !keyInNamespace(b.namespace, key) {
 			// A store may be shared with a broker of another namespace.
 			continue
 		}
-		state, ok := b.store.Load(key)
+		state, ok := b.persist.LoadSession(key)
 		if !ok {
 			continue
 		}
 		if !state.ExpiresAt.IsZero() && !now.Before(state.ExpiresAt) {
 			continue
 		}
-		b.index.SetStored(key, state.ClientID, state.Subscriptions, state.ExpiresAt)
+		b.index.SetStored(key, state.ClientID, state.Subs, state.ExpiresAt, len(state.Queue))
+		b.offlineQueued += len(state.Queue)
+	}
+}
+
+// loadRetained fills the hot table with the retained messages a previous process
+// stored. A store that cannot enumerate (the default in-process one) has nothing
+// to load, so this is a no-op there. The per-namespace filter is the same as the
+// session load: a store may be shared with a broker of another namespace. A
+// message past its deadline is dropped from both copies; the store's TTL already
+// removed it in most cases, this covers a store without TTL support.
+func (b *Broker) loadRetained() {
+	msgs := b.persist.Retained()
+	if len(msgs) == 0 {
+		return
+	}
+	now := time.Now()
+	for _, m := range msgs {
+		if m.Namespace != b.namespace {
+			continue
+		}
+		key := namespaceKey(m.Namespace, m.Topic)
+		if !m.ExpiresAt.IsZero() && !now.Before(m.ExpiresAt) {
+			b.persist.DeleteRetained(key)
+			continue
+		}
+		if !b.retained.Put(key, m, b.cfg.MaxRetainMessages) {
+			b.metrics().RecordDroppedMessage("max_retain")
+		}
 	}
 }
 
@@ -2377,37 +2400,27 @@ func (b *Broker) sessionSweeper() {
 // sweepExpiredSessions removes the stored sessions whose deadline has passed.
 // Subscriptions and queued messages go with them: the session is gone.
 func (b *Broker) sweepExpiredSessions() {
-	now := time.Now()
-	checked := 0
-	for _, key := range b.store.Keys() {
-		if checked >= maxSessionSweepPerTick {
-			return
-		}
-		if !keyInNamespace(b.namespace, key) {
-			// A store may be shared with a broker of another namespace; its
-			// sessions are that broker's to expire.
-			continue
-		}
-		checked++
-		stored, ok := b.store.Load(key)
-		if !ok || stored.ExpiresAt.IsZero() || now.Before(stored.ExpiresAt) {
-			continue
-		}
+	expired := b.index.Expired(time.Now())
+	if len(expired) > maxSessionSweepPerTick {
+		expired = expired[:maxSessionSweepPerTick]
+	}
+	for _, session := range expired {
+		key := session.Key
 		b.mu.Lock()
 		if _, connected := b.clients[key]; connected {
 			// The session has an owner; its next disconnect stamps a new deadline.
 			b.mu.Unlock()
 			continue
 		}
-		// Re-read under the lock: a reconnect or a new publish may have changed
-		// the entry since the check above.
-		current, ok := b.store.Load(key)
-		if ok && !current.ExpiresAt.IsZero() && !now.Before(current.ExpiresAt) {
+		// Re-check the index under the lock: a reconnect or a save may have
+		// replaced the entry since it was scanned.
+		deadline, _, stored := b.index.Deadline(key)
+		if stored && !deadline.IsZero() && !time.Now().Before(deadline) {
 			b.deleteStoredSession(key)
 			// The session is gone, so no directed publish can be queued for it
 			// here any more: a presence-tracking cluster backend stops routing it to
 			// this node.
-			b.forgetClientPresence(current.ClientID)
+			b.forgetClientPresence(session.ClientID)
 			b.metrics().RecordDroppedMessage("session_expired")
 			b.metrics().RecordQueueDepth("offline", b.offlineQueued)
 		}
@@ -2432,7 +2445,7 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 		_ = live.DeliverPublish(pub.Topic, pub.Payload, target.QoS, target.Retain, props)
 		return
 	}
-	state, ok := b.store.Load(key)
+	state, ok := b.persist.LoadSession(key)
 	if !ok {
 		b.mu.Unlock()
 		b.metrics().RecordDroppedMessage("offline_session_missing")
@@ -2449,25 +2462,19 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 		b.metrics().RecordDroppedMessage("offline_queue_total")
 		return
 	}
-	queue := make([]QueuedMessage, 0, len(state.Queue)+1)
+	queue := make([]sessionstate.Pending, 0, len(state.Queue)+1)
 	queue = append(queue, state.Queue...)
-	// The queued message keeps the MQTT 5 property block of the delivery, which
-	// carries the target's subscription identifiers when it has any: they are part
-	// of the subscription state and have to be there when the session drains its
-	// queue after the next CONNACK. Without them the block the publisher sent is
-	// stored unchanged, so an ordinary message is not re-encoded.
-	wireProps := pub.Props
-	if len(props.SubscriptionIdentifiers) > 0 {
-		if encoded, err := mqtt5.EncodePropertyBlock(props); err == nil {
-			wireProps = encoded
-		}
-	}
-	queue = append(queue, QueuedMessage{
+	// The queued message keeps the typed properties of the delivery, which carry
+	// the target's subscription identifiers when it has any: they are part of the
+	// subscription state and have to be there when the session drains its queue
+	// after the next CONNACK. The payload is copied because the publication's
+	// buffer is reused by the connection's read loop.
+	queue = append(queue, sessionstate.Pending{
 		Topic:   pub.Topic,
 		Payload: append([]byte(nil), pub.Payload...),
 		QoS:     target.QoS,
 		Retain:  target.Retain,
-		Props:   append([]byte(nil), wireProps...),
+		Props:   props,
 	})
 	queued := 1
 	evicted := false
@@ -2479,7 +2486,8 @@ func (b *Broker) enqueueOffline(target LocalTarget, pub Publication, props mqtt.
 	}
 	b.offlineQueued += queued
 	state.Queue = queue
-	b.store.Save(key, state)
+	b.persist.SaveSession(key, state)
+	b.index.SetQueued(key, len(queue))
 	depth := b.offlineQueued
 	b.mu.Unlock()
 
@@ -2962,65 +2970,3 @@ func ContextWithConn(ctx context.Context, info ConnInfo) context.Context {
 
 // ConnFromContext forwards to hook.ConnFromContext.
 func ConnFromContext(ctx context.Context) (ConnInfo, bool) { return hook.ConnFromContext(ctx) }
-
-// The session store lives in gmqx/session (docs/design/source-layout.md §2, rule L3):
-// the root package re-exports its types as aliases and forwards the constructors, so
-// Config.SessionStore, an implementation outside this module (contrib/sessionstore-
-// gcache) and the stores this package ships all name the same types as before.
-
-type (
-	// SessionStore is the persistence seam of persistent-session state.
-	SessionStore = sessionstore.SessionStore
-	// SharedSessionStore is a SessionStore that several broker nodes share.
-	SharedSessionStore = sessionstore.SharedSessionStore
-	// SessionState is the state of one persistent session with no live connection.
-	SessionState = sessionstore.SessionState
-	// InflightStage is where a stored outbound exchange stood when its connection
-	// ended.
-	InflightStage = sessionstore.InflightStage
-	// SessionInflight is one outbound QoS 1/2 exchange a session owes its client.
-	SessionInflight = sessionstore.SessionInflight
-	// SessionSubscription is one subscription of a stored sessionstore.
-	SessionSubscription = sessionstore.SessionSubscription
-	// QueuedMessage is one message queued for an offline persistent sessionstore.
-	QueuedMessage = sessionstore.QueuedMessage
-	// MemorySessionStore is the default node-local store.
-	MemorySessionStore = sessionstore.MemorySessionStore
-	// RedisSessionStore is the store shared by the nodes of a Redis cluster.
-	RedisSessionStore = sessionstore.RedisSessionStore
-	// RedisSessionStoreConfig configures the Redis-backed store.
-	RedisSessionStoreConfig = sessionstore.RedisSessionStoreConfig
-)
-
-const (
-	InflightAwaitPuback  = sessionstore.InflightAwaitPuback
-	InflightAwaitPubrec  = sessionstore.InflightAwaitPubrec
-	InflightAwaitPubcomp = sessionstore.InflightAwaitPubcomp
-)
-
-// NewMemorySessionStore builds the default node-local store.
-func NewMemorySessionStore() *MemorySessionStore { return sessionstore.NewMemorySessionStore() }
-
-// NewRedisSessionStore builds the Redis-backed store and validates its
-// configuration.
-func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, error) {
-	return sessionstore.NewRedisSessionStore(cfg)
-}
-
-// NewRedisClusterWithSessionStore builds the Redis cluster backend and the Redis
-// session store of one cluster from one RedisClusterConfig: both use the same
-// address, database and key prefix, so the sessions a node stores are the ones its
-// peers take over.
-func NewRedisClusterWithSessionStore(cfg RedisClusterConfig) (Cluster, *RedisSessionStore, error) {
-	return sessionstore.NewRedisClusterWithSessionStore(cfg)
-}
-
-// sessionTaker is implemented by a SessionStore that can remove a stored session
-// atomically and hand it to one caller. A shared store needs it: Load followed by
-// Delete is two round trips, so two nodes reconnecting the same client id at the
-// same time could both see the session and both serve it. The method is exported
-// so an implementation outside this module can provide it; the interface is
-// unexported because only the broker decides when to take a sessionstore.
-type sessionTaker interface {
-	Take(key string) (SessionState, bool)
-}

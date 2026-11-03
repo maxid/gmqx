@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxid/gmqx/session"
 	"github.com/maxid/gnety/codec/mqtt"
 )
 
@@ -27,7 +28,7 @@ func offlineSession(t *testing.T, b *Broker, clientID, filter string, qos byte) 
 	c.disconnect()
 	waitDisconnected(t, b, clientID)
 	waitFor(t, "client "+clientID+" to be stored", func() bool {
-		_, ok := b.store.Load(clientID)
+		_, ok := b.persist.LoadSession(clientID)
 		return ok
 	})
 }
@@ -57,8 +58,8 @@ func TestOfflineQueueDrainsAfterConnack(t *testing.T) {
 	b := startBroker(t, Config{})
 	offlineSession(t, b, "queue-sub", "queue/#", 1)
 
-	stored, ok := b.store.Load("queue-sub")
-	if !ok || len(stored.Queue) != 0 || len(stored.Subscriptions) != 1 {
+	stored, ok := b.persist.LoadSession("queue-sub")
+	if !ok || len(stored.Queue) != 0 || len(stored.Subs) != 1 {
 		t.Fatalf("stored session before publishing = %+v (ok=%v)", stored, ok)
 	}
 
@@ -67,7 +68,7 @@ func TestOfflineQueueDrainsAfterConnack(t *testing.T) {
 		pub.mustPublish(t, confPublish{topic: "queue/x", payload: payload, qos: 1, pid: uint16(i + 1)})
 	}
 
-	stored, ok = b.store.Load("queue-sub")
+	stored, ok = b.persist.LoadSession("queue-sub")
 	if !ok || len(stored.Queue) != 3 {
 		t.Fatalf("stored queue = %d messages (ok=%v), want 3", len(stored.Queue), ok)
 	}
@@ -102,7 +103,7 @@ func TestOfflineQueueDrainsAfterConnack(t *testing.T) {
 	expectNoMessage(t, sub, 100*time.Millisecond)
 
 	// The queue moved to the connection: the stored session no longer holds it.
-	if stored, ok := b.store.Load("queue-sub"); ok {
+	if stored, ok := b.persist.LoadSession("queue-sub"); ok {
 		t.Fatalf("the drained session is still stored: %+v", stored)
 	}
 	if depth := offlineDepth(b); depth != 0 {
@@ -160,13 +161,13 @@ func TestOfflineQueueOrderAcrossReconnects(t *testing.T) {
 func TestResumedSessionWithoutSubscriptionsCanSubscribe(t *testing.T) {
 	b := startBroker(t, Config{})
 	first, _ := mustConnect(t, b.Addr(), confConnect{clientID: "empty-session", clean: false})
-	if _, ok := b.store.Load("empty-session"); ok {
+	if _, ok := b.persist.LoadSession("empty-session"); ok {
 		t.Fatal("a connected session was stored")
 	}
 	first.disconnect()
 	waitDisconnected(t, b, "empty-session")
-	stored, ok := b.store.Load("empty-session")
-	if !ok || len(stored.Subscriptions) != 0 {
+	stored, ok := b.persist.LoadSession("empty-session")
+	if !ok || len(stored.Subs) != 0 {
 		t.Fatalf("stored session = %+v (ok=%v), want one without subscriptions", stored, ok)
 	}
 
@@ -195,7 +196,7 @@ func TestOfflineQueuePerSessionCapDropsOldest(t *testing.T) {
 	for i, payload := range []string{"one", "two", "three"} {
 		pub.mustPublish(t, confPublish{topic: "cap/x", payload: payload, qos: 1, pid: uint16(i + 1)})
 	}
-	stored, ok := b.store.Load("cap-sub")
+	stored, ok := b.persist.LoadSession("cap-sub")
 	if !ok || len(stored.Queue) != 2 {
 		t.Fatalf("stored queue = %d messages (ok=%v), want the 2 newest", len(stored.Queue), ok)
 	}
@@ -235,7 +236,7 @@ func TestOfflineQueueGlobalCapRejectsNewest(t *testing.T) {
 		t.Fatalf("global offline counter = %d, want 2", depth)
 	}
 	// The cap rejects the newest message, so the two accepted ones are the oldest.
-	stored, ok := b.store.Load("total-a")
+	stored, ok := b.persist.LoadSession("total-a")
 	if !ok || len(stored.Queue) != 2 {
 		t.Fatalf("stored queue = %d messages (ok=%v), want 2", len(stored.Queue), ok)
 	}
@@ -263,7 +264,7 @@ func TestOfflineQueueSkipsCleanSessions(t *testing.T) {
 	clean.disconnect()
 	waitDisconnected(t, b, "clean-queue")
 
-	if _, ok := b.store.Load("clean-queue"); ok {
+	if _, ok := b.persist.LoadSession("clean-queue"); ok {
 		t.Fatal("a clean session was stored")
 	}
 	publishQoS1(t, b, "cleanq/x", "unwanted", 1)
@@ -288,7 +289,7 @@ func TestOfflineQueueSkipsCleanSessions(t *testing.T) {
 		t.Fatal("a clean CONNECT resumed the stored session")
 	}
 	expectNoMessage(t, dropped, 100*time.Millisecond)
-	if _, ok := b.store.Load("clean-drop"); ok {
+	if _, ok := b.persist.LoadSession("clean-drop"); ok {
 		t.Fatal("the clean CONNECT did not delete the stored session")
 	}
 	if depth := offlineDepth(b); depth != 0 {
@@ -327,54 +328,19 @@ func TestOfflineQueueDrainDegradesToQoS0(t *testing.T) {
 	expectNoMessage(t, sub, 100*time.Millisecond)
 }
 
-// recordingSessionStore counts the calls the broker makes through the
-// SessionStore seam, so a test can prove the seam is used rather than bypassed.
-type recordingSessionStore struct {
-	*MemorySessionStore
-	mu      sync.Mutex
-	loads   int
-	saves   int
-	deletes int
-}
+// TestPersistenceStoreIsUsed pins that Config.Store is the backend the broker reads
+// and writes: a preloaded session resumes and delivers, a disconnect saves through
+// the seam, and a clean CONNECT deletes through it.
+func TestPersistenceStoreIsUsed(t *testing.T) {
+	store := newSharedStore()
+	b := startBroker(t, Config{Store: store, Locker: newSharedLocker(), Logger: discardLogger()})
 
-func (s *recordingSessionStore) Load(key string) (SessionState, bool) {
-	s.mu.Lock()
-	s.loads++
-	s.mu.Unlock()
-	return s.MemorySessionStore.Load(key)
-}
-
-func (s *recordingSessionStore) Save(key string, state SessionState) {
-	s.mu.Lock()
-	s.saves++
-	s.mu.Unlock()
-	s.MemorySessionStore.Save(key, state)
-}
-
-func (s *recordingSessionStore) Delete(key string) {
-	s.mu.Lock()
-	s.deletes++
-	s.mu.Unlock()
-	s.MemorySessionStore.Delete(key)
-}
-
-func (s *recordingSessionStore) counts() (loads, saves, deletes int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.loads, s.saves, s.deletes
-}
-
-// TestSessionStoreSeamIsUsed pins that Config.SessionStore is the store the
-// broker reads and writes: a preloaded session resumes and delivers, a disconnect
-// saves through the seam, and a clean CONNECT deletes through it.
-func TestSessionStoreSeamIsUsed(t *testing.T) {
-	store := &recordingSessionStore{MemorySessionStore: NewMemorySessionStore()}
-	b := startBroker(t, Config{SessionStore: store})
-
-	store.Save("seam", SessionState{
-		ClientID:      "seam",
-		Subscriptions: map[string]SessionSubscription{"seam/#": {QoS: 1}},
-	})
+	if !b.persist.SaveSession("seam", &session.State{
+		ClientID: "seam",
+		Subs:     map[string]session.Subscription{"seam/#": {QoS: 1}},
+	}) {
+		t.Fatal("could not seed the session")
+	}
 	c, ack := mustConnect(t, b.Addr(), confConnect{clientID: "seam", clean: false})
 	if !ack.SessionPresent {
 		t.Fatal("a session preloaded in the configured store was not resumed")
@@ -388,12 +354,8 @@ func TestSessionStoreSeamIsUsed(t *testing.T) {
 	c.disconnect()
 	waitDisconnected(t, b, "seam")
 	waitFor(t, "the session to be saved through the seam", func() bool {
-		_, ok := store.Load("seam")
-		return ok
+		return store.exists(persistKey("seam"))
 	})
-	if _, saves, _ := store.counts(); saves == 0 {
-		t.Fatal("the broker did not save through Config.SessionStore")
-	}
 
 	clean, ack := mustConnect(t, b.Addr(), confConnect{clientID: "seam", clean: true})
 	if ack.SessionPresent {
@@ -401,12 +363,8 @@ func TestSessionStoreSeamIsUsed(t *testing.T) {
 	}
 	expectNoMessage(t, clean, 50*time.Millisecond)
 	waitFor(t, "the session to be deleted through the seam", func() bool {
-		_, ok := store.Load("seam")
-		return !ok
+		return !store.exists(persistKey("seam"))
 	})
-	if _, _, deletes := store.counts(); deletes == 0 {
-		t.Fatal("the broker did not delete through Config.SessionStore")
-	}
 }
 
 // deliveryMetrics records everything the delivery limits report: the drop reasons

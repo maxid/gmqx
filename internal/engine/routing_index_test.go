@@ -12,15 +12,17 @@ package engine
 // here are the broker paths that install and tear it down.
 
 import (
+	"context"
 	"fmt"
-	"github.com/maxid/gmqx/conn"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/maxid/gcache"
 	"github.com/maxid/gnety/codec/mqtt"
 
+	"github.com/maxid/gmqx/conn"
 	sessionstate "github.com/maxid/gmqx/session"
 )
 
@@ -266,7 +268,7 @@ func installRoutingSubs(t *testing.T, b *Broker, subs []routingSub) {
 		conns[id].client.disconnect()
 		waitDisconnected(t, b, id)
 		waitFor(t, "the session of "+id+" to be stored", func() bool {
-			_, ok := b.store.Load(id)
+			_, ok := b.persist.LoadSession(id)
 			return ok
 		})
 	}
@@ -395,7 +397,7 @@ func TestRoutingIndexRemovals(t *testing.T) {
 		c.disconnect()
 		waitDisconnected(t, b, "persist")
 		waitFor(t, "the session of persist to be stored", func() bool {
-			_, ok := b.store.Load("persist")
+			_, ok := b.persist.LoadSession("persist")
 			return ok
 		})
 		targets := b.LocalTargets(pub("p/x"))
@@ -415,14 +417,14 @@ func TestRoutingIndexRemovals(t *testing.T) {
 		c.disconnect()
 		waitDisconnected(t, b, "expiring-idx")
 		waitFor(t, "the session of expiring-idx to be stored", func() bool {
-			_, ok := b.store.Load("expiring-idx")
+			_, ok := b.persist.LoadSession("expiring-idx")
 			return ok
 		})
 		if n := len(b.LocalTargets(pub("e/x"))); n != 1 {
 			t.Fatalf("targets while the session is inside its window = %d, want 1", n)
 		}
 		waitFor(t, "the stored session to expire", func() bool {
-			_, ok := b.store.Load("expiring-idx")
+			_, ok := b.persist.LoadSession("expiring-idx")
 			return !ok
 		})
 		waitFor(t, "the expired session to leave the route", func() bool {
@@ -435,7 +437,7 @@ func TestRoutingIndexRemovals(t *testing.T) {
 		c.disconnect()
 		waitDisconnected(t, b, "discard")
 		waitFor(t, "the session of discard to be stored", func() bool {
-			_, ok := b.store.Load("discard")
+			_, ok := b.persist.LoadSession("discard")
 			return ok
 		})
 		// A clean CONNECT ends the stored session; the new connection has no
@@ -444,7 +446,7 @@ func TestRoutingIndexRemovals(t *testing.T) {
 		if ack.SessionPresent {
 			t.Fatal("a clean CONNECT resumed the stored session")
 		}
-		if _, ok := b.store.Load("discard"); ok {
+		if _, ok := b.persist.LoadSession("discard"); ok {
 			t.Fatal("the stored session survived a clean CONNECT")
 		}
 		if targets := b.LocalTargets(pub("d/x")); len(targets) != 0 {
@@ -462,9 +464,9 @@ func TestRoutingIndexRemovals(t *testing.T) {
 // broker only ever holds its own scope, and a publication stamped with the other
 // namespace has no local target.
 func TestRoutingIndexNamespaceIsolation(t *testing.T) {
-	store := NewMemorySessionStore()
-	a := startBroker(t, Config{Namespace: nsValue("tenant-a"), SessionStore: store})
-	b := startBroker(t, Config{Namespace: nsValue("tenant-b"), SessionStore: store})
+	store := newSharedStore()
+	a := startBroker(t, Config{Namespace: nsValue("tenant-a"), Store: store, Locker: newSharedLocker()})
+	b := startBroker(t, Config{Namespace: nsValue("tenant-b"), Store: store, Locker: newSharedLocker()})
 
 	subA, _ := mustConnect(t, a.Addr(), confConnect{clientID: "same-id", clean: true})
 	subscribe(t, subA, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "iso/#", QoS: 1})
@@ -492,8 +494,7 @@ func TestRoutingIndexNamespaceIsolation(t *testing.T) {
 	offline.disconnect()
 	waitDisconnected(t, b, "offline-b")
 	waitFor(t, "the tenant-b session to be stored", func() bool {
-		_, ok := store.Load("tenant-b\x00offline-b")
-		return ok
+		return store.exists(persistKey("tenant-b\x00offline-b"))
 	})
 	if targets := a.LocalTargets(Publication{Namespace: "tenant-a", Topic: "iso/x"}); len(targets) != 1 {
 		t.Fatalf("tenant-a targets after a tenant-b session was stored = %v, want only its own", targetIDs(targets))
@@ -503,48 +504,47 @@ func TestRoutingIndexNamespaceIsolation(t *testing.T) {
 	}
 }
 
-// keyCountingSessionStore counts the enumeration and load calls the broker makes,
-// which is how a test proves the publish path does not read the store.
-type keyCountingSessionStore struct {
-	*MemorySessionStore
+// keyCountingStore counts the enumeration and load calls the broker makes, which
+// is how a test proves the publish path does not read the store.
+type keyCountingStore struct {
+	*sharedStore
 	mu    sync.Mutex
 	keys  int
 	loads int
 }
 
-func (s *keyCountingSessionStore) Keys() []string {
+func (s *keyCountingStore) Scan(ctx context.Context, prefix string, fn func(key string) error) error {
 	s.mu.Lock()
 	s.keys++
 	s.mu.Unlock()
-	return s.MemorySessionStore.Keys()
+	return s.sharedStore.Scan(ctx, prefix, fn)
 }
 
-func (s *keyCountingSessionStore) Load(key string) (SessionState, bool) {
+func (s *keyCountingStore) Get(ctx context.Context, key string) (gcache.Entry, bool, error) {
 	s.mu.Lock()
 	s.loads++
 	s.mu.Unlock()
-	return s.MemorySessionStore.Load(key)
+	return s.sharedStore.Get(ctx, key)
 }
 
-func (s *keyCountingSessionStore) counts() (keys, loads int) {
+func (s *keyCountingStore) counts() (keys, loads int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.keys, s.loads
 }
 
-func (s *keyCountingSessionStore) reset() {
+func (s *keyCountingStore) reset() {
 	s.mu.Lock()
 	s.keys, s.loads = 0, 0
 	s.mu.Unlock()
 }
 
-// TestPublishDoesNotConsultSessionStore pins the hot-path promise: subscribing and
-// publishing to a live subscriber never enumerates or loads the store. An operator
-// implementation may be a network call, so it must not be on the publish path at
-// all.
-func TestPublishDoesNotConsultSessionStore(t *testing.T) {
-	store := &keyCountingSessionStore{MemorySessionStore: NewMemorySessionStore()}
-	b := startBroker(t, Config{SessionStore: store, Metrics: newDeliveryMetrics()})
+// TestPublishDoesNotConsultStore pins the hot-path promise: subscribing and
+// publishing to a live subscriber never enumerates or loads the store. A real
+// backend may be a network call, so it must not be on the publish path at all.
+func TestPublishDoesNotConsultStore(t *testing.T) {
+	store := &keyCountingStore{sharedStore: newSharedStore()}
+	b := startBroker(t, Config{Store: store, Metrics: newDeliveryMetrics()})
 	// New indexed the (empty) store; the store also serves the CONNECT paths.
 	store.reset()
 
@@ -554,7 +554,7 @@ func TestPublishDoesNotConsultSessionStore(t *testing.T) {
 	store.reset()
 	subscribe(t, sub, 1, mqtt.Properties{}, mqtt.Subscription{Filter: "hot/#", QoS: 1})
 	if keys, loads := store.counts(); keys != 0 || loads != 0 {
-		t.Fatalf("SUBSCRIBE consulted the store: Keys()=%d Load()=%d", keys, loads)
+		t.Fatalf("SUBSCRIBE consulted the store: Scan()=%d Get()=%d", keys, loads)
 	}
 
 	pub, _ := mustConnect(t, b.Addr(), confConnect{clientID: "store-pub", clean: true})
@@ -566,7 +566,7 @@ func TestPublishDoesNotConsultSessionStore(t *testing.T) {
 		expectPublish(t, sub)
 	}
 	if keys, loads := store.counts(); keys != 0 || loads != 0 {
-		t.Fatalf("publishing to a live subscriber consulted the store: Keys()=%d Load()=%d", keys, loads)
+		t.Fatalf("publishing to a live subscriber consulted the store: Scan()=%d Get()=%d", keys, loads)
 	}
 }
 
@@ -655,7 +655,7 @@ func TestRoutingIndexExpiredSessionIsNotATarget(t *testing.T) {
 	c.disconnect()
 	waitDisconnected(t, b, "expiring-route")
 	waitFor(t, "the session to be stored", func() bool {
-		_, ok := b.store.Load("expiring-route")
+		_, ok := b.persist.LoadSession("expiring-route")
 		return ok
 	})
 
@@ -664,8 +664,11 @@ func TestRoutingIndexExpiredSessionIsNotATarget(t *testing.T) {
 		t.Fatalf("targets inside the expiry window = %+v, want one offline target", targets)
 	}
 	time.Sleep(3 * testSecond)
-	if _, ok := b.store.Load("expiring-route"); !ok {
-		t.Fatal("the session was deleted although the sweeper is disabled")
+	// The sweeper is disabled, so the index entry is still there; it is the table's
+	// deadline that must keep the session out of the target set. (The store itself
+	// drops the value at its TTL, which is the backend's job, not the broker's.)
+	if !b.index.Has("expiring-route") {
+		t.Fatal("the index entry was removed although the sweeper is disabled")
 	}
 	if targets := b.LocalTargets(pub); len(targets) != 0 {
 		t.Fatalf("targets after the deadline = %+v, want none", targets)

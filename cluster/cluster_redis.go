@@ -28,7 +28,7 @@ const redisClusterWireVersion = 1
 const (
 	// DefaultRedisChannelPrefix namespaces every channel and key this backend
 	// owns. The Redis session store uses the same default: a store passed to
-	// Config.SessionStore has to live under the prefix its cluster writes, which
+	// the persistence store has to live under the prefix its cluster writes, which
 	// is why this is exported rather than a private default.
 	DefaultRedisChannelPrefix = "gmqx:cluster"
 	// redisTTLFactor turns SummaryInterval into the default key TTLs: a key has

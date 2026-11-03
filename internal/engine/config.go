@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"github.com/maxid/gcache"
 	"github.com/maxid/gns"
 	"log/slog"
 	"time"
@@ -323,17 +324,28 @@ type Config struct {
 	// then removed when it is next loaded — a CONNECT never resumes one either way.
 	SessionSweepInterval time.Duration
 
-	// SessionStore is where persistent-session state lives while no connection
-	// owns it (subscriptions, queued messages, expiry deadline, the inbound QoS 2
-	// packet ids a client has not released and the outbound exchanges it has not
-	// confirmed). Nil installs
-	// MemorySessionStore, which is exactly the broker's behavior before the seam
-	// existed and stays the default. A deployment can supply another
-	// implementation; this package ships two, the node-local MemorySessionStore and
-	// the shared RedisSessionStore (NewRedisSessionStore), the latter being what
-	// lets a client that reconnects to another node of a cluster resume its
-	// session.
-	SessionStore SessionStore
+	// Store is the persistence backend the broker writes through for both kinds of
+	// state it keeps for a client: persistent sessions (subscriptions, the offline
+	// queue, the QoS 2 state) and retained messages. Nil installs gcache's
+	// in-process memory store, which is the behavior every deployment had before
+	// the seam existed: state is node-local and a restart loses it. A shared
+	// backend (gcache/redis, gcache/olric) makes a session resumable on another
+	// node and a retained message visible to every node.
+	//
+	// The broker never picks a store itself and creates no global one: two brokers
+	// in one process each get the store they were given, so a deployment can run
+	// them against separate gcache instances (and separate KeyPrefix values).
+	Store gcache.RemoteStore
+	// Locker, when set, makes the store multi-node: an atomic session take uses a
+	// distributed lock instead of load-then-delete, and a connection displaced by a
+	// peer's kick no longer writes its session copy back. Leave it nil for a store
+	// only this process writes to (the default memory store, or one dedicated to
+	// this node).
+	Locker gcache.Locker
+	// KeyPrefix is the key namespace of both records, "gmqx:" by default. Two
+	// brokers sharing one backend must use different prefixes (or namespaces) to
+	// keep their state apart.
+	KeyPrefix string
 
 	// Auth is the authentication hook of a CONNECT that carries no MQTT 5
 	// Authentication Method. A connection that negotiates an enhanced

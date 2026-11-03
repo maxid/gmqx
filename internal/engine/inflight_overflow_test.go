@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
+
+	sessionstate "github.com/maxid/gmqx/session"
 )
 
 // overflowBroker starts a broker whose inflight queue overflows after one window
@@ -201,10 +203,10 @@ func TestInflightOverflowTakesPersistentSessionOffline(t *testing.T) {
 	waitDisconnected(t, b, "overflow-persist")
 	key := namespaceKey(b.namespace, "overflow-persist")
 	waitFor(t, "the overflowing session to be stored", func() bool {
-		_, ok := b.store.Load(key)
+		_, ok := b.persist.LoadSession(key)
 		return ok
 	})
-	stored, ok := b.store.Load(key)
+	stored, ok := b.persist.LoadSession(key)
 	if !ok {
 		t.Fatal("the session of the overflowing connection was not stored")
 	}
@@ -248,7 +250,7 @@ func TestInflightOverflowTakesPersistentSessionOffline(t *testing.T) {
 	if qos[0] != 1 {
 		t.Fatalf("the retransmitted exchange arrived at QoS %d, want 1", qos[0])
 	}
-	if stored, ok := b.store.Load(key); ok {
+	if stored, ok := b.persist.LoadSession(key); ok {
 		t.Fatalf("the drained session is still stored: %+v", stored)
 	}
 	if depth := offlineDepth(b); depth != 0 {
@@ -310,19 +312,18 @@ func TestInflightOverflowImmediateReconnect(t *testing.T) {
 	_ = stalled.conn.Close()
 }
 
-// TestInflightOverflowQueuesForRedisStoreAcrossNodes pins the durable half of the
-// policy: the queue the hand-off produces is written to the shared Redis session
-// store, so the messages survive the disconnect of a broker node and are drained by
-// the node the client reconnects to.
-func TestInflightOverflowQueuesForRedisStoreAcrossNodes(t *testing.T) {
-	mr := runMiniRedis(t)
+// TestInflightOverflowQueuesAcrossNodes pins the durable half of the policy: the
+// queue the hand-off produces is written to the shared store, so the messages
+// survive the disconnect of a broker node and are drained by the node the client
+// reconnects to.
+func TestInflightOverflowQueuesAcrossNodes(t *testing.T) {
 	metrics := newDeliveryMetrics()
-	store := newTestRedisSessionStore(t, mr, metrics)
+	store := newSharedStore()
 
 	// Two independent brokers of one cluster: node A holds the connection, node B
 	// resumes the session from the store.
-	a := overflowBroker(t, Config{NodeID: "overflow-a", SessionStore: store, Metrics: metrics, MaxOfflineQueueSize: 64})
-	bb := overflowBroker(t, Config{NodeID: "overflow-b", SessionStore: store, Metrics: metrics, MaxOfflineQueueSize: 64})
+	a := overflowBroker(t, Config{NodeID: "overflow-a", Store: store, Locker: newSharedLocker(), Metrics: metrics, MaxOfflineQueueSize: 64})
+	bb := overflowBroker(t, Config{NodeID: "overflow-b", Store: store, Locker: newSharedLocker(), Metrics: metrics, MaxOfflineQueueSize: 64})
 
 	stalled := stalledSession(t, a, "overflow-redis", "redis/#")
 	pub, _ := mustConnect(t, a.Addr(), confConnect{clientID: "overflow-redis-pub", clean: true})
@@ -333,17 +334,13 @@ func TestInflightOverflowQueuesForRedisStoreAcrossNodes(t *testing.T) {
 
 	waitDisconnected(t, a, "overflow-redis")
 	key := namespaceKey(a.namespace, "overflow-redis")
-	waitFor(t, "the session to be stored in Redis", func() bool {
-		raw, err := mr.Get(sessionStoreKey(key))
-		return err == nil && len(raw) > 0
+	waitFor(t, "the session to be stored", func() bool {
+		return store.exists(persistKey(key))
 	})
 	// Node A must not keep the session in its own table any more: the store is the
 	// single copy (that is what keeps two nodes from serving one session).
-	if _, ok := a.store.Load(key); !ok {
+	if _, ok := a.persist.LoadSession(key); !ok {
 		t.Fatal("the session is not in the shared store")
-	}
-	if _, err := mr.Get(sessionStoreKey(key)); err != nil {
-		t.Fatalf("redis session key: %v", err)
 	}
 	if n := metrics.overflows("inflight_overflow"); n != 1 {
 		t.Fatalf("RecordOverflow(\"inflight_overflow\") = %d, want 1", n)
@@ -365,8 +362,7 @@ func TestInflightOverflowQueuesForRedisStoreAcrossNodes(t *testing.T) {
 		}
 	}
 	waitFor(t, "the resumed session to leave the shared store", func() bool {
-		_, err := mr.Get(sessionStoreKey(key))
-		return err != nil
+		return !store.exists(persistKey(key))
 	})
 	_ = stalled.conn.Close()
 }
@@ -401,7 +397,7 @@ func TestInflightOverflowCleanSessionDropsWithoutQueueing(t *testing.T) {
 
 	// Nothing is stored, and the connection stays up: the client is still reading
 	// what fits, and its session is not part of any durable state.
-	if _, ok := b.store.Load(namespaceKey(b.namespace, "overflow-clean")); ok {
+	if _, ok := b.persist.LoadSession(namespaceKey(b.namespace, "overflow-clean")); ok {
 		t.Fatal("a clean session was stored after an inflight overflow")
 	}
 	if depth := offlineDepth(b); depth != 0 {
@@ -516,14 +512,14 @@ func TestInflightOverflowQoS2SessionResumesExchanges(t *testing.T) {
 	waitDisconnected(t, b, "overflow-q2")
 	key := namespaceKey(b.namespace, "overflow-q2")
 	waitFor(t, "the QoS 2 session to be stored", func() bool {
-		_, ok := b.store.Load(key)
+		_, ok := b.persist.LoadSession(key)
 		return ok
 	})
-	stored, ok := b.store.Load(key)
+	stored, ok := b.persist.LoadSession(key)
 	if !ok {
 		t.Fatal("the QoS 2 session was not stored")
 	}
-	if len(stored.Inflight) != 1 || stored.Inflight[0].QoS != 2 || stored.Inflight[0].Stage != InflightAwaitPubrec {
+	if len(stored.Inflight) != 1 || stored.Inflight[0].QoS != 2 || stored.Inflight[0].Stage != sessionstate.AwaitPubrec {
 		t.Fatalf("stored exchanges = %+v, want one QoS 2 exchange awaiting PUBREC", stored.Inflight)
 	}
 	if got := len(stored.Queue); got != messages-1 {
@@ -611,7 +607,7 @@ func TestInflightOverflowLeavesNoGoroutineAndNoWriteAfterClose(t *testing.T) {
 		waitDisconnected(t, b, id)
 		// The session the hand-off stored is intact: one exchange plus the messages
 		// that were waiting behind it.
-		stored, ok := b.store.Load(namespaceKey(b.namespace, id))
+		stored, ok := b.persist.LoadSession(namespaceKey(b.namespace, id))
 		if !ok {
 			t.Fatalf("session %q was not stored", id)
 		}

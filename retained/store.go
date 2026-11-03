@@ -2,10 +2,15 @@
 //
 // A retained message is the value a new subscriber receives for a topic: the broker
 // keeps one per (namespace, topic) and replays it when a subscription matches. The
-// store is the table itself — bounded, keyed by the broker's namespace key and
-// carrying the MQTT 5 Message Expiry deadline — while the policy that decides when
-// to store, drop or replay a message stays with the broker, which is the only place
-// that knows the configuration, the metrics and the sessions to deliver to.
+// table is the in-memory copy of that state — bounded, keyed by the broker's
+// namespace key and carrying the MQTT 5 Message Expiry deadline — while the policy
+// that decides when to store, drop or replay a message stays with the broker, which
+// is the only place that knows the configuration, the metrics and the sessions to
+// deliver to.
+//
+// Persistence is not this package's business: gmqx/internal/persist writes the same
+// messages into the configured gcache store, and the broker keeps this table as the
+// hot copy that a SUBSCRIBE scans.
 package retained
 
 import (
@@ -35,25 +40,25 @@ type Message struct {
 	ExpiresAt time.Time
 }
 
-// Store is the retained-message table. The zero value is not usable; use NewStore.
+// Table is the retained-message table. The zero value is not usable; use NewTable.
 // It is safe for concurrent use.
-type Store struct {
+type Table struct {
 	mu   sync.Mutex
 	msgs map[string]Message
 }
 
 // NewStore builds an empty retained store.
-func NewStore() *Store { return &Store{msgs: make(map[string]Message)} }
+func NewTable() *Table { return &Table{msgs: make(map[string]Message)} }
 
 // Len reports how many topics the store holds.
-func (s *Store) Len() int {
+func (s *Table) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.msgs)
 }
 
 // Get returns the message stored under key.
-func (s *Store) Get(key string) (Message, bool) {
+func (s *Table) Get(key string) (Message, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ok := s.msgs[key]
@@ -61,7 +66,7 @@ func (s *Store) Get(key string) (Message, bool) {
 }
 
 // Delete removes key. Deleting a missing key is a no-op.
-func (s *Store) Delete(key string) {
+func (s *Table) Delete(key string) {
 	s.mu.Lock()
 	delete(s.msgs, key)
 	s.mu.Unlock()
@@ -71,7 +76,7 @@ func (s *Store) Delete(key string) {
 // message for a key the store already holds is always accepted, because replacing
 // a value does not grow the table. Put reports false and leaves the store
 // unchanged when key is new and the table already holds max topics.
-func (s *Store) Put(key string, m Message, max int64) bool {
+func (s *Table) Put(key string, m Message, max int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.msgs[key]; !exists && max > 0 && int64(len(s.msgs)) >= max {
@@ -84,7 +89,7 @@ func (s *Store) Put(key string, m Message, max int64) bool {
 // Range calls fn for every message in the store. fn may request the removal of the
 // message it was given by returning false; any other value keeps it. Range holds
 // the store's lock, so fn must not call back into the store.
-func (s *Store) Range(fn func(key string, m Message) bool) {
+func (s *Table) Range(fn func(key string, m Message) bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key, m := range s.msgs {

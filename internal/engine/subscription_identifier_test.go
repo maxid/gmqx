@@ -101,7 +101,7 @@ func TestSubscriptionIdentifierOfflineQueue(t *testing.T) {
 	sub.disconnect()
 	waitDisconnected(t, b, "si-offline")
 	waitFor(t, "the session to be stored", func() bool {
-		_, ok := b.store.Load("si-offline")
+		_, ok := b.persist.LoadSession("si-offline")
 		return ok
 	})
 
@@ -135,20 +135,20 @@ func TestSubscriptionIdentifierSurvivesResume(t *testing.T) {
 	sub.disconnect()
 	waitDisconnected(t, b, "si-resume")
 	waitFor(t, "the session to be stored", func() bool {
-		_, ok := b.store.Load("si-resume")
+		_, ok := b.persist.LoadSession("si-resume")
 		return ok
 	})
 
-	stored, ok := b.store.Load("si-resume")
+	stored, ok := b.persist.LoadSession("si-resume")
 	if !ok {
 		t.Fatal("the session was not stored")
 	}
-	keep, ok := stored.Subscriptions["si/resume/#"]
+	keep, ok := stored.Subs["si/resume/#"]
 	if !ok {
-		t.Fatalf("the stored session lost the subscription: %+v", stored.Subscriptions)
+		t.Fatalf("the stored session lost the subscription: %+v", stored.Subs)
 	}
-	if len(keep.SubscriptionIdentifiers) != 1 || keep.SubscriptionIdentifiers[0] != 11 {
-		t.Fatalf("stored subscription identifiers = %v, want [11]", keep.SubscriptionIdentifiers)
+	if len(keep.SubscriptionIDs) != 1 || keep.SubscriptionIDs[0] != 11 {
+		t.Fatalf("stored subscription identifiers = %v, want [11]", keep.SubscriptionIDs)
 	}
 
 	back, ack := mustConnect(t, b.Addr(), confConnect{

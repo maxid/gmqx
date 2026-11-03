@@ -8,7 +8,7 @@ import "github.com/maxid/gnety/codec/mqtt"
 // with the subscription that packet creates or modifies, and it is copied into
 // every PUBLISH the broker sends because of that subscription. The state belongs
 // to the subscription, so it is part of what a persistent session keeps: it
-// travels through the SessionStore (SessionSubscription.SubscriptionIdentifiers)
+// travels through the persistence record (a subscription's SubscriptionIDs)
 // and is restored on a resume, exactly like the filter's QoS, no-local,
 // retain-as-published and retain-handling.
 //
@@ -26,7 +26,7 @@ import "github.com/maxid/gnety/codec/mqtt"
 //   - MaxSubscriptionIdentifiersPerSubscription caps what one subscription
 //     stores. The codec delivers at most one identifier per SUBSCRIBE (the
 //     specification forbids repeating the property in SUBSCRIBE, §3.8.2.1.2), so
-//     the cap only matters for state restored from a SessionStore that another
+//     the cap only matters for state restored from a store that another
 //     implementation wrote, and for a subscription modified by several packets.
 //   - MaxSubscriptionIdentifiersPerDelivery caps one outgoing PUBLISH. Identifiers
 //     beyond it are not attached and the drop is counted

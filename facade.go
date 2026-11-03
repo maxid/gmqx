@@ -5,11 +5,12 @@
 // This package is the facade: it declares no behavior of its own, it re-exports the
 // engine and the role packages under one import path, because that is the path
 // every consumer and every example uses. The implementations live in
+//   - internal/persist  — the one persistence seam: sessions and retained messages in one gcache store;
 //   - internal/engine   — the broker: lifecycle, conn.Host, clientId table,
 //     session bookkeeping, pending wills, plugin host;
 //   - conn/             — one physical connection;
 //   - routing/          — the routing table and the shared-subscription election;
-//   - session/          — the session state and the SessionStore seam;
+//   - session/          — the live session state (its persisted form lives in internal/persist);
 //   - cluster/          — the gossip / TCP mesh / Redis backends;
 //   - hook/             — the extension contracts;
 //   - retained/         — the retained-message store;
@@ -26,7 +27,6 @@ import (
 	"github.com/maxid/gmqx/cluster"
 	"github.com/maxid/gmqx/hook"
 	engine "github.com/maxid/gmqx/internal/engine"
-	sessionstore "github.com/maxid/gmqx/session"
 )
 
 // The broker engine lives in gmqx/internal/engine (docs/design/source-layout.md
@@ -227,55 +227,3 @@ func NewTCPCluster(cfg TCPClusterConfig) Cluster { return cluster.NewTCPCluster(
 
 // NewRedisCluster builds the Redis backend from cfg.
 func NewRedisCluster(cfg RedisClusterConfig) Cluster { return cluster.NewRedisCluster(cfg) }
-
-// The session store lives in gmqx/session (docs/design/source-layout.md §2, rule L3):
-// the root package re-exports its types as aliases and forwards the constructors, so
-// Config.SessionStore, an implementation outside this module (contrib/sessionstore-
-// gcache) and the stores this module ships all name the same types as before.
-
-type (
-	// SessionStore is the persistence seam of persistent-session state.
-	SessionStore = sessionstore.SessionStore
-	// SharedSessionStore is a SessionStore that several broker nodes share.
-	SharedSessionStore = sessionstore.SharedSessionStore
-	// SessionState is the state of one persistent session with no live connection.
-	SessionState = sessionstore.SessionState
-	// InflightStage is where a stored outbound exchange stood when its connection
-	// ended.
-	InflightStage = sessionstore.InflightStage
-	// SessionInflight is one outbound QoS 1/2 exchange a session owes its client.
-	SessionInflight = sessionstore.SessionInflight
-	// SessionSubscription is one subscription of a stored session.
-	SessionSubscription = sessionstore.SessionSubscription
-	// QueuedMessage is one message queued for an offline persistent session.
-	QueuedMessage = sessionstore.QueuedMessage
-	// MemorySessionStore is the default node-local store.
-	MemorySessionStore = sessionstore.MemorySessionStore
-	// RedisSessionStore is the store shared by the nodes of a Redis cluster.
-	RedisSessionStore = sessionstore.RedisSessionStore
-	// RedisSessionStoreConfig configures the Redis-backed store.
-	RedisSessionStoreConfig = sessionstore.RedisSessionStoreConfig
-)
-
-const (
-	InflightAwaitPuback  = sessionstore.InflightAwaitPuback
-	InflightAwaitPubrec  = sessionstore.InflightAwaitPubrec
-	InflightAwaitPubcomp = sessionstore.InflightAwaitPubcomp
-)
-
-// NewMemorySessionStore builds the default node-local store.
-func NewMemorySessionStore() *MemorySessionStore { return sessionstore.NewMemorySessionStore() }
-
-// NewRedisSessionStore builds the Redis-backed store and validates its
-// configuration.
-func NewRedisSessionStore(cfg RedisSessionStoreConfig) (*RedisSessionStore, error) {
-	return sessionstore.NewRedisSessionStore(cfg)
-}
-
-// NewRedisClusterWithSessionStore builds the Redis cluster backend and the Redis
-// session store of one cluster from one RedisClusterConfig: both use the same
-// address, database and key prefix, so the sessions a node stores are the ones its
-// peers take over.
-func NewRedisClusterWithSessionStore(cfg RedisClusterConfig) (Cluster, *RedisSessionStore, error) {
-	return sessionstore.NewRedisClusterWithSessionStore(cfg)
-}

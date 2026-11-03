@@ -11,7 +11,7 @@
 // (the CONNECT/AUTH handshake, the read loop, the write-behind queue, the outbound
 // QoS 1/2 window and the will it leaves behind); gmqx/routing is the routing table
 // and the shared-subscription node election; gmqx/session is the session state and
-// the SessionStore seam; gmqx/cluster is the gossip / TCP mesh / Redis backends;
+// the persistence seam (gmqx/internal/persist); gmqx/cluster is the gossip / TCP mesh / Redis backends;
 // gmqx/hook is the extension contract and gmqx/retained the retained store.
 //
 // This package implements conn.Host, owns the broker lifecycle (New, Start, Stop,

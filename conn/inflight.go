@@ -34,7 +34,7 @@ package conn
 // the connection is closed, so the session — its subscriptions, the exchanges it
 // has not confirmed and everything still waiting in pending — is stored and the
 // next CONNECT drains it. That hand-off reuses the machinery a lost connection
-// already has (close → unregister → SessionStore → drain after the next CONNACK);
+// already has (close → unregister → store → drain after the next CONNACK);
 // the only loss points that remain are the offline queue's own capacity limits
 // (Config.MaxOfflineQueueSize, Config.MaxTotalOfflineMessages), which are a
 // documented capacity limit and not a defect. A clean session has nowhere to
@@ -107,24 +107,24 @@ const (
 
 // inflightStage is the projection of a live exchange's stage into the form a
 // session carries across a disconnect.
-func inflightStage(state inflightState) session.InflightStage {
+func inflightStage(state inflightState) session.Stage {
 	switch state {
 	case awaitPubrec:
-		return session.InflightAwaitPubrec
+		return session.AwaitPubrec
 	case awaitPubcomp:
-		return session.InflightAwaitPubcomp
+		return session.AwaitPubcomp
 	default:
-		return session.InflightAwaitPuback
+		return session.AwaitPuback
 	}
 }
 
-// liveInflightState is the inverse of inflightStage. session.State normalises an
+// liveInflightState is the inverse of inflightStage. session.State records the
 // unknown stored stage to InflightAwaitPuback, so the default is only a guard.
-func liveInflightState(stage session.InflightStage) inflightState {
+func liveInflightState(stage session.Stage) inflightState {
 	switch stage {
-	case session.InflightAwaitPubrec:
+	case session.AwaitPubrec:
 		return awaitPubrec
-	case session.InflightAwaitPubcomp:
+	case session.AwaitPubcomp:
 		return awaitPubcomp
 	default:
 		return awaitPuback

@@ -250,11 +250,11 @@ func TestSharedSubscriptionOfflineMemberReceivesNothing(t *testing.T) {
 	away.disconnect()
 	waitDisconnected(t, b, "away")
 	waitFor(t, "the session to be stored", func() bool {
-		_, ok := b.store.Load("away")
+		_, ok := b.persist.LoadSession("away")
 		return ok
 	})
-	stored, _ := b.store.Load("away")
-	if _, kept := stored.Subscriptions["$share/g/offline/x"]; !kept {
+	stored, _ := b.persist.LoadSession("away")
+	if _, kept := stored.Subs["$share/g/offline/x"]; !kept {
 		t.Fatal("the stored session lost its shared subscription")
 	}
 	// The offline session is not a member of the group.
@@ -298,8 +298,8 @@ func TestSharedSubscriptionOfflineMemberReceivesNothing(t *testing.T) {
 // assertion: a publication that matches a shared group is answered by the index and
 // the peer view, never by a SessionStore call.
 func TestSharedSubscriptionKeepsStoreOffThePublishPath(t *testing.T) {
-	store := &keyCountingSessionStore{MemorySessionStore: NewMemorySessionStore()}
-	b := startBroker(t, Config{SessionStore: store, Metrics: newDeliveryMetrics()})
+	store := &keyCountingStore{sharedStore: newSharedStore()}
+	b := startBroker(t, Config{Store: store, Metrics: newDeliveryMetrics()})
 	store.reset()
 
 	member, _ := mustConnect(t, b.Addr(), confConnect{version: mqtt.Version5, clientID: "store-member", clean: true})

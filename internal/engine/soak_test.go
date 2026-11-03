@@ -194,7 +194,7 @@ run:
 	retained := broker.retained.Len()
 	offlineQueued := broker.offlineQueued
 	broker.mu.RUnlock()
-	stored := len(broker.store.Keys())
+	stored := len(broker.persist.SessionKeys())
 	indexed := broker.index.Len()
 	broker.willMu.Lock()
 	wills := len(broker.wills)

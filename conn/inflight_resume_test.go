@@ -23,7 +23,7 @@ func TestResumeInflightResendsOnlyRestored(t *testing.T) {
 	// A persistent session whose connection ended with one unconfirmed QoS 1
 	// exchange: restoreQoS2State carries it over.
 	c.restoreQoS2Locked(&session.State{Inflight: []session.Inflight{{
-		PacketID: 1, QoS: 1, Topic: "resume/x", Payload: []byte("restored"), Stage: session.InflightAwaitPuback,
+		PacketID: 1, QoS: 1, Topic: "resume/x", Payload: []byte("restored"), Stage: session.AwaitPuback,
 	}}})
 
 	// A delivery that reached this fresh connection after the CONNACK and before

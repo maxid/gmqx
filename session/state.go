@@ -6,10 +6,7 @@ package session
 // subscriptions to restore, the messages published to those subscriptions while
 // there was no connection, the QoS 2 state of both directions (the packet ids the
 // client published without releasing them and the outbound exchanges it has not
-// confirmed) and the deadline after which the state ends. The stored form is
-// SessionState; Stored and StateFromStored are the projection between the two, and
-// they are the only place where the typed MQTT 5 property blocks of the live form
-// become the wire byte blocks a store persists.
+// confirmed) and the deadline after which the state ends.
 //
 // The broker keeps a State only for a session with no live connection. While a
 // connection owns the session its subscriptions live on the connection and the
@@ -20,18 +17,15 @@ package session
 // re-checks it, and a session that reconnected in between receives the message on
 // its live connection instead of a stale queue.
 //
-// The reference broker of this family also queues for clean sessions; gmqx does
-// not, because a clean session is deleted with its connection and recreated empty
-// by the next CONNECT — a queued message would be delivered to a session that
-// declared it wanted none.
+// Persistence is not this package's business. The wire form a shared store keeps
+// (and the projection between this form and it) lives in gmqx/internal/persist,
+// because the same store also keeps retained messages: one persistence seam for
+// both, keyed and encoded there.
 
 import (
-	"sort"
 	"time"
 
 	"github.com/maxid/gnety/codec/mqtt"
-
-	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 )
 
 // Subscription stores the MQTT 5 subscription options of one filter of a session.
@@ -49,14 +43,14 @@ type Subscription struct {
 	RetainHandling byte
 	// SubscriptionIDs are the Subscription Identifiers the SUBSCRIBE that created
 	// or modified this subscription carried (at most one per packet, §3.8.2.1.2,
-	// but the field is a slice because it is part of the state a SessionStore
+	// but the field is a slice because it is part of the state a shared store
 	// round-trips). They are attached to every PUBLISH delivered because of this
 	// subscription.
 	SubscriptionIDs []uint32
 }
 
 // Pending is one message a session owes its client, with its MQTT 5 properties in
-// typed form (the stored form, QueuedMessage, keeps the property block instead).
+// typed form (the persisted form keeps the property block instead).
 type Pending struct {
 	Topic   string
 	Payload []byte
@@ -65,10 +59,23 @@ type Pending struct {
 	Props   mqtt.Properties
 }
 
-// Inflight is the persisted projection of one outbound QoS 1/2 exchange a session
-// owes its client. It is what a State carries across a disconnect; the connection
-// that resumes the session turns each one back into a live exchange with its
-// retransmission schedule.
+// Stage is where the outbound exchange of one session stands: a QoS 1 PUBLISH
+// waiting for its PUBACK, a QoS 2 PUBLISH waiting for its PUBREC, or a PUBREL
+// waiting for its PUBCOMP. It is state of the exchange, not of the connection, so
+// a resumed session re-sends the exchange in the stage it was left in.
+type Stage byte
+
+const (
+	// AwaitPuback is a QoS 1 PUBLISH whose PUBACK never arrived.
+	AwaitPuback Stage = iota
+	// AwaitPubrec is a QoS 2 PUBLISH whose PUBREC never arrived.
+	AwaitPubrec
+	// AwaitPubcomp is a QoS 2 PUBLISH that was confirmed with PUBREC whose PUBREL
+	// has not been answered with PUBCOMP yet.
+	AwaitPubcomp
+)
+
+// Inflight is one outbound QoS 1/2 exchange a session owes its client.
 type Inflight struct {
 	// PacketID is the packet identifier of the exchange, 1..65535.
 	PacketID uint16
@@ -81,7 +88,7 @@ type Inflight struct {
 	// Props is the MQTT 5 PUBLISH property block in typed form.
 	Props mqtt.Properties
 	// Stage is where the exchange stood when the connection ended.
-	Stage InflightStage
+	Stage Stage
 }
 
 // State is the in-memory form of a stored session.
@@ -103,172 +110,6 @@ type State struct {
 	// Inflight are the outbound exchanges the session never confirmed; the
 	// resumed connection re-sends them under their original packet ids.
 	Inflight []Inflight
-}
-
-// Stored converts the in-memory form into the form a SessionStore persists. The
-// QoS 2 state of both directions travels with it: the inbound packet ids the
-// client has not released and the outbound exchanges the client has not confirmed
-// are what makes a reconnect continue the exchanges instead of restarting or losing
-// them. Both are written in packet-id order, so the stored form of a session is
-// reproducible.
-func (s *State) Stored() SessionState {
-	state := SessionState{ClientID: s.ClientID, ExpiresAt: s.ExpiresAt}
-	if len(s.Subs) > 0 {
-		state.Subscriptions = make(map[string]SessionSubscription, len(s.Subs))
-		for filter, sub := range s.Subs {
-			state.Subscriptions[filter] = SessionSubscription{
-				QoS:               sub.QoS,
-				NoLocal:           sub.NoLocal,
-				RetainAsPublished: sub.RetainAsPublished,
-				RetainHandling:    sub.RetainHandling,
-				// The subscription identifier is part of the session state, so a
-				// resumed session keeps tagging its deliveries.
-				SubscriptionIdentifiers: append([]uint32(nil), sub.SubscriptionIDs...),
-			}
-		}
-	}
-	if len(s.Queue) > 0 {
-		state.Queue = make([]QueuedMessage, 0, len(s.Queue))
-		for _, msg := range s.Queue {
-			props, err := mqtt5.EncodePropertyBlock(msg.Props)
-			if err != nil {
-				// A message whose properties cannot be encoded still travels; it
-				// simply carries none, exactly like a will with invalid properties.
-				props = nil
-			}
-			state.Queue = append(state.Queue, QueuedMessage{
-				Topic:   msg.Topic,
-				Payload: msg.Payload,
-				QoS:     msg.QoS,
-				Retain:  msg.Retain,
-				Props:   props,
-			})
-		}
-	}
-	if len(s.InboundQoS2) > 0 {
-		state.InboundQoS2 = append([]uint16(nil), s.InboundQoS2...)
-		sort.Slice(state.InboundQoS2, func(i, j int) bool { return state.InboundQoS2[i] < state.InboundQoS2[j] })
-	}
-	if len(s.Inflight) > 0 {
-		state.Inflight = make([]SessionInflight, 0, len(s.Inflight))
-		for _, m := range s.Inflight {
-			props, err := mqtt5.EncodePropertyBlock(m.Props)
-			if err != nil {
-				props = nil
-			}
-			state.Inflight = append(state.Inflight, SessionInflight{
-				PacketID: m.PacketID,
-				Topic:    m.Topic,
-				Payload:  m.Payload,
-				QoS:      m.QoS,
-				Retain:   m.Retain,
-				Props:    props,
-				Stage:    m.Stage,
-			})
-		}
-		sort.Slice(state.Inflight, func(i, j int) bool { return state.Inflight[i].PacketID < state.Inflight[j].PacketID })
-	}
-	return state
-}
-
-// StateFromStored converts the stored form into the in-memory form and reports how
-// many queued messages had to be dropped because their property block no longer
-// decodes. The QoS 2 state of both directions is restored with it; the
-// retransmission schedule of the outbound exchanges is set by the connection that
-// takes the session over.
-//
-// A store is an external input, so what cannot have been written by a broker is
-// dropped instead of trusted: an outbound exchange that is not a QoS 1/2 PUBLISH
-// with a packet id, and a queued message whose property block no longer decodes,
-// which costs the message and not the session.
-func StateFromStored(state SessionState) (*State, int) {
-	s := &State{ClientID: state.ClientID, ExpiresAt: state.ExpiresAt, Subs: SubscriptionsFromStored(state.Subscriptions)}
-	if s.Subs == nil {
-		// A session without subscriptions is still resumable: the broker installs an
-		// empty set so a SUBSCRIBE has a map to write into.
-		s.Subs = make(map[string]Subscription)
-	}
-	if len(state.InboundQoS2) > 0 {
-		s.InboundQoS2 = append([]uint16(nil), state.InboundQoS2...)
-	}
-	if len(state.Inflight) > 0 {
-		s.Inflight = make([]Inflight, 0, len(state.Inflight))
-		for _, stored := range state.Inflight {
-			if stored.PacketID == 0 || stored.QoS == 0 || stored.QoS > 2 {
-				// An exchange that cannot have been a QoS 1/2 PUBLISH is dropped
-				// instead of being retransmitted with a shape the protocol does not
-				// allow.
-				continue
-			}
-			props, err := mqtt5.DecodePropertyBlock(stored.Props)
-			if err != nil {
-				// A property block that no longer decodes costs the properties, not
-				// the message: the exchange still has its topic, payload and packet id.
-				props = mqtt.Properties{}
-			}
-			s.Inflight = append(s.Inflight, Inflight{
-				PacketID: stored.PacketID,
-				Topic:    stored.Topic,
-				Payload:  stored.Payload,
-				QoS:      stored.QoS,
-				Retain:   stored.Retain,
-				Props:    props,
-				Stage:    knownStage(stored.Stage),
-			})
-		}
-	}
-	dropped := 0
-	if len(state.Queue) > 0 {
-		s.Queue = make([]Pending, 0, len(state.Queue))
-		for _, msg := range state.Queue {
-			props, err := mqtt5.DecodePropertyBlock(msg.Props)
-			if err != nil {
-				dropped++
-				continue
-			}
-			s.Queue = append(s.Queue, Pending{
-				Topic:   msg.Topic,
-				Payload: msg.Payload,
-				QoS:     msg.QoS,
-				Retain:  msg.Retain,
-				Props:   props,
-			})
-		}
-	}
-	return s, dropped
-}
-
-// knownStage normalises the stage a store hands back. An unknown value (a store
-// written by a build that knew another stage) is treated as a QoS 1 PUBLISH waiting
-// for its PUBACK, which re-sends the packet instead of dropping it.
-func knownStage(stage InflightStage) InflightStage {
-	switch stage {
-	case InflightAwaitPubrec, InflightAwaitPubcomp:
-		return stage
-	default:
-		return InflightAwaitPuback
-	}
-}
-
-// SubscriptionsFromStored converts a stored subscription set into the live form,
-// and reports nothing else: the two shapes carry the same options under the names
-// of their side of the seam. A nil set converts to nil, so an empty session stays
-// distinguishable from one that was never stored.
-func SubscriptionsFromStored(subs map[string]SessionSubscription) map[string]Subscription {
-	if len(subs) == 0 {
-		return nil
-	}
-	out := make(map[string]Subscription, len(subs))
-	for filter, sub := range subs {
-		out[filter] = Subscription{
-			QoS:               sub.QoS,
-			NoLocal:           sub.NoLocal,
-			RetainAsPublished: sub.RetainAsPublished,
-			RetainHandling:    sub.RetainHandling,
-			SubscriptionIDs:   sub.SubscriptionIdentifiers,
-		}
-	}
-	return out
 }
 
 // CopySubscriptions returns a detached copy of a session's subscription set, so a
