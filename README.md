@@ -315,7 +315,7 @@ needed.
 | `WebsocketSecureAddr` / `WebsocketSecurePort` | — / 8884 | WSS listener |
 | `WebsocketPath` | `/mqtt` | WebSocket path |
 | `TLS` | disabled | `Enabled`, `Cert`, `Key`, `CA`, `RequireClientCert` |
-| `MaxPacketSize` | 4 MiB | inbound packet limit |
+| `MaxPacketSize` | 4 MiB | inbound packet limit; the same number bounds one inbound WebSocket message on the WS/WSS listeners |
 | `ConnectMode` | `UNIQUE` | reject or kick an existing client id |
 | `NotKickSeconds` | 30 | anti-flap window of a takeover, enforced for a local CONNECT and for a peer's kick (negative: no window) |
 | `ConnectTimeout` | 10 s | CONNECT-phase read deadline; a socket that says nothing is closed |
@@ -1092,6 +1092,15 @@ the next `PortFallback` ports (default 16, negative disables it) and keeps the
 transport it was configured with. Each attempt really binds the next port — the
 bind is the probe, so there is no check-then-bind race — the resolved address is
 logged and reported by `Addrs()`, and an ephemeral bind (`:0`) never falls back.
+
+The WS and WSS listeners accept an inbound WebSocket message of at most
+`MaxPacketSize`, like every other transport accepts a packet of that size. gnety's
+own 4 MiB per-message default is deliberately not used: it is a library default,
+not a protocol limit (RFC 6455 has no message size limit, and the MQTT spec lets
+one frame carry several or partial control packets), and it would make a
+`MaxPacketSize` above 4 MiB unreachable over ws. The limit counts one whole
+message, so a sender that bundles several packets into one message is held to
+their sum.
 
 ## Cluster backend
 

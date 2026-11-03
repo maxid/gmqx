@@ -81,6 +81,10 @@
 - **MQTT client library `github.com/maxid/gmqx/client`**：基于标准库与 `gnety/codec/mqtt` 的完整 MQTT 3.1.1/5 client；QoS 1/2 状态机、DUP/PUBREL 重传、inflight window、重连退避、订阅恢复、keepalive、MQTT 5 属性、有界有序 writer/delivery 队列。
 - 连接/session 治理、共享订阅、subscription identifier、Will Delay、AUTH 增强认证、retained expiry、跨节点 takeover、kick epochs、Redis shared session store、Receive Maximum、Maximum Packet Size、QoS 2 重连状态、字节速率整形、listener 端口回退、gossip/TCP/Redis cluster、client-id presence、directed routing、MQTT 3.1 兼容等（详见英文版逐条说明）。
 
+### 修复
+
+- **`MaxPacketSize` 现在对 WebSocket 监听器生效。** WS/WSS 监听器从未把消息上限传给 gnety，等于静默沿用其 4 MiB 默认值：配置 `MaxPacketSize: 8 MiB` 后，5 MiB 的 PUBLISH 在 TCP/TLS 上正常，在 WS/WSS 上被以 WebSocket 状态码 1009 断开。现在四条传输统一由 `Config.MaxPacketSize` 决定：4 MiB 是库的默认值而不是协议上限（RFC 6455 没有消息大小上限，MQTT 也允许一帧承载多个或部分控制报文），而其它传输本来就只服从这一个数字。上限按整条 WebSocket 消息计，把多个包黏进一条消息的发送方按总和受限（详见英文版）。
+
 ## [0.6.0-dev.1] - 2026-10-29
 
 - Transport 迁移到 gnety（`RawHandler`）：TCP/TLS/WS/WSS listener 由 gnety 提供，MQTT codec 与 broker 状态机仍在 gmqx。

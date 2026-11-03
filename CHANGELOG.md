@@ -995,6 +995,21 @@
 - Cluster interface (`Cluster`/`ClusterMessage`) and broker hooks for cross-node
   publish and kick; in-memory two-node test.
 
+### Fixed
+
+- **`MaxPacketSize` reaches the WebSocket listeners.** The WS and WSS listeners
+  passed no message limit to gnety, so they silently kept gnety's 4 MiB default: a
+  broker configured with `MaxPacketSize: 8 MiB` served a 5 MiB PUBLISH over TCP and
+  TLS and closed the same PUBLISH over WS/WSS with WebSocket status 1009. All four
+  transports now take their limit from `Config.MaxPacketSize` — 4 MiB is a library
+  default, not a protocol limit (RFC 6455 has no message size limit, and the MQTT
+  spec lets one frame carry several or partial control packets), and the other
+  transports already obeyed that single number. The limit counts one whole
+  WebSocket message, so a sender that bundles several packets into one message is
+  held to their sum. `internal/engine/transport_frame_size_test.go` is the
+  acceptance case: 5 MiB over ws and wss at an 8 MiB limit, a 2 MiB message
+  refused at a 1 MiB limit.
+
 
 ## [0.6.0-dev.1] - 2026-10-29
 
