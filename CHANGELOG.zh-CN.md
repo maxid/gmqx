@@ -2,7 +2,7 @@
 
 # 变更日志
 
-> 开发快照不打 tag。条目按变更落地日期分组（新到旧），当日发布的版本作为该日期节内的版本号子标题；没有挂在版本号下的条目属于未发布快照。本文为中文摘要版，逐条技术细节以英文版为准。
+> 开发快照不打 tag。条目按变更落地日期分组（新到旧），当日发布的版本作为该日期节内的版本号子标题；没有挂在版本号下的条目属于未发布快照。每个日期只记当天**最终状态**：被后续步骤取代的中间步骤并入描述最终形态的那一条，不按步骤各记一条。本文为中文摘要版，逐条技术细节以英文版为准。
 
 ## 2026-11-03
 
@@ -39,12 +39,6 @@
   import、名称与类型断言全部照旧可用。契约从 `hooks.go` 里的一节变成单独可评审的目录，
   且 `gmqx/hook` 不 import broker 的任何东西。
 
-- **broker 引擎移到 `gmqx/server`，根包只剩门面。** 连接/会话状态机、路由索引、字节速率整形、配置、
-  错误与 broker 侧的 cluster 适配器一起进一个包——它们是同一个整体（inflight/will/auth 是未导出
-  `client` 的方法，路由索引持有 `*client`）。根包把公开类型全部别名导出并转发构造函数，消费方零改动；
-  根实现文件降到 8 个（全是门面），`libcheck` 的 gmqx 欠账条目随之删除。`server/` 是落脚点不是终点：
-  后续按角色（会话状态、routing、conn）的拆分计划记在 `docs/design/source-layout.md` §4.3。
-
 - **在线会话状态进了 `gmqx/session`，不再留在引擎里。** `server/session.go` 原来在 store 的
   `SessionState` 旁边又声明了一个未导出类型 `session`，而它所在的包也叫 `session`——这就是
   `docs/design/source-layout.md` §4.2 记下的同名债务。该类型现在是 `session.State`：订阅
@@ -71,25 +65,11 @@
   可换的 metrics/sink/logger 快照、认证入口、register/unregister、publish/subscribe/retained 路径、
   离线入队与延迟 will 调度。会话交接仍是**一个临界区**（`HandOff`、`TakeOver`）：取走状态与“连接不再
   拥有自己的队列”同时发生，broker 在这个回调里完成 store 写入，因此投递不可能落在“会话已保存”的
-  连接上。引擎保留待发 will 表与定时器、认证 exchange 工厂与会话簿记；`gmqx/server` 从 ~7.5k 行降到
-  ~4k 行。连接拒绝错误与 `MaxAuthSteps` 随产生它们的代码走并在 server 重新导出，`errors.Is`、错误值
-  与根包公开 API 均不变。
+  连接上。引擎保留待发 will 表与定时器、认证 exchange 工厂与会话簿记；字节速率整形也归 `conn`
+  （`conn.Shape`，`ByteRateMetrics` 是 conn 同名接口的别名）。连接拒绝错误与 `MaxAuthSteps`
+  随产生它们的代码走并在 server 重新导出，`errors.Is`、错误值与根包公开 API 均不变。
 
-- **`gmqx/server` 成为装配层，只剩五个文件。** 角色拆分的最后一刀把两件本就是独立角色的事搬出引擎：
-  字节速率整形归 `gmqx/conn`（它包住的是一条连接的 `net.Conn`；broker 只保留每监听器设置与全局桶，
-  调用 `conn.Shape`）；其余属于 Broker 的各个侧面——`conn.Host` 实现、会话簿记、待发 will 表与定时器、
-  插件宿主、公开编程面与 hook 别名、会话 store 门面、auth exchange 工厂——都成为 `broker.go` 的分节；
-  共享订阅分发并入 `cluster.go`。目录在打开任何文件前就回答“这里是装配层”：`broker.go`、
-  `cluster.go`、`config.go`、`errors.go`、`doc.go`。行为零变化；根包公开 API 逐字节相同
-  （`go doc -all`），`ByteRateMetrics` 是 conn 同名接口的别名。
-
-- **引擎变为 `internal/engine`，根包只剩一个 `facade.go`。** 装配包原本是 `gmqx/server`——一个公开
-  import 路径，文件名与根门面一一对应：同一个 broker 有两个公开包，其中一个还是逐文件复制的名字。
-  现在它是 `internal/engine`（包名 `engine`），外部不可 import；根目录的八个别名文件合成一个
-  `facade.go`（外加 `version.go`）。公开 API 不变：每个名字仍是别名（`gmqx.Broker` ==
-  `engine.Broker`），与上一提交用 `go doc -all` 对比（标识符集合差异 0），并用一个模块外的消费者验证过
-  （实现 `gmqx.Dispatcher`/`gmqx.EventSink`、嵌入 `gmqx.NoopMetrics`、创建 broker）。
-  `gmqx/server` 从未被文档列为公开路径、仓内除门面外无人 import，现已删除。
+- **引擎变为 `internal/engine`，根包只剩一个 `facade.go`。** 装配 broker 的东西——`conn.Host` 实现、会话簿记、待发 will 表与定时器、插件宿主、hook 别名、会话 store 门面与 auth exchange 工厂——放在一个外部不可 import 的包里；根包只剩一个 `facade.go`（外加 `version.go`），把每个名字以别名重新导出，因此 `gmqx.Broker` == `engine.Broker`，消费方零改动。`gmqx/server`（一个文件名与根门面重名的中间公开包）已删除。公开 API 不变：与上一提交用 `go doc -all` 对比（标识符集合差异 0），并用一个模块外的消费者验证过（实现 `gmqx.Dispatcher`/`gmqx.EventSink`、嵌入 `gmqx.NoopMetrics`、创建 broker）。
 
 ## 2026-11-01
 

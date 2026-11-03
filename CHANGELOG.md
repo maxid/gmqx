@@ -3,7 +3,8 @@
 > Development snapshots are untagged. Entries are grouped by the date the change
 > landed, newest first, and a release cut that day appears under its version number
 > inside the date. An entry that is not under a version heading is part of the
-> unreleased snapshot.
+> unreleased snapshot. A date records the final state of that day's work: superseded
+> steps fold into the entry that says where things ended up, not one entry per step.
 
 ## 2026-11-03
 
@@ -91,18 +92,6 @@
   consumer changes. The root package is down to 21 implementation files from 26, and
   the backends carry their own tests (including -race) beside them.
 
-- **The broker engine lives in `gmqx/server`; the root package is a facade.** The
-  connection/session state machine, the routing index, the byte-rate shaper, the
-  configuration, the errors and the broker side of the cluster seam moved together
-  into one package, because they are one unit: the inflight, will and auth code are
-  methods of the unexported `client`, the routing index holds `*client`. The root
-  package re-exports every public type as an alias and forwards `New`,
-  `NewDefaultDispatcher` and the constructors, so no consumer changes and both
-  import paths name the same types. Root implementation files are down to 8 — all
-  facades — and `libcheck`'s root-debt entry for gmqx is gone. `server/` is a
-  waypoint, not the destination: the staged split by role (session state, routing,
-  connection) is recorded in `docs/design/source-layout.md` §4.3.
-
 - **`Config.Namespace` is a `gns.Namespace`.** The isolation scope of a broker is now
   the gns namespace value, so a process that runs several brokers — or several
   middlewares — declares each namespace once with `gns.New` and passes the same value
@@ -159,36 +148,24 @@
   together, and the broker writes the store inside that callback, so a delivery can
   never be written to a socket whose session was just stored. The engine keeps the
   pending-will map and its timers, the exchange factory and the session
-  bookkeeping; `gmqx/server` is down to ~4k lines from ~7.5k. The connect-refusal
+  bookkeeping, and the byte-rate shaper is `conn`'s as well (`conn.Shape`, with
+  `ByteRateMetrics` an alias of conn's identical interface). The connect-refusal
   errors and `MaxAuthSteps` moved with the code that produces them and are
   re-exported, so `errors.Is`, the error values and the root package's exported API
   are unchanged.
 
-- **`gmqx/server` is the assembly layer, five files.** The last cut of the role
-  split moved the two things that were roles of their own out of the engine: the
-  byte-rate shaper is `gmqx/conn`'s (it wraps one connection's `net.Conn`; the
-  broker keeps the per-listener settings and the broker-wide buckets and calls
-  `conn.Shape`), and everything that was a facet of the Broker — the `conn.Host`
-  implementation, the session bookkeeping, the pending-will map and its timers,
-  the plugin host, the public programming surface with the hook aliases, the
-  session store facade and the auth exchange factory — became sections of
-  `broker.go`; the shared-subscription distribution joined `cluster.go`. The
-  directory now says "assembly" before a file is opened: `broker.go`,
-  `cluster.go`, `config.go`, `errors.go`, `doc.go`. No behavior changes; the root
-  package's exported API is byte-identical (`go doc -all`), and `ByteRateMetrics`
-  is an alias of conn's identical interface.
-
-- **The engine is `internal/engine` and the root package is one `facade.go`.** The
-  assembly package was `gmqx/server`, a public import path with the same file names
-  as the root facade — two public packages for one broker, one of them duplicated
-  name for name. It is now `internal/engine` (package `engine`), which consumers
-  cannot import, and the eight alias files at the root are one `facade.go` (plus
-  `version.go`). The public API is unchanged: every name is still an alias
-  (`gmqx.Broker` == `engine.Broker`), verified against the previous commit with
-  `go doc -all` (identifier set diff: 0) and with an out-of-module consumer that
-  implements `gmqx.Dispatcher` and `gmqx.EventSink`, embeds `gmqx.NoopMetrics` and
-  builds a broker. `gmqx/server` — never documented as a public path, no in-repo
-  importer besides the facade — is gone.
+- **The engine is `internal/engine` and the root package is one `facade.go`.** What
+  assembles the broker — the `conn.Host` implementation, the session bookkeeping,
+  the pending-will map and its timers, the plugin host, the hook aliases, the
+  session-store facade and the auth exchange factory — lives in one package that
+  consumers cannot import, and the root package is a single `facade.go` (plus
+  `version.go`) re-exporting every name as an alias, so `gmqx.Broker` ==
+  `engine.Broker` and no consumer changes. `gmqx/server`, an intermediate public
+  package whose file names duplicated the root facade, is gone. The public API is
+  unchanged, verified against the previous commit with `go doc -all` (identifier
+  set diff: 0) and with an out-of-module consumer that implements
+  `gmqx.Dispatcher` and `gmqx.EventSink`, embeds `gmqx.NoopMetrics` and builds a
+  broker.
 
 - `hook.SinkFuncs`: implement only the events that matter; a nil field is skipped and a
   sink without a publish hook accepts the publication.
