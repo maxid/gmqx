@@ -223,6 +223,34 @@ broker, _ := gmqx.New(gmqx.Config{
 `broker-demo -serve` 与 `cluster-node` 则一直运行到你停为止。
 [示例 README](examples/README.zh-CN.md) 逐个说明回答什么问题、怎么跑、应该看到什么。
 
+## 限流与准入
+
+`MaxConnections`、`ConnectionRateLimit`、inflight 窗口、队列上限与字节整形各自就能约束一个对端。
+当预算需要共享时——一套策略覆盖多个 broker、且与传输层或 HTTP 网关使用同一套词表——把
+`Config.Limiter` 设成一个 [`glimit`](https://github.com/maxid/glimit) 门。两层都必须放行，
+`nil` 时行为与之前完全一致：
+
+| 判定点 | 计费维度 | 拒绝表达 |
+|---|---|---|
+| CONNECT | `connections` 与 `requests`，按 `global` 与 `peer`（peer 是远端地址的主机部分） | CONNACK：MQTT 5 计数器返回 0x97 Quota exceeded、3.1.1 返回 5；速率分别返回 0x9F / 3 |
+| 每个入站控制报文 | `requests`，按 `global` 与 `session`（连接 id） | 连接结束：MQTT 5 先发 DISCONNECT 0x97 |
+| 每个入站 PUBLISH | `bytes`，按 `global` 与 `session`，按报文的线格式大小计费 | 只拒绝这一条发布，与 receive maximum 耗尽时一致——MQTT 5 QoS 2 回 PUBREC 0x97、QoS 1 不回 PUBACK、QoS 0 丢弃——**流不会断** |
+
+字节预算按报文计费而不是按 socket：MQTT 流中间出现空洞是损坏而不是限流，所以 socket 层面的回答仍然是
+字节整形（延迟）而不是断连。拒绝理由映射到本 broker 已有的指标词表：被拒的 CONNECT 仍记
+`max_connections` / `connection_rate_limit`，会话内用 `rate_limited` / `byte_limited`，
+`quota_exceeded` / `overloaded` / `unavailable` 留给配额来源与自适应控制器。
+
+```go
+gate, _ := glimit.Compile(glimit.Spec{Policies: []glimit.Policy{
+    {Kind: glimit.KindConnections, Scope: glimit.ScopeGlobal, Max: 20_000},
+    {Kind: glimit.KindConnections, Scope: glimit.ScopePeer, Max: 100},
+    {Kind: glimit.KindRequests, Scope: glimit.ScopeSession, Dir: glimit.DirIn, Rate: 500},
+    {Kind: glimit.KindBytes, Scope: glimit.ScopeSession, Dir: glimit.DirIn, Rate: 2 << 20},
+}})
+b, _ := gmqx.New(gmqx.Config{Limiter: gate})
+```
+
 ## 配置（部分）
 
 | 字段 | 默认值 | 说明 |
@@ -243,6 +271,7 @@ broker, _ := gmqx.New(gmqx.Config{
 | `MaxTopicSubscriptions` | 0 | 每会话订阅数限制 |
 | `MaxRetainMessages` | 0 | 保留消息数量限制 |
 | `ConnectionRateLimit` | 0 | 连接数/秒的令牌桶 |
+| `Limiter` | nil | 共享准入门（[`glimit`](https://github.com/maxid/glimit)）：每个 CONNECT 的连接计数与 accept 速率、每个入站报文计一次、每条入站 PUBLISH 按线格式大小计费；与上面的限制叠加，nil 时行为不变 |
 | `MaxInflightQoS1` | 64 | 每连接未确认的 QoS 1 PUBLISH 数，受客户端 Receive Maximum 限制（负值：不限） |
 | `MaxInflightQoS2` | 64 | 每连接每个方向的 QoS 2 交换数，受客户端 Receive Maximum 限制；入站方向同时压低 `ReceiveMaximum`（负值：不限） |
 | `MaxInflightQueueSize` | 256 | 每连接等待空闲 inflight 位置的 QoS 1/2 投递数 |

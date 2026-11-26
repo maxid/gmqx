@@ -44,6 +44,11 @@ package hook
 // because its sender predates kick epochs, so it was applied with the pre-epoch
 // behavior; it is counted although it is not dropped, so an operator can see a
 // mixed-version cluster)
+// "rate_limited" and "byte_limited" (a configured shared limiter,
+// github.com/maxid/glimit, refused a packet or a publication's wire size),
+// "quota_exceeded", "overloaded" and "unavailable" (the limiter's other reasons,
+// which a quota source or an adaptive controller can raise) — a refused CONNECT
+// keeps the historical "max_connections" and "connection_rate_limit" words —,
 // and "target_unknown" (a directed publish for a client id nobody holds: no
 // cluster backend is configured, the Redis presence view has no record for it, or
 // a TCP peer received the broadcast without holding the id — a directed publish is

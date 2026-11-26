@@ -52,7 +52,9 @@ MQTT 5 原因码 0x9F）后重试。
   WSS `WebsocketSecureAddr`。`PortFallback`（默认 16）让绑定在端口被占用时试下一个端口；`Addrs()`
   报告真正绑上的地址，读它，别假设。
 - `MaxConnections`、`ConnectionRateLimit`、`NotKickSeconds`、`ConnectTimeout`、
-  `AuthTimeout`、`MaxPacketSize` 与字节速率整形是把恶意 peer 关在笼子里的旋钮。唯一会把慢消费者
+  `AuthTimeout`、`MaxPacketSize` 与字节速率整形是把恶意 peer 关在笼子里的旋钮。`Limiter` 在其上再叠一层共享门
+  （每个 CONNECT 的连接计数与 accept 速率、每个入站报文计一次、每条入站 PUBLISH 按线格式大小计费），
+  与上述旋钮叠加生效，nil 时行为不变。唯一会把慢消费者
   变成故障的是不设上限的队列：`MaxOfflineQueueSize` 与 `MaxTotalOfflineMessages` 必须设。
 - `MaxTotalOfflineMessages` 是按节点计数的，不是跨集群（见 PERSISTENCE.zh-CN.md）。
 

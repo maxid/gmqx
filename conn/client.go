@@ -30,6 +30,7 @@ import (
 	"github.com/maxid/gnety/codec/mqtt"
 	"github.com/maxid/gnety/codec/wire"
 
+	"github.com/maxid/glimit"
 	"github.com/maxid/gmqx/hook"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
 	topicmatch "github.com/maxid/gmqx/internal/topic"
@@ -720,6 +721,10 @@ func (c *Client) remoteAddr() string {
 	return ""
 }
 
+// RemoteAddr is the peer address of the connection, "" when the transport has
+// none. A host uses it to key per-peer admission.
+func (c *Client) RemoteAddr() string { return c.remoteAddr() }
+
 // warn logs at Warn level. A broker built without Config.Logger (only tests do
 // that) has no logger, and a delivery guard must not panic there.
 func (c *Client) warn(msg string, args ...any) {
@@ -1036,6 +1041,7 @@ func (c *Client) Handshake() error {
 	c.setConnInfo(info)
 	if err := c.host.Register(c); err != nil {
 		code := byte(5)
+		var denied LimitDenied
 		switch {
 		case errors.Is(err, ErrClientIDInUse):
 			code = connackClientIDInvalid(c.version)
@@ -1043,6 +1049,15 @@ func (c *Client) Handshake() error {
 			code = connackRateExceeded(c.version)
 		case errors.Is(err, ErrMaxConnections):
 			code = connackQuotaExceeded(c.version)
+		case errors.As(err, &denied):
+			// A shared limiter refused the CONNECT: a counter reads as a quota, a
+			// rate as a rate, on whichever protocol level the client speaks.
+			switch denied.Reason {
+			case glimit.ReasonConcurrency, glimit.ReasonQuota, glimit.ReasonUnavailable:
+				code = connackQuotaExceeded(c.version)
+			default:
+				code = connackRateExceeded(c.version)
+			}
 		}
 		_ = c.writeConnack(code, "")
 		return err
@@ -1086,6 +1101,10 @@ func (c *Client) Loop() {
 		// exactly as before, by the typed decoder below.
 		view, pubErr := c.readPublish()
 		if pubErr == nil {
+			if err := c.admitInbound(); err != nil {
+				c.readFailed(err)
+				return
+			}
 			c.handlePublish(view)
 			continue
 		}
@@ -1096,6 +1115,10 @@ func (c *Client) Loop() {
 
 		msg, err := c.readMessage()
 		if err != nil {
+			c.readFailed(err)
+			return
+		}
+		if err := c.admitInbound(); err != nil {
 			c.readFailed(err)
 			return
 		}
@@ -1142,6 +1165,28 @@ func (c *Client) Loop() {
 	}
 }
 
+// admitInbound charges one inbound control packet to the host gate, when there is
+// one. A denial ends the connection: the packet is already consumed, and a
+// packet-rate limit is about how fast the peer may speak rather than about one
+// message. The MQTT answer is decided in failProtocol.
+func (c *Client) admitInbound() error {
+	gate, ok := c.host.(Gate)
+	if !ok {
+		return nil
+	}
+	return gate.AdmitInbound(c)
+}
+
+// refusePublish answers a PUBLISH the host gate refused, exactly as an exhausted
+// inbound window does: MQTT 5 QoS 2 gets PUBREC 0x97 and the exchange never
+// starts; QoS 1 gets no acknowledgement at all, because a PUBACK would claim the
+// message was accepted; QoS 0 is dropped.
+func (c *Client) refusePublish(v mqtt.PublishView) {
+	if v.QoS == 2 && c.version == mqtt.Version5 {
+		_ = c.writePublishAck(2, v.PacketID, hook.ReasonQuotaExceeded)
+	}
+}
+
 // readFailed ends the connection after a read that did not produce a packet: it
 // marks the connection lost (so the will is published), tells an MQTT 5 client why
 // when the error is a protocol violation, and closes.
@@ -1159,6 +1204,12 @@ func (c *Client) readFailed(err error) {
 // expired keep-alive deadline) are not protocol errors and stay silent.
 func (c *Client) failProtocol(err error) {
 	if c.version != mqtt.Version5 {
+		return
+	}
+	if errors.Is(err, ErrLimit) {
+		// A shared limiter refused the traffic. 0x97 (Quota exceeded) is the
+		// reason MQTT 5 gives a peer that is over a broker's budget.
+		c.sendDisconnect(hook.ReasonQuotaExceeded)
 		return
 	}
 	if !errors.Is(err, mqtt.ErrMalformedPacket) {
@@ -1265,6 +1316,15 @@ func (c *Client) handlePublish(v mqtt.PublishView) {
 		// Empty or wildcard topic name in a PUBLISH is a protocol violation.
 		c.protocolError(0x90)
 		return
+	}
+	if gate, ok := c.host.(Gate); ok {
+		// The publication's wire size is the message budget: topic and payload
+		// plus the fixed header. A refusal answers this one packet; the stream
+		// is never cut for a byte budget (see gate.go and byte_rate.go).
+		if err := gate.AdmitPublish(c, len(topic)+len(v.Payload)+2); err != nil {
+			c.refusePublish(v)
+			return
+		}
 	}
 	if v.QoS == 2 {
 		// A retransmitted QoS 2 PUBLISH while the first one is still pending

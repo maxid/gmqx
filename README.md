@@ -314,6 +314,37 @@ print one `[n/N]` line per step; `broker-demo -serve` and `cluster-node` stay up
 until you stop them. The [examples README](examples/README.md) lists, for every
 demo, what it answers, how to run it and what it should print.
 
+## Limits and admission
+
+`MaxConnections`, `ConnectionRateLimit`, the inflight windows, the queue caps and the
+byte-rate shapers bound a peer on their own. When the budget has to be shared — one policy
+set across brokers, phrased in the same vocabulary a transport or an HTTP gateway uses — set
+`Config.Limiter` to a [`glimit`](https://github.com/maxid/glimit) gate. Both layers must
+admit, and a nil limiter keeps the previous behaviour exactly:
+
+| Point | Charged | Refusal |
+|---|---|---|
+| CONNECT | `connections` and `requests`, per `global` and `peer` (the peer is the host part of the remote address) | CONNACK: 0x97 Quota exceeded on MQTT 5, 5 on 3.1.1 for a counter; 0x9F / 3 for a rate |
+| every inbound control packet | `requests`, per `global` and `session` (the connection id) | the connection ends: DISCONNECT 0x97 on MQTT 5 |
+| every inbound PUBLISH | `bytes`, per `global` and `session`, charged its wire size | that publication is refused the way an exhausted receive maximum refuses one — PUBREC 0x97 on MQTT 5 QoS 2, no PUBACK on QoS 1, dropped on QoS 0 — and the stream stays up |
+
+The byte budget is charged per message, not per socket: a hole in an MQTT stream is a
+corruption bug, which is why the socket-level answer to too many bytes stays the byte-rate
+shaper (delay) and not a disconnect. Denials map onto the metric vocabulary this broker
+already publishes: a refused CONNECT keeps `max_connections` / `connection_rate_limit`,
+in-session refusals use `rate_limited` / `byte_limited`, and `quota_exceeded` /
+`overloaded` / `unavailable` are reserved for a quota source or an adaptive controller.
+
+```go
+gate, _ := glimit.Compile(glimit.Spec{Policies: []glimit.Policy{
+    {Kind: glimit.KindConnections, Scope: glimit.ScopeGlobal, Max: 20_000},
+    {Kind: glimit.KindConnections, Scope: glimit.ScopePeer, Max: 100},
+    {Kind: glimit.KindRequests, Scope: glimit.ScopeSession, Dir: glimit.DirIn, Rate: 500},
+    {Kind: glimit.KindBytes, Scope: glimit.ScopeSession, Dir: glimit.DirIn, Rate: 2 << 20},
+}})
+b, _ := gmqx.New(gmqx.Config{Limiter: gate})
+```
+
 ## Configuration (selected)
 
 | Field | Default | Description |
@@ -334,6 +365,7 @@ demo, what it answers, how to run it and what it should print.
 | `MaxTopicSubscriptions` | 0 | per-session subscription limit |
 | `MaxRetainMessages` | 0 | retained message count limit |
 | `ConnectionRateLimit` | 0 | connections/second token bucket |
+| `Limiter` | nil | shared admission gate ([`glimit`](https://github.com/maxid/glimit)): connection gauge and accept rate per CONNECT, one charge per inbound packet, and each inbound PUBLISH by wire size; stacked on the limits above, nil keeps the behaviour unchanged |
 | `MaxInflightQoS1` | 64 | unconfirmed QoS 1 PUBLISHes per connection, capped by the client's Receive Maximum (negative: unlimited) |
 | `MaxInflightQoS2` | 64 | QoS 2 exchanges per connection and direction, capped by the client's Receive Maximum; the inbound half lowers `ReceiveMaximum` (negative: unlimited) |
 | `MaxInflightQueueSize` | 256 | QoS 1/2 deliveries per connection waiting for a free inflight slot |

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/maxid/gcache/memory"
+	"github.com/maxid/glimit"
 	"github.com/maxid/gmqx/conn"
 	"github.com/maxid/gmqx/hook"
 	mqtt5 "github.com/maxid/gmqx/internal/mqtt5"
@@ -41,9 +42,14 @@ type Broker struct {
 	// codecs is the registry of payload encodings the loaded plugins contributed,
 	// and plugins the registry that controls them. The broker never picks a codec
 	// itself.
-	codecs     *hook.CodecSet
-	plugins    *gplugin.Registry[hook.Host]
-	limiter    *rateLimiter
+	codecs  *hook.CodecSet
+	plugins *gplugin.Registry[hook.Host]
+	limiter *rateLimiter
+	// gate is the shared limiter a deployment wired in, nil when there is none;
+	// limits is the credit each live connection holds in it, so a teardown returns
+	// it exactly once. Both are guarded by mu.
+	gate       glimit.Limiter
+	limits     map[*conn.Client][]glimit.Key
 	nodeID     string
 	namespace  string
 	dispatcher Dispatcher
@@ -323,6 +329,10 @@ func New(cfg Config) (*Broker, error) {
 	b.loadRetained()
 	if cfg.ConnectionRateLimit > 0 {
 		b.limiter = newRateLimiter(cfg.ConnectionRateLimit)
+	}
+	b.gate = cfg.Limiter
+	if b.gate != nil {
+		b.limits = make(map[*conn.Client][]glimit.Key)
 	}
 	return b, nil
 }
@@ -834,6 +844,9 @@ type ByteRateMetrics = conn.ByteRateMetrics
 // id spreads a kick to the cluster, so a duplicate connection on another node is
 // closed instead of surviving until its keep-alive expires (see spreadKick).
 func (b *Broker) register(c *conn.Client) error {
+	if err := b.admitConnect(c); err != nil {
+		return err
+	}
 	key := namespaceKey(b.namespace, c.ID())
 	b.mu.Lock()
 	var takeover *sessionstate.State
@@ -989,6 +1002,13 @@ func (b *Broker) insideNotKickWindow(startedAt time.Time) bool {
 func (b *Broker) unregister(c *conn.Client) {
 	if !c.MarkUnregistered() {
 		return
+	}
+	if b.gate != nil {
+		b.mu.Lock()
+		credit := b.limits[c]
+		delete(b.limits, c)
+		b.mu.Unlock()
+		b.release(credit)
 	}
 	key := namespaceKey(b.namespace, c.ID())
 	b.mu.Lock()
@@ -3054,3 +3074,136 @@ func ContextWithConn(ctx context.Context, info ConnInfo) context.Context {
 
 // ConnFromContext forwards to hook.ConnFromContext.
 func ConnFromContext(ctx context.Context) (ConnInfo, bool) { return hook.ConnFromContext(ctx) }
+
+// AdmitInbound charges one inbound control packet for a connection and implements
+// conn.Gate. The session key is the connection id: it exists before the CONNECT
+// names a client and is never reused, so a reconnecting peer starts from a fresh
+// budget instead of inheriting the previous socket's.
+func (b *Broker) AdmitInbound(c *conn.Client) error {
+	if b.gate == nil {
+		return nil
+	}
+	keys := []glimit.Key{
+		{Kind: glimit.KindRequests, Scope: glimit.ScopeGlobal, Direction: glimit.DirIn},
+		{Kind: glimit.KindRequests, Scope: glimit.ScopeSession, ID: string(c.ConnectionID()), Direction: glimit.DirIn},
+	}
+	for _, key := range keys {
+		d := b.gate.Allow(context.Background(), key, 1)
+		if !d.Allow {
+			b.metrics().RecordDroppedMessage(inboundReason(d.Reason))
+			return conn.LimitDenied{Reason: d.Reason}
+		}
+	}
+	return nil
+}
+
+// AdmitPublish charges one inbound publication's wire size and implements
+// conn.Gate. A refusal answers that packet only, exactly like an exhausted
+// receive maximum: the stream is never cut for a byte budget.
+func (b *Broker) AdmitPublish(c *conn.Client, size int) error {
+	if b.gate == nil || size <= 0 {
+		return nil
+	}
+	keys := []glimit.Key{
+		{Kind: glimit.KindBytes, Scope: glimit.ScopeGlobal, Direction: glimit.DirIn},
+		{Kind: glimit.KindBytes, Scope: glimit.ScopeSession, ID: string(c.ConnectionID()), Direction: glimit.DirIn},
+	}
+	for _, key := range keys {
+		d := b.gate.Allow(context.Background(), key, size)
+		if !d.Allow {
+			b.metrics().RecordDroppedMessage(inboundReason(d.Reason))
+			return conn.LimitDenied{Reason: d.Reason}
+		}
+	}
+	return nil
+}
+
+// admitConnect charges the connection gauge and the accept rate for one CONNECT.
+// It runs before registration, so a refusal reaches the peer as a CONNACK code
+// rather than a closed socket.
+func (b *Broker) admitConnect(c *conn.Client) error {
+	if b.gate == nil {
+		return nil
+	}
+	peer := peerID(c.RemoteAddr())
+	var charged []glimit.Key
+	for _, key := range []glimit.Key{
+		{Kind: glimit.KindConnections, Scope: glimit.ScopeGlobal},
+		{Kind: glimit.KindConnections, Scope: glimit.ScopePeer, ID: peer},
+		{Kind: glimit.KindRequests, Scope: glimit.ScopeGlobal, Direction: glimit.DirIn},
+		{Kind: glimit.KindRequests, Scope: glimit.ScopePeer, ID: peer, Direction: glimit.DirIn},
+	} {
+		d := b.gate.Allow(context.Background(), key, 1)
+		if !d.Allow {
+			// A refused CONNECT holds nothing, so the credits taken before the
+			// denial go straight back.
+			b.release(charged)
+			b.metrics().RecordDroppedMessage(connectReason(d.Reason))
+			switch d.Reason {
+			case glimit.ReasonConcurrency, glimit.ReasonQuota, glimit.ReasonUnavailable:
+				b.metrics().RecordOverflow("connections")
+			}
+			return conn.LimitDenied{Reason: d.Reason}
+		}
+		charged = append(charged, key)
+	}
+	b.mu.Lock()
+	if b.limits == nil {
+		b.limits = make(map[*conn.Client][]glimit.Key)
+	}
+	b.limits[c] = charged
+	b.mu.Unlock()
+	return nil
+}
+
+// release returns credit taken by admitConnect. Releasing a rate key is a no-op in
+// glimit, so one list serves both shapes.
+func (b *Broker) release(keys []glimit.Key) {
+	if b.gate == nil || len(keys) == 0 {
+		return
+	}
+	for _, key := range keys {
+		b.gate.Release(context.Background(), key, 1)
+	}
+}
+
+// peerID is the limiter identity of a peer: the host part of its address, so a
+// NAT gateway does not become one peer per source port.
+func peerID(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
+}
+
+// connectReason maps a CONNECT denial onto the metric vocabulary this broker
+// already publishes.
+func connectReason(r glimit.Reason) string {
+	switch r {
+	case glimit.ReasonConcurrency:
+		return "max_connections"
+	case glimit.ReasonRate, glimit.ReasonBurst:
+		return "connection_rate_limit"
+	}
+	return inboundReason(r)
+}
+
+// inboundReason maps a denial inside a session onto a metric reason.
+func inboundReason(r glimit.Reason) string {
+	switch r {
+	case glimit.ReasonRate, glimit.ReasonBurst:
+		return "rate_limited"
+	case glimit.ReasonBytes:
+		return "byte_limited"
+	case glimit.ReasonConcurrency:
+		return "max_connections"
+	case glimit.ReasonQuota:
+		return "quota_exceeded"
+	case glimit.ReasonOverload:
+		return "overloaded"
+	case glimit.ReasonUnavailable:
+		return "unavailable"
+	}
+	return "rate_limited"
+}

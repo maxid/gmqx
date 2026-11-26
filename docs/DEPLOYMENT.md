@@ -66,7 +66,9 @@ accepts the refusal (MQTT 3.1.1 return code 3, MQTT 5 reason 0x9F) and retries.
   really bound, so read it instead of assuming.
 - `MaxConnections`, `ConnectionRateLimit`, `NotKickSeconds`, `ConnectTimeout`,
   `AuthTimeout`, `MaxPacketSize` and the byte-rate shapers are the knobs that bound a
-  hostile peer. An unbounded queue is the one setting that turns a slow consumer into
+  hostile peer. `Limiter` adds a shared gate on top (connections and accept rate per
+  CONNECT, one charge per inbound packet, each inbound PUBLISH by wire size); it is
+  consulted in addition to every knob above and a nil limiter changes nothing. An unbounded queue is the one setting that turns a slow consumer into
   an outage: keep `MaxOfflineQueueSize` and `MaxTotalOfflineMessages` set.
 - `MaxTotalOfflineMessages` is counted per node, not across the cluster (see
   PERSISTENCE.md).

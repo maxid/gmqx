@@ -5,6 +5,20 @@
 > superseded steps fold into the entry that says where things ended up, not one entry
 > per step.
 
+## 2026-11-26
+
+### Added
+
+- **Shared admission through `glimit`.** `Config.Limiter` is consulted in addition to
+  every built-in limit, and a nil limiter changes nothing. A CONNECT charges the
+  connection gauge and the accept rate per global and peer, and a refusal answers with
+  a CONNACK code (0x97 / 0x9F on MQTT 5, 5 / 3 on 3.1.1) instead of a closed socket. Each
+  inbound control packet charges a request per global and session (the connection id); a
+  denial ends the connection with DISCONNECT 0x97 on MQTT 5. Each inbound PUBLISH charges
+  its wire size in bytes per global and session, and a denial refuses only that
+  publication — PUBREC 0x97 on MQTT 5 QoS 2, no PUBACK on QoS 1, dropped on QoS 0 — so the
+  stream survives a byte budget. `gmqx.ErrLimit` and `gmqx.LimitDenied` carry the reason.
+
 ## 2026-11-03
 
 ### Added

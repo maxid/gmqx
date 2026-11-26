@@ -2,10 +2,12 @@ package engine
 
 import (
 	"context"
-	"github.com/maxid/gcache"
-	"github.com/maxid/gns"
 	"log/slog"
 	"time"
+
+	"github.com/maxid/gcache"
+	"github.com/maxid/glimit"
+	"github.com/maxid/gns"
 )
 
 // ConnectMode controls what happens when a client connects with an existing
@@ -188,6 +190,12 @@ type Config struct {
 	MaxTopicSubscriptions int
 	MaxRetainMessages     int64
 	ConnectionRateLimit   int
+	// Limiter, when set, is consulted in addition to the limits above: the
+	// connection gauge and the accept rate for a CONNECT, one charge per inbound
+	// control packet, and the wire size of every inbound PUBLISH. Both layers must
+	// admit and nil keeps the previous behaviour exactly. See
+	// github.com/maxid/glimit for the vocabulary.
+	Limiter glimit.Limiter
 
 	// Outbound delivery. MaxInflightQoS1 bounds the unconfirmed QoS 1 PUBLISHes of
 	// one connection and MaxInflightQoS2 the QoS 2 exchanges of one connection, in

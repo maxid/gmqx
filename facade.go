@@ -25,6 +25,7 @@ import (
 	"context"
 
 	"github.com/maxid/gmqx/cluster"
+	"github.com/maxid/gmqx/conn"
 	"github.com/maxid/gmqx/hook"
 	engine "github.com/maxid/gmqx/internal/engine"
 )
@@ -51,6 +52,9 @@ type (
 	ByteRateMetrics = engine.ByteRateMetrics
 	// ConnectionID identifies one physical connection.
 	ConnectionID = engine.ConnectionID
+	// LimitDenied is a CONNECT or a packet the configured limiter refused; it
+	// carries the limiter's reason so a caller can tell a quota from a rate.
+	LimitDenied = conn.LimitDenied
 )
 
 // New builds a broker from cfg.
@@ -98,6 +102,9 @@ var (
 	ErrNamespaceMismatch  = engine.ErrNamespaceMismatch
 	ErrClusterUnavailable = engine.ErrClusterUnavailable
 	ErrNodeIDInUse        = engine.ErrNodeIDInUse
+	// ErrLimit reports traffic the configured limiter refused. Every denial
+	// wraps it, so errors.Is matches the family and errors.As reads the reason.
+	ErrLimit = conn.ErrLimit
 )
 
 // The extension contracts live in ./hook; the engine that implements the host side

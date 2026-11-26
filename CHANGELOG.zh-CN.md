@@ -4,6 +4,17 @@
 
 > 开发快照不打 tag。条目按变更落地日期分组（新到旧），每个日期只记当天**最终状态**：被后续步骤取代的中间步骤并入描述最终形态的那一条，不按步骤各记一条。中文版与英文版逐条对应（同日期、同条目、同顺序），代码标识符与协议名保持原文。
 
+## 2026-11-26
+
+### 新增
+
+- **经 `glimit` 的共享准入。** `Config.Limiter` 与每一道内建限制叠加，`nil` 时行为完全不变。
+  CONNECT 按 global 与 peer 计入连接计数与 accept 速率，拒绝时回 CONNACK 码（MQTT 5 为
+  0x97 / 0x9F，3.1.1 为 5 / 3）而不是直接关 socket。每个入站控制报文按 global 与 session
+  （连接 id）记一次请求，超限则结束连接（MQTT 5 先发 DISCONNECT 0x97）。每条入站 PUBLISH
+  按线格式大小记字节，超限只拒绝这一条——MQTT 5 QoS 2 回 PUBREC 0x97、QoS 1 不回 PUBACK、
+  QoS 0 丢弃——流不会因为字节预算而断。`gmqx.ErrLimit` 与 `gmqx.LimitDenied` 携带理由。
+
 ## 2026-11-03
 
 ### 新增

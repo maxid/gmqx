@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/maxid/gcache v0.0.0-20261103041603-912aec0aaae4
+	github.com/maxid/glimit v0.0.0-20261124100600-ce8dcbde2d34
 	github.com/maxid/gnety v0.0.0-20261101055410-7fc85d35bd1c
 	github.com/maxid/gns v0.0.0-20261102075341-0dc680a5af4a
 	github.com/maxid/gplugin v0.0.0-20261102034223-09f50dbe8e66
